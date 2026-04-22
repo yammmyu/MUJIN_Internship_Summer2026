@@ -1,0 +1,8 @@
+numpy
+protobuf==3.12.4
+ruckig==0.15.3
+opencv-python==4.10.0.84
+scipy
+pyzmq==26.2.0
+matplotlib
+pynput
