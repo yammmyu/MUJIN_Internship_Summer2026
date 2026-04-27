@@ -5,7 +5,8 @@ import numpy as np
 from PIL import Image, ImageTk
 import threading
 import time
-from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController, Slam
+import math
+from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
 from scipy.spatial.transform import Rotation as R
 from camera_pose import compute_point_B_world
 
@@ -121,191 +122,6 @@ class RobotCoordinateTransformer:
             return res.x
         else:
             return None
-
-class TrajectoryPlanner:
-    """基于RRT-Connect的轨迹规划器"""
-    def __init__(self, transformer, collision_checker):
-        self.transformer = transformer
-        self.collision_checker = collision_checker
-        self.max_iter = 5000
-        self.step_size = 0.2 # 关节空间步长(rad)
-
-    def plan_path(self, side, start_joints, target_pos):
-        """
-        在 A 点和 B 点之间寻找一条不碰撞的路径
-        start_joints: [q1...q7] 起始关节角
-        target_pos: [x, y, z] 目标末端位置
-        """
-        # 1. 首先尝试用 IK 求解目标点的关节角
-        goal_joints = self.transformer.solve_ik(side, target_pos, start_joints)
-        if goal_joints is None:
-            print("IK 求解失败，无法到达目标点")
-            return None
-
-        # 2. RRT 采样搜索
-        # 状态定义: q = [q1, q2, q3, q4, q5, q6, q7]
-        tree = {tuple(start_joints): None} # {node: parent}
-        nodes = [np.array(start_joints)]
-
-        for i in range(self.max_iter):
-            # 随机采样目标点
-            if np.random.rand() < 0.1: # 10% 概率直接向目标点生长
-                sample = np.array(goal_joints)
-            else:
-                # 在关节限位内随机采样
-                sample = np.random.uniform(-3.14, 3.14, 7)
-
-            # 找到树中最近的节点
-            dists = [np.linalg.norm(node - sample) for node in nodes]
-            nearest_node = nodes[np.argmin(dists)]
-
-            # 向采样点方向延伸一步
-            diff = sample - nearest_node
-            dist = np.linalg.norm(diff)
-            if dist > 0:
-                step = (diff / dist) * self.step_size
-                new_node = nearest_node + step
-
-                # 碰撞检测: 检查新节点
-                if side == 'left':
-                    collided, msg = self.collision_checker.check_collision(new_node, [0.0]*7)
-                else:
-                    collided, msg = self.collision_checker.check_collision([0.0]*7, new_node)
-
-                if not collided:
-                    tree[tuple(new_node)] = tuple(nearest_node)
-                    nodes.append(new_node)
-
-                    # 检查是否到达目标点
-                    if np.linalg.norm(new_node - goal_joints) < self.step_size:
-                        # 找到路径，回溯
-                        path = []
-                        curr = tuple(new_node)
-                        while curr is not None:
-                            path.append(list(curr))
-                            curr = tree[curr]
-                        return path[::-1]
-
-        print("RRT 规划在最大迭代次数内未找到路径")
-        return None
-
-    def smooth_path(self, path):
-        """简单的路径平滑: 尝试删除冗余中间点"""
-        if len(path) <= 2: return path
-
-        smoothed = [path[0]]
-        curr_idx = 0
-        while curr_idx < len(path) - 1:
-            # 尝试从当前点直接跳到后面尽可能远且不碰撞的点
-            for next_idx in range(len(path)-1, curr_idx, -1):
-                # 这里简化处理，假设直接跳跃，实际应进行采样检测
-                smoothed.append(path[next_idx])
-                curr_idx = next_idx
-                break
-        return smoothed
-
-class CollisionChecker:
-
-    """基于简化几何体的机器人自碰撞检测类"""
-    def __init__(self):
-        # 定义安全半径 (米)
-        self.safety_radius = 0.04
-
-        # 定义机器人身体的简化几何体 (相对中心点, 半径, 高度)
-        # 简化为几个核心圆柱体
-        self.body_cylinders = [
-            {'name': 'base', 'pos': [0, 0, 0.3], 'radius': 0.3, 'height': 0.6},
-            {'name': 'torso', 'pos': [0.1, 0, 0.8], 'radius': 0.2, 'height': 0.4}
-        ]
-
-    def _dist_line_to_line(self, p1, p2, p3, p4):
-        """计算两条线段 (p1,p2) 和 (p3,p4) 之间的最短距离"""
-        u = p2 - p1
-        v = p4 - p3
-        w = p1 - p3
-        a = np.dot(u, u)
-        b = np.dot(u, v)
-        c = np.dot(v, v)
-        d = np.dot(u, w)
-        e = np.dot(v, w)
-        D = a * c - b * b
-
-        sc, tc = 0, 0
-
-        if D < 1e-8: # 线段平行
-            sc = 0.0
-            tc = d / b if b > 0 else 0.0
-        else:
-            sc = (b * e - c * d) / D
-            tc = (a * e - b * d) / D
-
-        sc = np.clip(sc, 0, 1)
-        tc = np.clip(tc, 0, 1)
-
-        closest_p1 = p1 + sc * u
-        closest_p2 = p3 + tc * v
-        return np.linalg.norm(closest_p1 - closest_p2)
-
-    def get_arm_segments(self, side, joint_angles):
-        """
-        根据关节角计算手臂各段的端点坐标
-        joint_angles: 7个手臂关节角度 (rad)
-        """
-        # 臂段长度 (从Transformer同步)
-        lengths = [0.188, 0.305, 0.1975, 0.181, 0.23]
-
-        # 起始点 (手臂挂载点)
-        current_pos = np.array([0.3, 0.025 if side == 'left' else -0.025, 0.7])
-        segments = []
-
-        # 建立简单的变换链
-        # 简化模型：每个关节绕一个轴旋转，并沿着X轴延伸
-        current_rot = R.from_euler('xyz', [0, 0, 0])
-
-        # 我们需要处理7个关节，但只有5个长度段
-        # 假设关节与段的对应关系如下 (简化处理):
-        # q0, q1 -> 段0; q2, q3 -> 段1...
-        # 实际上最简单且相对准确的方法是为每个关节定义一个旋转轴
-        axes = [
-            [0, 0, 1], [0, 1, 0], [0, 0, 1], [0, 1, 0],
-            [0, 0, 1], [0, 1, 0], [0, 0, 1]
-        ]
-
-        # 处理关节旋转和段延伸
-        for i in range(len(joint_angles)):
-            # 1. 更新旋转
-            current_rot = current_rot * R.from_rotvec(np.array(axes[i]) * joint_angles[i])
-
-            # 2. 如果这个关节对应一个物理长度段，则延伸
-            if i < len(lengths):
-                direction = current_rot.apply([1, 0, 0])
-                next_pos = current_pos + direction * lengths[i]
-                segments.append((current_pos.copy(), next_pos.copy()))
-                current_pos = next_pos
-
-        return segments
-
-    def check_collision(self, left_joints, right_joints):
-        """检查机器人是否发生碰撞"""
-        # 1. 计算左右臂的线段模型
-        left_segs = self.get_arm_segments('left', left_joints)
-        right_segs = self.get_arm_segments('right', right_joints)
-
-        # 2. 检查左臂与右臂是否碰撞
-        for ls in left_segs:
-            for rs in right_segs:
-                if self._dist_line_to_line(ls[0], ls[1], rs[0], rs[1]) < (self.safety_radius * 2):
-                    return True, "Left arm vs Right arm"
-
-        # 3. 检查手臂与身体碰撞
-        # 身体简化为一个大圆柱体 (P1, P2 线段)
-        body_line = (np.array([0, 0, 0]), np.array([0, 0, 1.0]))
-        for side, segs in [('left', left_segs), ('right', right_segs)]:
-            for s in segs:
-                if self._dist_line_to_line(s[0], s[1], body_line[0], body_line[1]) < self.safety_radius:
-                    return True, f"{side} arm vs Body"
-
-        return False, ""
  
 class RobotControlGUI:
     def __init__(self, root):
@@ -322,18 +138,6 @@ class RobotControlGUI:
         self.robot = Robot()
         self.camera = Camera(["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"])
         self.robot_controller = RobotController()
-        
-        # 初始化SLAM导航
-        try:
-            # from a2d_sdk.robot import Slam
-            self.slam = Slam()
-            print("SLAM导航模块初始化成功")
-            # 切换底盘到自动导航模式。
-            self.slam.switch_nav_mode(2)
-            print("切换底盘到自动导航模式成功")
-        except ImportError:
-            print("⚠️ 无法导入SLAM模块，底盘控制功能将不可用")
-            self.slam = None
 
         # 等待初始化
         time.sleep(1.0)
@@ -358,6 +162,18 @@ class RobotControlGUI:
             "head_depth": None,
             "head_center_fisheye": None
         }
+
+        # MONEY
+        self.coordinates_3d = (0, 0, 0)
+        self.camera_hand_coordinates_3d = (0, 0, 0)
+        self.camera_target_coordinates_3d = (0, 0, 0)
+        self.world_hand_coordinates_3d = (0, 0, 0)
+        self.world_target_coordinates_3d = (0, 0, 0)
+        self.delta_coordinates_3d = (0, 0, 0)
+        self.hand_status_text = tk.StringVar()
+        self.hand_status_text.set("null")
+        self.target_status_text = tk.StringVar()
+        self.target_status_text.set("null")
         
         # RGBD坐标转换相关
         self.depth_scale = 0.001  # 深度缩放因子（毫米到米）
@@ -367,12 +183,6 @@ class RobotControlGUI:
 
         # 坐标转换处理器
         self.transformer = RobotCoordinateTransformer()
-        # 碰撞检测处理器
-        self.collision_checker = CollisionChecker()
-        # 轨迹规划器
-        self.planner = TrajectoryPlanner(self.transformer, self.collision_checker)
-
-
 
         # 状态栏相关
         self.status_text = tk.StringVar()
@@ -424,18 +234,17 @@ class RobotControlGUI:
         
         # 右侧面板：状态和控制
         self.setup_status_panel(right_frame)
-        self.setup_control_panel(right_frame)
-        
-        # 底部状态栏
-        status_frame = ttk.Frame(self.root, relief=tk.SUNKEN)
-        status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
-        
-        self.status_label = ttk.Label(status_frame, textvariable=self.status_text, anchor=tk.W)
-        self.status_label.pack(side=tk.LEFT, padx=5, pady=2)
-        
-        ttk.Button(status_frame, text="清除状态", 
-                  command=lambda: self.status_text.set("就绪")).pack(side=tk.RIGHT, padx=5)
-        
+
+
+        jog_frame = ttk.LabelFrame(right_frame, text="Jog控制面板")
+        jog_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        # 创建标签页
+        notebook = ttk.Notebook(jog_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.setup_pick_and_place_panel(notebook)
+        self.setup_control_panel(notebook)
+
         # 底部状态栏
         status_frame = ttk.Frame(self.root, relief=tk.SUNKEN)
         status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
@@ -457,7 +266,7 @@ class RobotControlGUI:
         rgbd_control_frame.pack(fill=tk.X, padx=5, pady=5)
         
         ttk.Label(rgbd_control_frame, text="RGBD坐标转换:").pack(side=tk.LEFT, padx=5)
-        self.rgbd_enabled_var = tk.BooleanVar(value=False)
+        self.rgbd_enabled_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(rgbd_control_frame, text="启用3D坐标获取", 
                          variable=self.rgbd_enabled_var,
                          command=self.toggle_rgbd_mode).pack(side=tk.LEFT, padx=5)
@@ -496,14 +305,6 @@ class RobotControlGUI:
         self.camera_labels["hand_right"].pack(pady=5)
         self._bind_camera_click("hand_right")
         
-        # 头部中心鱼眼相机
-        fisheye_frame = ttk.Frame(top_frame)
-        fisheye_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        ttk.Label(fisheye_frame, text="头部鱼眼相机").pack()
-        self.camera_labels["head_center_fisheye"] = ttk.Label(fisheye_frame, borderwidth=2, relief="solid")
-        self.camera_labels["head_center_fisheye"].pack(pady=5)
-        self._bind_camera_click("head_center_fisheye")
-        
         # 第二行：头部RGB和深度相机
         bottom_frame = ttk.Frame(camera_frame)
         bottom_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -515,14 +316,6 @@ class RobotControlGUI:
         self.camera_labels["head"] = ttk.Label(head_frame, borderwidth=2, relief="solid")
         self.camera_labels["head"].pack(pady=5)
         self._bind_camera_click("head")
-        
-        # 头部深度相机
-        depth_frame = ttk.Frame(bottom_frame)
-        depth_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        ttk.Label(depth_frame, text="头部深度相机").pack()
-        self.camera_labels["head_depth"] = ttk.Label(depth_frame, borderwidth=2, relief="solid")
-        self.camera_labels["head_depth"].pack(pady=5)
-        self._bind_camera_click("head_depth")
         
     def setup_status_panel(self, parent):
         """设置状态面板"""
@@ -583,12 +376,180 @@ class RobotControlGUI:
             value_label = ttk.Label(frame, text="0.000", width=10)
             value_label.pack(side=tk.LEFT)
             self.gripper_status_labels.append(value_label)
+
+    def update_hand_position(self):
+        position = self.robot_controller.get_motion_status()['frames']['arm_left_link7']['position']
+        x = position['x']
+        y = position['y']
+        z = position['z']
+        print(x, y, z)
+        self.world_hand_coordinates_3d = (x, y, z)
+        self.camera_hand_coordinates_3d = self.coordinates_3d
+        self.world_hand_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.world_hand_coordinates_3d]}")
+        self.camera_hand_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.camera_hand_coordinates_3d]}")
+
+    def update_target_position(self):
+        yaw_rad = math.radians(-self.robot.head_joint_states()[0][0])  # degree to rad
+        self.camera_target_coordinates_3d = self.coordinates_3d
+        # B_w = compute_point_B_world(A_c, B_c, A_w, roll, pitch, yaw_rad)
+        assert self.world_hand_coordinates_3d
+        print(self.camera_hand_coordinates_3d)
+        print(self.camera_target_coordinates_3d)
+        print(self.world_hand_coordinates_3d)
+        print(yaw_rad)
+        self.world_target_coordinates_3d = compute_point_B_world(
+            self.camera_hand_coordinates_3d,
+            self.camera_target_coordinates_3d,
+            self.world_hand_coordinates_3d,
+            0,
+            0,
+            yaw_rad
+        )
+        self.world_target_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.world_target_coordinates_3d]}")
+        self.camera_target_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.camera_target_coordinates_3d]}")
+        self.delta_coordinates_3d = np.array(self.world_target_coordinates_3d) - self.world_hand_coordinates_3d
+        self.delta_coordinates_3d_frame_value_label.config(text=f"{[round(v, 3) for v in self.delta_coordinates_3d]}")
+
+    def run_trajectory(self, path_nodes, side, delta_time):
+        try:
+            for node in path_nodes:
+                # 获取当前实时状态
+                arm_states, _ = self.robot.arm_joint_states()
+                head_states, _ = self.robot.head_joint_states()
+                waist_states, _ = self.robot.waist_joint_states()
+                assert arm_states
+                assert head_states
+                assert waist_states
+
+                robot_states = {
+                    "head": head_states,
+                    "waist": waist_states,
+                    "arm": arm_states,
+                }
+
+                # 构建关节空间控制动作
+                # 假设 SDK 的 trajectory_tracking_control 在 JOINT 模式下
+                # action_data 接受关节目标值
+                arm_key = f"{side}_arm"
+                robot_actions = [{
+                    arm_key: {
+                        "action_data": node,
+                        "control_type": "ABS_JOINT"
+                    }
+                }]
+
+                print(robot_states)
+                print(robot_actions)
+                # 发送控制命令
+                self.robot_controller.trajectory_tracking_control(
+                    int(time.time() * 1e9),
+                    robot_states,
+                    robot_actions,
+                    "base_link",
+                    delta_time  # 每个点执行时间 s
+                )
+                time.sleep(delta_time)
+            print(f"{side}臂轨迹执行完毕", "success")
+        except Exception as traj_e:
+            print(f"轨迹执行错误: {traj_e}")
+
+    def plan_and_run_picking_tarjectory(self):
+        # Ignore z for now
+        step = 0.01
+        sign_x = 1 if self.delta_coordinates_3d[0] >= 0 else -1
+        sign_y = 1 if self.delta_coordinates_3d[1] >= 0 else -1
+        deltas = [[0.0, 0.0, 0.0]]
+        node = [0.0, 0.0, 0.0]
+        is_x_reached = False
+        is_y_reached = False
+        while True:
+            next_delta = [0.0, 0.0, 0.0]
+            if is_x_reached:
+                pass
+            elif abs(node[0] - self.delta_coordinates_3d[0]) <= step:
+                # next_delta[0] = self.delta_coordinates_3d[0] - node[0]
+                node[0] = self.delta_coordinates_3d[0]
+                is_x_reached = True
+            else:
+                next_delta[0] = step * sign_x
+                node[0] = round(node[0] + step * sign_x, 2)
+
+            if is_y_reached:
+                pass
+            elif abs(node[1] - self.delta_coordinates_3d[1]) <= step:
+                # next_delta[1] = self.delta_coordinates_3d[1] - node[1]
+                node[1] = self.delta_coordinates_3d[1]
+                is_y_reached = True
+            else:
+                next_delta[1] = step * sign_y
+                node[1] = round(node[1] + step * sign_y, 2)
+
+            print(node)
+            print(next_delta)
+            deltas.append(next_delta)
+            print(is_x_reached, is_y_reached)
+            if is_x_reached and is_y_reached:
+                break
+        print(f"Deltas: {deltas}")
+
+        for delta in deltas:
+            self.move_arm_relative('left', delta, tiem_step=0.02)
+
+    def setup_pick_and_place_panel(self, parent):
+        """设置控制面板"""
+        # 创建滚动区域
+        frame = ttk.Frame(parent)
+        parent.add(frame, text="pickAndPlace")
+
+        hand_frame = ttk.Frame(frame)
+        hand_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        world_hand_coordinates_3d_frame = ttk.Frame(hand_frame)
+        world_hand_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(world_hand_coordinates_3d_frame, text="world_hand_coordinates_3d:\n").pack(side=tk.LEFT)
+        self.world_hand_coordinates_3d_value_label = ttk.Label(world_hand_coordinates_3d_frame, text="0.000")
+        self.world_hand_coordinates_3d_value_label.pack(side=tk.LEFT)
+
+        camera_hand_coordinates_3d_frame = ttk.Frame(hand_frame)
+        camera_hand_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(camera_hand_coordinates_3d_frame, text="camera_hand_coordinates_3d:\n").pack(side=tk.LEFT)
+        self.camera_hand_coordinates_3d_value_label = ttk.Label(camera_hand_coordinates_3d_frame, text="0.000")
+        self.camera_hand_coordinates_3d_value_label.pack(side=tk.LEFT)
+
+        ttk.Button(hand_frame, text="更新手部位置", command=lambda: self.update_hand_position()).pack(side=tk.LEFT, padx=2)
+
+        target_frame = ttk.Frame(frame)
+        target_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        world_target_coordinates_3d_frame = ttk.Frame(target_frame)
+        world_target_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(world_target_coordinates_3d_frame, text="world_target_coordinates_3d:\n").pack(side=tk.LEFT)
+        self.world_target_coordinates_3d_value_label = ttk.Label(world_target_coordinates_3d_frame, text="0.000")
+        self.world_target_coordinates_3d_value_label.pack(side=tk.LEFT)
+
+        camera_target_coordinates_3d_frame = ttk.Frame(target_frame)
+        camera_target_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(camera_target_coordinates_3d_frame, text="camera_target_coordinates_3d:\n").pack(side=tk.LEFT)
+        self.camera_target_coordinates_3d_value_label = ttk.Label(camera_target_coordinates_3d_frame, text="0.000")
+        self.camera_target_coordinates_3d_value_label.pack(side=tk.LEFT)
+
+        ttk.Button(frame, text="更新目标位置", command=lambda: self.update_target_position()).pack(side=tk.LEFT, padx=2)
+
+        delta_coordinates_3d_frame = ttk.Frame(target_frame)
+        delta_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(delta_coordinates_3d_frame, text="delta_coordinates_3d:\n").pack(side=tk.LEFT)
+        self.delta_coordinates_3d_frame_value_label = ttk.Label(delta_coordinates_3d_frame, text="0.000")
+        self.delta_coordinates_3d_frame_value_label.pack(side=tk.LEFT)
+
+        ttk.Button(frame, text="执行抓取", command=lambda: self.plan_and_run_picking_tarjectory()).pack(side=tk.LEFT, padx=2)
+
         
     def setup_control_panel(self, parent):
         """设置控制面板"""
         # 创建滚动区域
         scroll_frame = ttk.Frame(parent)
-        scroll_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        parent.add(scroll_frame, text="jog")
+        # scroll_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
         # 创建画布和滚动条
         canvas = tk.Canvas(scroll_frame, height=400)
@@ -610,75 +571,6 @@ class RobotControlGUI:
         # 在可滚动框架中创建控制面板
         control_frame = ttk.LabelFrame(scrollable_frame, text="机器人控制")
         control_frame.pack(fill=tk.X, pady=5)
-
-        # 底盘控制
-        chassis_frame = ttk.Frame(control_frame)
-        chassis_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(chassis_frame, text="底盘控制:").pack(anchor=tk.W)
-        
-        # 创建箭头按钮框架
-        arrow_frame = ttk.Frame(chassis_frame)
-        arrow_frame.pack(fill=tk.X, pady=5)
-        
-        # 上排：前进按钮
-        top_frame = ttk.Frame(arrow_frame)
-        top_frame.pack(fill=tk.X, pady=2)
-        ttk.Button(top_frame, text="↑ Y增加", width=10,
-                  command=lambda: self.move_chassis_relative(0.0, 100.0, 0.0)).pack()
-        
-        # 中排：左右转
-        middle_frame = ttk.Frame(arrow_frame)
-        middle_frame.pack(fill=tk.X, pady=2)
-        ttk.Button(middle_frame, text="← 顺时针旋转30度", width=10,
-                  command=lambda: self.move_chassis_relative(0.0, 0.0, 30.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(middle_frame, text="→ 逆时针针旋转30度", width=10,
-                  command=lambda: self.move_chassis_relative(0.0, 0.0, -30.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 下排：后退按钮
-        bottom_frame = ttk.Frame(arrow_frame)
-        bottom_frame.pack(fill=tk.X, pady=2)
-        ttk.Button(bottom_frame, text="↓ Y减少", width=10,
-                  command=lambda: self.move_chassis_relative(0.0, -100.0, 0.0)).pack()
-        
-        # 左右平移
-        side_frame = ttk.Frame(chassis_frame)
-        side_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(side_frame, text="左右平移:").pack(side=tk.LEFT, padx=5)
-        ttk.Button(side_frame, text="← X减少", width=8,
-                  command=lambda: self.move_chassis_relative(-100.0, 0.0, 0.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(side_frame, text="→ X增加", width=8,
-                  command=lambda: self.move_chassis_relative(100.0, 0.0, 0.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 绝对坐标导航
-        nav_frame = ttk.Frame(chassis_frame)
-        nav_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(nav_frame, text="绝对坐标导航:").pack(anchor=tk.W)
-        
-        # 坐标输入框架
-        coord_frame = ttk.Frame(nav_frame)
-        coord_frame.pack(fill=tk.X, pady=5)
-        
-        # X坐标
-        ttk.Label(coord_frame, text="X:").pack(side=tk.LEFT, padx=2)
-        self.nav_x_var = tk.StringVar(value="0.0")
-        ttk.Entry(coord_frame, textvariable=self.nav_x_var, width=8).pack(side=tk.LEFT, padx=2)
-        
-        # Y坐标
-        ttk.Label(coord_frame, text="Y:").pack(side=tk.LEFT, padx=2)
-        self.nav_y_var = tk.StringVar(value="0.0")
-        ttk.Entry(coord_frame, textvariable=self.nav_y_var, width=8).pack(side=tk.LEFT, padx=2)
-        
-        # Theta角度
-        ttk.Label(coord_frame, text="角度(rad):").pack(side=tk.LEFT, padx=2)
-        self.nav_theta_var = tk.StringVar(value="0.0")
-        ttk.Entry(coord_frame, textvariable=self.nav_theta_var, width=8).pack(side=tk.LEFT, padx=2)
-        
-        # 执行按钮
-        ttk.Button(nav_frame, text="执行导航", 
-                  command=self.execute_absolute_navigation,
-                  style="Accent.TButton").pack(pady=5)
-
 
         # 腰部控制
         waist_frame = ttk.Frame(control_frame)
@@ -794,96 +686,6 @@ class RobotControlGUI:
                   command=lambda: self.set_arm_preset("down")).pack(side=tk.LEFT, padx=2)
         ttk.Button(preset_frame, text="双臂前伸", 
                   command=lambda: self.set_arm_preset("forward")).pack(side=tk.LEFT, padx=2)
-
-        
-        # 末端位姿控制区域 - 使用move_arm_to_position函数
-        pose_control_frame = ttk.LabelFrame(arm_frame, text="末端位姿控制")
-        pose_control_frame.pack(fill=tk.X, padx=5, pady=10)
-        
-        # 手臂选择
-        arm_selection_frame = ttk.Frame(pose_control_frame)
-        arm_selection_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(arm_selection_frame, text="选择手臂:").pack(side=tk.LEFT, padx=5)
-        
-        self.arm_side_var = tk.StringVar(value="left")
-        ttk.Radiobutton(arm_selection_frame, text="左臂", variable=self.arm_side_var, value="left").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(arm_selection_frame, text="右臂", variable=self.arm_side_var, value="right").pack(side=tk.LEFT, padx=5)
-        
-        # 位置输入 (X, Y, Z)
-        position_frame = ttk.Frame(pose_control_frame)
-        position_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(position_frame, text="位置 (米):").pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(position_frame, text="X:").pack(side=tk.LEFT, padx=2)
-        self.x_var = tk.StringVar(value="0.4")
-        x_entry = ttk.Entry(position_frame, textvariable=self.x_var, width=8)
-        x_entry.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(position_frame, text="Y:").pack(side=tk.LEFT, padx=2)
-        self.y_var = tk.StringVar(value="0.2" if self.arm_side_var.get() == "left" else "-0.2")
-        y_entry = ttk.Entry(position_frame, textvariable=self.y_var, width=8)
-        y_entry.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(position_frame, text="Z:").pack(side=tk.LEFT, padx=2)
-        self.z_var = tk.StringVar(value="0.6")
-        z_entry = ttk.Entry(position_frame, textvariable=self.z_var, width=8)
-        z_entry.pack(side=tk.LEFT, padx=2)
-        
-        # 姿态输入 (Roll, Pitch, Yaw)
-        orientation_frame = ttk.Frame(pose_control_frame)
-        orientation_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(orientation_frame, text="姿态 (弧度):").pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(orientation_frame, text="Roll:").pack(side=tk.LEFT, padx=2)
-        self.roll_var = tk.StringVar(value="0.0")
-        roll_entry = ttk.Entry(orientation_frame, textvariable=self.roll_var, width=8)
-        roll_entry.pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(orientation_frame, text="Pitch:").pack(side=tk.LEFT, padx=2)
-        self.pitch_var = tk.StringVar(value="0.0")
-        pitch_entry = ttk.Entry(orientation_frame, textvariable=self.pitch_var, width=8)
-        pitch_entry.pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(orientation_frame, text="Yaw:").pack(side=tk.LEFT, padx=2)
-        self.yaw_var = tk.StringVar(value="0.0")
-        yaw_entry = ttk.Entry(orientation_frame, textvariable=self.yaw_var, width=8)
-        yaw_entry.pack(side=tk.LEFT, padx=2)
-
-        # 安全模式切换
-        self.safe_mode_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(orientation_frame, text="安全模式 (RRT规划)",
-                        variable=self.safe_mode_var).pack(side=tk.LEFT, padx=10)
-
-        # 执行按钮
-        execute_frame = ttk.Frame(pose_control_frame)
-        execute_frame.pack(fill=tk.X, padx=5, pady=10)
-        ttk.Button(execute_frame, text="执行末端位姿控制", 
-                  command=self.execute_end_effector_control,
-                  style="Accent.TButton").pack(side=tk.LEFT, padx=5)
-        ttk.Button(execute_frame, text="获取当前位姿", 
-                  command=self.get_current_pose).pack(side=tk.LEFT, padx=5)
-        
-        # RGBD坐标转换结果区域
-        result_frame = ttk.LabelFrame(control_frame, text="RGBD坐标转换结果")
-        result_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        # 显示最近获取的坐标
-        self.coordinate_display = ttk.Label(result_frame, 
-                                           text="点击图像获取3D坐标...",
-                                           justify=tk.LEFT,
-                                           font=('Courier', 9))
-        self.coordinate_display.pack(fill=tk.X, padx=5, pady=5)
-        
-        # 坐标操作按钮
-        coord_button_frame = ttk.Frame(result_frame)
-        coord_button_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Button(coord_button_frame, text="导出坐标", 
-                  command=self.export_coordinates_to_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(coord_button_frame, text="清除记录", 
-                  command=self.clear_coordinate_records).pack(side=tk.LEFT, padx=2)
-        ttk.Button(coord_button_frame, text="更新显示", 
-                  command=self.update_coordinate_display).pack(side=tk.LEFT, padx=2)        
 
         # 复位按钮
         reset_frame = ttk.Frame(control_frame)
@@ -1059,7 +861,11 @@ class RobotControlGUI:
                 return
 
             # ================= resize =================
-            pil_image = pil_image.resize((320, 240), Image.Resampling.LANCZOS)
+            if camera_name == "head":
+                pil_image = pil_image.resize((800, 600), Image.Resampling.LANCZOS)
+            else:
+                # pil_image = pil_image.resize((320, 240), Image.Resampling.LANCZOS)
+                pil_image = pil_image.resize((256, 195), Image.Resampling.LANCZOS)
 
             photo = ImageTk.PhotoImage(pil_image)
 
@@ -1236,8 +1042,11 @@ class RobotControlGUI:
             else:
                 # 默认尺寸
                 original_width, original_height = 640, 480
-                
-            display_width, display_height = 320, 240
+
+            if camera_name == "head":
+                display_width, display_height = 800, 600
+            else:
+                display_width, display_height = 256, 195
             
             # 坐标映射：将显示坐标转换为原始图像坐标
             pixel_x = int(display_x * original_width / display_width)
@@ -1254,6 +1063,7 @@ class RobotControlGUI:
             
             # 转换为3D坐标
             coordinates_3d = self.pixel_to_3d_coordinate(camera_name, pixel_x, pixel_y, depth_value)
+            self.coordinates_3d = coordinates_3d
             if coordinates_3d and coordinates_3d[0] is not None and coordinates_3d[1] is not None and coordinates_3d[2] is not None:
                 x, y, z = coordinates_3d
 
@@ -1472,7 +1282,7 @@ class RobotControlGUI:
         except Exception as e:
             self.show_status(f"机械臂位置控制失败: {e}", "error")
     
-    def move_arm_relative(self, arm_side, delta_position, delta_orientation=None):
+    def move_arm_relative(self, arm_side, delta_position, delta_orientation=None, tiem_step=1.0):
         """相对移动机械臂末端 - 使用DELTA_POSE控制模式
         Args:
             arm_side: 'left' 或 'right'
@@ -1543,8 +1353,9 @@ class RobotControlGUI:
                 robot_states,
                 robot_actions,
                 "base_link",
-                1.0  # 较短的执行时间
+                tiem_step  # 较短的执行时间
             )
+            time.sleep(tiem_step)
         except Exception as e:
             print(f"机械臂相对移动失败: {e}")
             self.show_status(f"机械臂相对移动失败: {e}", "error")
@@ -1805,33 +1616,6 @@ class RobotControlGUI:
             print(f"更新坐标显示失败: {e}")
             if hasattr(self, 'coordinate_display'):
                 self.coordinate_display.config(text="显示更新失败")
-
-    def move_chassis_relative(self, x, y, theta):
-        """控制底盘相对移动"""
-        if not self.slam:
-            self.show_status("SLAM模块未初始化，无法控制底盘", "error")
-            return
-        try:
-            # self.slam.switch_nav_mode(1)
-            self.slam.move_to_relative(x, y, theta)
-            print(f"底盘相对移动命令发送: x={x}m, y={y}m, theta={theta}rad")
-        except Exception as e:
-            self.show_status(f"底盘移动失败: {e}", "error")
-
-    def execute_absolute_navigation(self):
-        """控制底盘绝对移动"""
-        if not self.slam:
-            self.show_status("SLAM模块未初始化，无法控制底盘", "error")
-            return
-        try:
-            # self.slam.switch_nav_mode(1)
-            x = float(self.nav_x_var.get())
-            y = float(self.nav_y_var.get())
-            theta = float(self.nav_theta_var.get())
-            self.slam.navigate_to_pose(x, y, theta)
-            print(f"底盘绝对移动命令发送: x={x}mm, y={y}mm, theta={theta}rad")
-        except Exception as e:
-            self.show_status(f"底盘移动失败: {e}", "error")
 
     def reset_robot(self):
         """机器人复位"""

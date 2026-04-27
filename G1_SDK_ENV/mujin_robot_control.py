@@ -17,6 +17,11 @@ class RobotCoordinateTransformer:
 
         # 机械臂段长度 (用于IK求解)
         self.arm_lengths = [0.188, 0.305, 0.1975, 0.181, 0.23]
+        self.left_arm_home = [-1.0743615627288818, 0.6110466122627258, 0.2795490026473999, -1.2839884757995605, 0.7303872108459473, 1.4954301118850708, -0.18760496377944946]
+        self.right_arm_home = [1.0743964910507202, -0.6110990047454834, -0.27946174144744873, 1.2839535474777222, -0.7304046154022217, -1.4952905178070068, 0.18762239813804626]
+
+        self.left_arm_pose = [ 0.89756692, -0.59635312, 0.66221681]
+        self.right_arm_pose = [0.89754079, 0.59639798, 0.73783894]
 
     def get_transformation_matrix(self, translation, rpy):
         """创建齐次变换矩阵"""
@@ -76,7 +81,8 @@ class RobotCoordinateTransformer:
         """
         # 初始位置 (手臂挂载点)
         # p = np.array([0.3, 0.025 if side == 'left' else -0.025, 0.7])
-        p = np.array([0, 0, 0.15 if side == 'left' else -0.15])
+        p = np.array([0.3, 0.25 if side == 'left' else -0.25, 0.7])
+        # p = np.array([0, 0, 0.15 if side == 'left' else -0.15])
 
         # 简化正运动学：将各段长度沿当前旋转方向累加
         # 注意：这里是简化模型，实际应使用 URDF 的完整 DH 参数或变换矩阵链
@@ -348,38 +354,44 @@ def move_arm_relative(robot, robot_controller, arm_side, delta_position, delta_o
     # 注意：DELTA_POSE模式下，实际实现可能需要使用轨迹跟踪控制
     print(f"{arm_side}臂相对移动: 位置变化={delta_position}m, 姿态变化={delta_orientation}rad")
 
-    # 由于DELTA_POSE是控制模式，我们需要通过轨迹跟踪控制来实现
-    arm_states, _ = robot.arm_joint_states()
-    head_states, _ = robot.head_joint_states()
-    waist_states, _ = robot.waist_joint_states()
-    assert arm_states and head_states and waist_states
+    numDelta = 10
 
-    # 构建完整的机器人状态（参考SDK文档的格式）
-    robot_states = {
-        "head": head_states,
-        "waist": waist_states,
-        "arm": arm_states  # 14个关节
-    }
+    for _ in range(numDelta):
+        # 由于DELTA_POSE是控制模式，我们需要通过轨迹跟踪控制来实现
+        arm_states, _ = robot.arm_joint_states()
+        head_states, _ = robot.head_joint_states()
+        waist_states, _ = robot.waist_joint_states()
+        assert arm_states and head_states and waist_states
 
-    # 构建6维动作数据（位置3 + 姿态3）
-    action_data = delta_position + delta_orientation
-    robot_actions = [{
-        f"{arm_side}_arm": {
-            "action_data": action_data,
-            "control_type": "DELTA_POSE"
+        # 构建完整的机器人状态（参考SDK文档的格式）
+        robot_states = {
+            "head": head_states,
+            "waist": waist_states,
+            "arm": arm_states  # 14个关节
         }
-    }]
 
-    # 使用轨迹跟踪控制
-    robot_controller.trajectory_tracking_control(
-        int(time.time() * 1e9),
-        robot_states,
-        robot_actions,
-        "base_link",
-        1.0  # 较短的执行时间
-    )
+        # 构建6维动作数据（位置3 + 姿态3）
+        action_data = delta_position + delta_orientation
+        action_data = [float(v) / numDelta for v in action_data]
+        robot_actions = [{
+            f"{arm_side}_arm": {
+                "action_data": action_data,
+                "control_type": "DELTA_POSE"
+            }
+        }]
 
-def run_trajectory(robot, robot_controller, path_nodes, side):
+        # 使用轨迹跟踪控制
+        robot_controller.trajectory_tracking_control(
+            int(time.time() * 1e9),
+            robot_states,
+            robot_actions,
+            "base_link",
+            # 1.0  # 较短的执行时间
+            0.02  # 较短的执行时间
+        )
+        time.sleep(0.02)
+
+def run_trajectory(robot, robot_controller, path_nodes, side, delta_time):
     try:
         for node in path_nodes:
             # 获取当前实时状态
@@ -415,9 +427,9 @@ def run_trajectory(robot, robot_controller, path_nodes, side):
                 robot_states,
                 robot_actions,
                 "base_link",
-                0.02  # 每个点执行时间 200ms
+                delta_time  # 每个点执行时间 s
             )
-            time.sleep(0.02)
+            time.sleep(delta_time)
         print(f"{side}臂轨迹执行完毕", "success")
     except Exception as traj_e:
         print(f"轨迹执行错误: {traj_e}")
