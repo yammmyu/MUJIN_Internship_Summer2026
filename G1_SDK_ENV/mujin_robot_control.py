@@ -441,7 +441,7 @@ def main():
     robot = Robot()
     camera = Camera(["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"])
     robot_controller = RobotController()
-    # slam = Slam()
+    slam = Slam()
 
     # 坐标转换处理器
     transformer = RobotCoordinateTransformer()

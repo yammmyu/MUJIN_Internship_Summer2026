@@ -1,3 +1,4 @@
+import copy
 import tkinter as tk
 from tkinter import ttk
 import cv2
@@ -6,9 +7,11 @@ from PIL import Image, ImageTk
 import threading
 import time
 import math
+import rclpy
 from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
 from scipy.spatial.transform import Rotation as R
 from camera_pose import compute_point_B_world
+from control_wheel_example import WheelController
 from constants import *
 
 class RobotCoordinateTransformer:
@@ -139,6 +142,12 @@ class RobotControlGUI:
         self.robot = Robot()
         self.camera = Camera(["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"])
         self.robot_controller = RobotController()
+
+        # Slam
+        rclpy.init(args=None)
+        self.wheel_controller = WheelController()
+        wheel_thread = threading.Thread(target=rclpy.spin, args=(self.wheel_controller,), daemon=True)
+        wheel_thread.start()
 
         # 等待初始化
         time.sleep(1.0)
@@ -312,6 +321,13 @@ class RobotControlGUI:
         self.camera_labels["hand_right"] = ttk.Label(right_frame, borderwidth=2, relief="solid")
         self.camera_labels["hand_right"].pack(pady=5)
         self._bind_camera_click("hand_right")
+
+        depth_frame = ttk.Frame(top_frame)
+        depth_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        ttk.Label(depth_frame, text="头部深度相机").pack()
+        self.camera_labels["head_depth"] = ttk.Label(depth_frame, borderwidth=2, relief="solid")
+        self.camera_labels["head_depth"].pack(pady=5)
+        self._bind_camera_click("head_depth")
         
         # 第二行：头部RGB和深度相机
         bottom_frame = ttk.Frame(camera_frame)
@@ -347,6 +363,14 @@ class RobotControlGUI:
             value_label = ttk.Label(frame, text="0.000", width=10)
             value_label.pack(side=tk.LEFT)
             self.arm_status_labels.append(value_label)
+        # agv angle
+        frame = ttk.Frame(arm_frame)
+        frame.pack(fill=tk.X, padx=5, pady=2)
+        name_label = ttk.Label(frame, text="agv_angle:", width=15)
+        name_label.pack(side=tk.LEFT)
+        value_label = ttk.Label(frame, text="0.000", width=10)
+        value_label.pack(side=tk.LEFT)
+        self.arm_status_labels.append(value_label)
         
         # 头部和腰部状态
         head_waist_frame = ttk.Frame(notebook)
@@ -384,6 +408,14 @@ class RobotControlGUI:
             value_label = ttk.Label(frame, text="0.000", width=10)
             value_label.pack(side=tk.LEFT)
             self.gripper_status_labels.append(value_label)
+
+    @property
+    def wheel_angle_deg(self):
+        return self.wheel_controller.agv_angle
+
+    @property
+    def left_hand_joint_values(self):
+        return self.robot.arm_joint_states()[0][:7]
 
     @property
     def left_hand_pos(self):
@@ -483,7 +515,7 @@ class RobotControlGUI:
         except Exception as traj_e:
             print(f"轨迹执行错误: {traj_e}")
 
-    def plan_and_run_picking_trajectory(self, delta_coordinates_3d, release=False, y_first=False):
+    def plan_and_run_picking_trajectory(self, delta_coordinates_3d, release=False, y_first=False, time_step=0.02):
         if release:
             # open gripper
             self.robot.move_gripper([0, 0])
@@ -528,34 +560,82 @@ class RobotControlGUI:
         print(f"Deltas: {deltas}")
 
         for delta in deltas:
-            self.move_arm_relative('left', delta, tiem_step=0.02)
+            self.move_arm_relative('left', delta, time_step=time_step)
+
+    def get_smooth_paths(self, raw_paths):
+        paths = copy.deepcopy(raw_paths)
+        index = 0
+        while True:
+            if index >= len(paths) - 1:
+                break
+            current_path = paths[index]
+            next_path = paths[index + 1]
+            insert_path = copy.deepcopy(current_path)
+            assert len(current_path) == len(next_path)
+            has_inserted_path = False
+            for i in range(len(current_path)):
+                if abs(next_path[i] - current_path[i]) > 0.01:
+                    has_inserted_path = True
+                    if next_path[i] > current_path[i]:
+                        insert_path[i] += 0.01
+                    else:
+                        insert_path[i] -= 0.01
+            if has_inserted_path:
+                paths.insert(index + 1, insert_path)
+            index += 1
+        return paths
+
+    def grasp_approach(self):
+        arm_joint_values = self.left_hand_joint_values
+        assert arm_joint_values
+        assert len(arm_joint_values) == len(LEFT_HAND_HOME_JOINT_VALUES)
+        if all(abs(arm_joint_values[i] - LEFT_HAND_HOME_JOINT_VALUES[i]) < 0.1 for i in range(len(arm_joint_values))):
+            self.run_trajectory(HOME_TO_READY_PATHS, "left", 0.02, validate=True, release=True)
+            time.sleep(0.2)
+        arm_joint_values = self.left_hand_joint_values
+        assert arm_joint_values
+        assert all(abs(arm_joint_values[i] - LEFT_HAND_READY_JOINT_VALUES[i]) < 0.1 for i in range(len(arm_joint_values)))
+        self.plan_and_run_picking_trajectory(self.delta_coordinates_3d, release=True, y_first=True)
+
 
     def grasp_depart_home(self, grasp=False, depart=False, validate=True, direct=False):
         if grasp:
             self.robot.move_gripper([1, 0])
             time.sleep(1)
         if depart:
-            for i in range(5):
-                self.move_arm_relative('left', [0, 0.01, 0.01], tiem_step=0.02)
-                time.sleep(0.02)
-            for i in range(20):
-                self.move_arm_relative('left', [-0.01, 0, 0], tiem_step=0.02)
-                time.sleep(0.02)
-        delta_coordinates_3d = np.array(LEFT_HAND_HOME_COORDINATE_3D) - self.left_hand_pos
-        if validate:
-            for index, limit in enumerate([0.3, 0.3, 0.2]):
-                # TODO: for safe
-                assert abs(delta_coordinates_3d[index]) <= limit
-        self.plan_and_run_picking_trajectory(delta_coordinates_3d, release=False)
-        # self.run_trajectory([LEFT_HAND_HIGH_HOME_JOINT_VALUES], "left", 0.5)
-        # time.sleep(0.5)
-        self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.5)
-        time.sleep(0.5)
+            for i in range(10):
+                self.move_arm_relative('left', [0, 0.01, 0.005], time_step=0.05)
+            # for i in range(20):
+            #     self.move_arm_relative('left', [-0.01, 0, 0], time_step=0.02)
+        # delta_coordinates_3d = np.array(LEFT_HAND_HIGH_HOME_COORDINATE_3D) - self.left_hand_pos
+        # if validate:
+        #     for index, limit in enumerate([0.3, 0.3, 0.2]):
+        #         # TODO: for safe
+        #         assert abs(delta_coordinates_3d[index]) <= limit
+        # self.plan_and_run_picking_trajectory(delta_coordinates_3d, release=False, time_step=0.02)
+        # self.run_trajectory([LEFT_HAND_HIGH_HOME_JOINT_VALUES], "left", 1)
+        self.run_trajectory(self.get_smooth_paths([self.left_hand_joint_values, LEFT_HAND_HIGH_HOME_JOINT_VALUES]), "left", 0.01)
+        # self.run_trajectory(HIGH_HOME_TO_HOME_PATHS, "left", 0.1)
+        # delta_coordinates_3d = np.array(LEFT_HAND_HOME_COORDINATE_3D) - self.left_hand_pos
+        # if validate:
+        #     for index, limit in enumerate([0.3, 0.3, 0.2]):
+        #         # TODO: for safe
+        #         assert abs(delta_coordinates_3d[index]) <= limit
+        # self.plan_and_run_picking_trajectory(delta_coordinates_3d, release=False, time_step=0.02)
+        # self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 1)
+        self.run_trajectory(self.get_smooth_paths([self.left_hand_joint_values, LEFT_HAND_HOME_JOINT_VALUES]), "left", 0.01)
 
     def release_part(self):
+        if abs(self.wheel_angle_deg - 215) > 5:
+            self.wheel_controller.commands.append(215)
+            while True:
+                if abs(self.wheel_angle_deg - 205) <= 10:
+                    break
+                time.sleep(0.1)
         self.run_trajectory(HOME_TO_RELEASE_PATHS, "left", 0.02, validate=True)
         self.robot.move_gripper([0, 0])
         time.sleep(1)
+        self.wheel_controller.commands.append(180)
         reversed_paths = list(reversed(HOME_TO_RELEASE_PATHS))
         self.run_trajectory(reversed_paths, "left", 0.02, validate=False)
         self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.2)
@@ -619,7 +699,7 @@ class RobotControlGUI:
         grasp_frame = ttk.Frame(frame)
         grasp_frame.pack(fill=tk.X, pady=5)
 
-        ttk.Button(grasp_frame, text="前往抓取点", command=lambda: self.plan_and_run_picking_trajectory(self.delta_coordinates_3d, release=True, y_first=True)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(grasp_frame, text="前往抓取点", command=lambda: self.grasp_approach()).pack(side=tk.LEFT, padx=2)
 
         ttk.Button(grasp_frame, text="抓取并返回Home", command=lambda: self.grasp_depart_home(grasp=True, depart=True, validate=True, direct=True)).pack(side=tk.LEFT, padx=2)
 
@@ -837,6 +917,7 @@ class RobotControlGUI:
                             if i < len(self.arm_status_labels):
                                 self.root.after(0, lambda label=self.arm_status_labels[i], value=state: 
                                               label.config(text=f"{value:.3f}"))
+                    self.arm_status_labels[-1].config(text=f"{self.wheel_controller.agv_angle:.3f}")
                     
                     # 获取头部关节状态
                     head_states, _ = self.robot.head_joint_states()
@@ -1364,7 +1445,7 @@ class RobotControlGUI:
         except Exception as e:
             self.show_status(f"机械臂位置控制失败: {e}", "error")
     
-    def move_arm_relative(self, arm_side, delta_position, delta_orientation=None, tiem_step=1.0):
+    def move_arm_relative(self, arm_side, delta_position, delta_orientation=None, time_step=1.0):
         """相对移动机械臂末端 - 使用DELTA_POSE控制模式
         Args:
             arm_side: 'left' 或 'right'
@@ -1438,9 +1519,9 @@ class RobotControlGUI:
                 robot_states,
                 robot_actions,
                 "base_link",
-                tiem_step  # 较短的执行时间
+                time_step  # 较短的执行时间
             )
-            time.sleep(tiem_step)
+            time.sleep(time_step)
         except Exception as e:
             print(f"机械臂相对移动失败: {e}")
             self.show_status(f"机械臂相对移动失败: {e}", "error")
