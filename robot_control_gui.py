@@ -9,6 +9,7 @@ import math
 from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
 from scipy.spatial.transform import Rotation as R
 from camera_pose import compute_point_B_world
+from constants import *
 
 class RobotCoordinateTransformer:
     def __init__(self, urdf_params=None):
@@ -169,6 +170,13 @@ class RobotControlGUI:
         self.camera_target_coordinates_3d = (0, 0, 0)
         self.world_hand_coordinates_3d = (0, 0, 0)
         self.world_target_coordinates_3d = (0, 0, 0)
+        # pre set
+        head_states = self.robot.head_joint_states()[0]
+        waist_states = self.robot.waist_joint_states()[0]
+        if all(abs(head_states[i] - HEAD[i]) < 0.001 for i in range(len(HEAD))) and all(abs(waist_states[i] - WAIST[i]) < 0.001 for i in range(len(WAIST))):
+            self.camera_hand_coordinates_3d = LEFT_HAND_READY_CAMERA_COORDINATE_3D
+            self.world_hand_coordinates_3d = LEFT_HAND_READY_COORDINATE_3D
+
         self.delta_coordinates_3d = (0, 0, 0)
         self.hand_status_text = tk.StringVar()
         self.hand_status_text.set("null")
@@ -377,11 +385,16 @@ class RobotControlGUI:
             value_label.pack(side=tk.LEFT)
             self.gripper_status_labels.append(value_label)
 
-    def update_hand_position(self):
+    @property
+    def left_hand_pos(self):
         position = self.robot_controller.get_motion_status()['frames']['arm_left_link7']['position']
         x = position['x']
         y = position['y']
         z = position['z']
+        return x, y, z
+
+    def update_hand_position(self):
+        x, y, z = self.left_hand_pos
         print(x, y, z)
         self.world_hand_coordinates_3d = (x, y, z)
         self.camera_hand_coordinates_3d = self.coordinates_3d
@@ -389,7 +402,12 @@ class RobotControlGUI:
         self.camera_hand_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.camera_hand_coordinates_3d]}")
 
     def update_target_position(self):
-        yaw_rad = math.radians(-self.robot.head_joint_states()[0][0])  # degree to rad
+        yaw, pitch = self.robot.head_joint_states()[0]
+        # degree to rad
+        yaw_rad = math.radians(-90 + yaw)
+        pitch_rad = math.radians(90 + pitch)
+        roll_deg = 0  # TODO
+        roll = math.radians(roll_deg)
         self.camera_target_coordinates_3d = self.coordinates_3d
         # B_w = compute_point_B_world(A_c, B_c, A_w, roll, pitch, yaw_rad)
         assert self.world_hand_coordinates_3d
@@ -401,16 +419,28 @@ class RobotControlGUI:
             self.camera_hand_coordinates_3d,
             self.camera_target_coordinates_3d,
             self.world_hand_coordinates_3d,
-            0,
-            0,
-            yaw_rad
+            roll,
+            pitch_rad,  # reversed
+            yaw_rad  # reversed
         )
         self.world_target_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.world_target_coordinates_3d]}")
         self.camera_target_coordinates_3d_value_label.config(text=f"{[round(v, 3) for v in self.camera_target_coordinates_3d]}")
         self.delta_coordinates_3d = np.array(self.world_target_coordinates_3d) - self.world_hand_coordinates_3d
         self.delta_coordinates_3d_frame_value_label.config(text=f"{[round(v, 3) for v in self.delta_coordinates_3d]}")
 
-    def run_trajectory(self, path_nodes, side, delta_time):
+    def run_trajectory(self, path_nodes, side, delta_time, validate=False, release=False):
+        if release:
+            self.robot.move_gripper([0, 0])
+        if validate:
+            if side == "left":
+                arm_joint_values = self.robot.arm_joint_states()[0][:7]
+            elif side == "right":
+                arm_joint_values = self.robot.arm_joint_states()[0][7:14]
+            else:
+                raise RuntimeError(f"Unknown side: {side}")
+            assert arm_joint_values
+            assert len(arm_joint_values) == len(path_nodes[0])
+            assert all(abs(arm_joint_values[i] - path_nodes[0][i]) < 0.1 for i in range(len(arm_joint_values)))
         try:
             for node in path_nodes:
                 # 获取当前实时状态
@@ -453,36 +483,41 @@ class RobotControlGUI:
         except Exception as traj_e:
             print(f"轨迹执行错误: {traj_e}")
 
-    def plan_and_run_picking_tarjectory(self):
+    def plan_and_run_picking_trajectory(self, delta_coordinates_3d, release=False, y_first=False):
+        if release:
+            # open gripper
+            self.robot.move_gripper([0, 0])
         # Ignore z for now
-        step = 0.01
-        sign_x = 1 if self.delta_coordinates_3d[0] >= 0 else -1
-        sign_y = 1 if self.delta_coordinates_3d[1] >= 0 else -1
+        step = 0.005
+        sign_x = 1 if delta_coordinates_3d[0] >= 0 else -1
+        sign_y = 1 if delta_coordinates_3d[1] >= 0 else -1
         deltas = [[0.0, 0.0, 0.0]]
         node = [0.0, 0.0, 0.0]
         is_x_reached = False
         is_y_reached = False
         while True:
             next_delta = [0.0, 0.0, 0.0]
-            if is_x_reached:
+            if y_first and not is_y_reached:
                 pass
-            elif abs(node[0] - self.delta_coordinates_3d[0]) <= step:
-                # next_delta[0] = self.delta_coordinates_3d[0] - node[0]
-                node[0] = self.delta_coordinates_3d[0]
+            elif is_x_reached:
+                pass
+            elif abs(node[0] - delta_coordinates_3d[0]) <= step:
+                # next_delta[0] = delta_coordinates_3d[0] - node[0]
+                node[0] = delta_coordinates_3d[0]
                 is_x_reached = True
             else:
                 next_delta[0] = step * sign_x
-                node[0] = round(node[0] + step * sign_x, 2)
+                node[0] = round(node[0] + step * sign_x, 3)
 
             if is_y_reached:
                 pass
-            elif abs(node[1] - self.delta_coordinates_3d[1]) <= step:
-                # next_delta[1] = self.delta_coordinates_3d[1] - node[1]
-                node[1] = self.delta_coordinates_3d[1]
+            elif abs(node[1] - delta_coordinates_3d[1]) <= step:
+                # next_delta[1] = delta_coordinates_3d[1] - node[1]
+                node[1] = delta_coordinates_3d[1]
                 is_y_reached = True
             else:
                 next_delta[1] = step * sign_y
-                node[1] = round(node[1] + step * sign_y, 2)
+                node[1] = round(node[1] + step * sign_y, 3)
 
             print(node)
             print(next_delta)
@@ -495,11 +530,51 @@ class RobotControlGUI:
         for delta in deltas:
             self.move_arm_relative('left', delta, tiem_step=0.02)
 
+    def grasp_depart_home(self, grasp=False, depart=False, validate=True, direct=False):
+        if grasp:
+            self.robot.move_gripper([1, 0])
+            time.sleep(1)
+        if depart:
+            for i in range(5):
+                self.move_arm_relative('left', [0, 0.01, 0.01], tiem_step=0.02)
+                time.sleep(0.02)
+            for i in range(20):
+                self.move_arm_relative('left', [-0.01, 0, 0], tiem_step=0.02)
+                time.sleep(0.02)
+        delta_coordinates_3d = np.array(LEFT_HAND_HOME_COORDINATE_3D) - self.left_hand_pos
+        if validate:
+            for index, limit in enumerate([0.3, 0.3, 0.2]):
+                # TODO: for safe
+                assert abs(delta_coordinates_3d[index]) <= limit
+        self.plan_and_run_picking_trajectory(delta_coordinates_3d, release=False)
+        # self.run_trajectory([LEFT_HAND_HIGH_HOME_JOINT_VALUES], "left", 0.5)
+        # time.sleep(0.5)
+        self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.5)
+        time.sleep(0.5)
+
+    def release_part(self):
+        self.run_trajectory(HOME_TO_RELEASE_PATHS, "left", 0.02, validate=True)
+        self.robot.move_gripper([0, 0])
+        time.sleep(1)
+        reversed_paths = list(reversed(HOME_TO_RELEASE_PATHS))
+        self.run_trajectory(reversed_paths, "left", 0.02, validate=False)
+        self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.2)
+        time.sleep(0.2)
+
     def setup_pick_and_place_panel(self, parent):
         """设置控制面板"""
         # 创建滚动区域
         frame = ttk.Frame(parent)
         parent.add(frame, text="pickAndPlace")
+
+        home_frame = ttk.Frame(frame)
+        home_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(home_frame, text="回Home位置(！直接模式)", command=lambda: self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 2)).pack(side=tk.LEFT, padx=2)
+
+        # ttk.Button(home_frame, text="回Home位置(！步进模式)", command=lambda: self.grasp_depart_home(grasp=False, validate=False)).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(home_frame, text="前往Ready位置(!处于Home位置)", command=lambda: self.run_trajectory(HOME_TO_READY_PATHS, "left", 0.02, validate=True, release=True)).pack(side=tk.LEFT, padx=2)
 
         hand_frame = ttk.Frame(frame)
         hand_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -507,13 +582,13 @@ class RobotControlGUI:
         world_hand_coordinates_3d_frame = ttk.Frame(hand_frame)
         world_hand_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(world_hand_coordinates_3d_frame, text="world_hand_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.world_hand_coordinates_3d_value_label = ttk.Label(world_hand_coordinates_3d_frame, text="0.000")
+        self.world_hand_coordinates_3d_value_label = ttk.Label(world_hand_coordinates_3d_frame, text=f"{[round(v, 3) for v in self.world_hand_coordinates_3d]}")
         self.world_hand_coordinates_3d_value_label.pack(side=tk.LEFT)
 
         camera_hand_coordinates_3d_frame = ttk.Frame(hand_frame)
         camera_hand_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(camera_hand_coordinates_3d_frame, text="camera_hand_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.camera_hand_coordinates_3d_value_label = ttk.Label(camera_hand_coordinates_3d_frame, text="0.000")
+        self.camera_hand_coordinates_3d_value_label = ttk.Label(camera_hand_coordinates_3d_frame, text=f"{[round(v, 3) for v in self.camera_hand_coordinates_3d]}")
         self.camera_hand_coordinates_3d_value_label.pack(side=tk.LEFT)
 
         ttk.Button(hand_frame, text="更新手部位置", command=lambda: self.update_hand_position()).pack(side=tk.LEFT, padx=2)
@@ -533,15 +608,22 @@ class RobotControlGUI:
         self.camera_target_coordinates_3d_value_label = ttk.Label(camera_target_coordinates_3d_frame, text="0.000")
         self.camera_target_coordinates_3d_value_label.pack(side=tk.LEFT)
 
-        ttk.Button(frame, text="更新目标位置", command=lambda: self.update_target_position()).pack(side=tk.LEFT, padx=2)
-
         delta_coordinates_3d_frame = ttk.Frame(target_frame)
         delta_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(delta_coordinates_3d_frame, text="delta_coordinates_3d:\n").pack(side=tk.LEFT)
         self.delta_coordinates_3d_frame_value_label = ttk.Label(delta_coordinates_3d_frame, text="0.000")
         self.delta_coordinates_3d_frame_value_label.pack(side=tk.LEFT)
 
-        ttk.Button(frame, text="执行抓取", command=lambda: self.plan_and_run_picking_tarjectory()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(target_frame, text="更新目标位置", command=lambda: self.update_target_position()).pack(side=tk.LEFT, padx=2)
+
+        grasp_frame = ttk.Frame(frame)
+        grasp_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(grasp_frame, text="前往抓取点", command=lambda: self.plan_and_run_picking_trajectory(self.delta_coordinates_3d, release=True, y_first=True)).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(grasp_frame, text="抓取并返回Home", command=lambda: self.grasp_depart_home(grasp=True, depart=True, validate=True, direct=True)).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(grasp_frame, text="前往释放点释放物件", command=lambda: self.release_part()).pack(side=tk.LEFT, padx=2)
 
         
     def setup_control_panel(self, parent):
@@ -1329,12 +1411,15 @@ class RobotControlGUI:
             arm_states, _ = self.robot.arm_joint_states()
             head_states, _ = self.robot.head_joint_states()
             waist_states, _ = self.robot.waist_joint_states()
-            
+            assert arm_states
+            assert head_states
+            assert waist_states
+
             # 构建完整的机器人状态（参考SDK文档的格式）
             robot_states = {
-                "head": head_states if head_states else [0.0, 0.0],
-                "waist": waist_states if waist_states else [0.0, 0.0],
-                "arm": arm_states if arm_states else [0.0] * 14  # 14个关节
+                "head": head_states,
+                "waist": waist_states,
+                "arm": arm_states
             }
             
             # 构建6维动作数据（位置3 + 姿态3）

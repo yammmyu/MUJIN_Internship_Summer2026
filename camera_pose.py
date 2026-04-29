@@ -200,29 +200,36 @@ if __name__ == "__main__":
 
     print("=" * 60)
 
-    yaw_deg = -28.64788975654116
-    # yaw_deg = 0
+    # yaw_deg = 45.836486034520085
+    yaw_deg = -90
     yaw_rad = math.radians(yaw_deg)
     print(yaw_rad)
-    roll = 0
-    # pitch = math.radians(0.2199999237060547)
-    pitch = 0
+    roll_deg = 0
+    roll = math.radians(roll_deg)
+    # pitch_deg = 17.188872997805056
+    pitch_deg = 90
+    pitch = math.radians(pitch_deg)
+    # pitch = -11.459655566238098
 
     # 相机坐标系中的点
     # A_c = [0.22, -0.378, 1.207]  # A 点
     # B_c = [0.404, -0.434, 1.207]  # B 点
 
-    A_c = [-0.199, 0.076, 0.466]  # A 点
-    B_c = [0.019, 0.045, 0.466]  # B 点
+    # A_c = [-0.103, 0.077, 0.324]  # A 点
+    # B_c = [0.121, 0.072, 0.477]  # B 点
+
+    # A_c = [-0.087, 0.079, 0.363]  # A 点
+    A_c = [-0.29, 0.13, 0.434]  # A 点
+    B_c = [-0.085, 0.145, 0.579]  # B 点
 
     # A 点世界坐标
-    A_w = [0.5214255306006392, 0.4455203887213439, 0.8947249170524721]  # 地面上的点 (假设 Z 向上)
+    A_w = [0.643, 0.323, 0.901]  # 地面上的点 (假设 Z 向上)
 
     B_w = compute_point_B_world(A_c, B_c, A_w, roll, pitch, yaw_rad)
     print(f"A_c = {A_c}")
     print(f"B_c = {B_c}")
     print(f"A_w = {A_w}")
-    print(f"相机姿态: roll={roll:.1f}°, pitch={pitch:.1f}°, yaw={yaw_deg}°")
+    print(f"相机姿态: roll={roll_deg:.1f}°, pitch={pitch_deg:.1f}°, yaw={yaw_deg}°")
     print(f"B_w = {B_w}")
     print()
 

@@ -1,5 +1,6 @@
 import numpy as np
 import time
+import json
 from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController, Slam
 from scipy.spatial.transform import Rotation as R
 
@@ -486,15 +487,18 @@ def main():
             return
         run_trajectory(robot, robot_controller, paths, "left")
 
-    def record():
+    def record(timeout=5, save=None):
         t0 = time.time()
         data = []
         while True:
             left_j0 = robot.arm_joint_states()[0][:7]
             data.append(left_j0)
-            if time.time() - t0 > 5:
+            if time.time() - t0 > timeout:
                 break
             time.sleep(0.02)
+        if save is not None:
+            with open(save, "w+") as f:
+                json.dump({"data": data}, f)
         return data
 
     from IPython import embed
