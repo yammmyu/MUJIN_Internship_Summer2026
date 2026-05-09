@@ -2,6 +2,9 @@ import copy
 import tkinter as tk
 from tkinter import ttk
 import cv2
+import base64
+import json
+import http
 import numpy as np
 from PIL import Image, ImageTk
 import threading
@@ -12,7 +15,11 @@ from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotContro
 from scipy.spatial.transform import Rotation as R
 from camera_pose import compute_point_B_world
 from control_wheel_example import WheelController
+from robot_info_server import create_robot_info_http_server, RobotInfo
 from constants import *
+
+PC4080_HOST = "10.12.11.144"
+PC4080_PORT = 9000
 
 class RobotCoordinateTransformer:
     def __init__(self, urdf_params=None):
@@ -157,12 +164,13 @@ class RobotControlGUI:
         
         # 相机图像缓存
         self.camera_images = {
-            "hand_left": None,
-            "hand_right": None, 
+            "hand_left": None,  # cache latest two images for inference
+            "hand_right": None,  # cache latest two images for inference
             "head": None,
-            "head_depth": None,
+            "head_depth": None,  # cache latest one image
             "head_center_fisheye": None
         }
+        self.last_two_left_arm_joint_values = []
 
         # 相机内参缓存
         self.camera_intrinsics = {
@@ -172,6 +180,10 @@ class RobotControlGUI:
             "head_depth": None,
             "head_center_fisheye": None
         }
+
+        # update robot_info
+        self.robot_info = RobotInfo()
+        create_robot_info_http_server(self.robot_info)
 
         # MONEY
         self.coordinates_3d = (0, 0, 0)
@@ -414,7 +426,7 @@ class RobotControlGUI:
         return self.wheel_controller.agv_angle
 
     @property
-    def left_hand_joint_values(self):
+    def left_arm_joint_values(self):
         return self.robot.arm_joint_states()[0][:7]
 
     @property
@@ -574,25 +586,25 @@ class RobotControlGUI:
             assert len(current_path) == len(next_path)
             has_inserted_path = False
             for i in range(len(current_path)):
-                if abs(next_path[i] - current_path[i]) > 0.01:
+                if abs(next_path[i] - current_path[i]) > 0.005:
                     has_inserted_path = True
                     if next_path[i] > current_path[i]:
-                        insert_path[i] += 0.01
+                        insert_path[i] += 0.005
                     else:
-                        insert_path[i] -= 0.01
+                        insert_path[i] -= 0.005
             if has_inserted_path:
                 paths.insert(index + 1, insert_path)
             index += 1
         return paths
 
     def grasp_approach(self):
-        arm_joint_values = self.left_hand_joint_values
+        arm_joint_values = self.left_arm_joint_values
         assert arm_joint_values
         assert len(arm_joint_values) == len(LEFT_HAND_HOME_JOINT_VALUES)
         if all(abs(arm_joint_values[i] - LEFT_HAND_HOME_JOINT_VALUES[i]) < 0.1 for i in range(len(arm_joint_values))):
             self.run_trajectory(HOME_TO_READY_PATHS, "left", 0.02, validate=True, release=True)
             time.sleep(0.2)
-        arm_joint_values = self.left_hand_joint_values
+        arm_joint_values = self.left_arm_joint_values
         assert arm_joint_values
         assert all(abs(arm_joint_values[i] - LEFT_HAND_READY_JOINT_VALUES[i]) < 0.1 for i in range(len(arm_joint_values)))
         self.plan_and_run_picking_trajectory(self.delta_coordinates_3d, release=True, y_first=True)
@@ -614,7 +626,7 @@ class RobotControlGUI:
         #         assert abs(delta_coordinates_3d[index]) <= limit
         # self.plan_and_run_picking_trajectory(delta_coordinates_3d, release=False, time_step=0.02)
         # self.run_trajectory([LEFT_HAND_HIGH_HOME_JOINT_VALUES], "left", 1)
-        self.run_trajectory(self.get_smooth_paths([self.left_hand_joint_values, LEFT_HAND_HIGH_HOME_JOINT_VALUES]), "left", 0.01)
+        self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values, LEFT_HAND_HIGH_HOME_JOINT_VALUES]), "left", 0.01)
         # self.run_trajectory(HIGH_HOME_TO_HOME_PATHS, "left", 0.1)
         # delta_coordinates_3d = np.array(LEFT_HAND_HOME_COORDINATE_3D) - self.left_hand_pos
         # if validate:
@@ -623,7 +635,7 @@ class RobotControlGUI:
         #         assert abs(delta_coordinates_3d[index]) <= limit
         # self.plan_and_run_picking_trajectory(delta_coordinates_3d, release=False, time_step=0.02)
         # self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 1)
-        self.run_trajectory(self.get_smooth_paths([self.left_hand_joint_values, LEFT_HAND_HOME_JOINT_VALUES]), "left", 0.01)
+        self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values, LEFT_HAND_HOME_JOINT_VALUES]), "left", 0.01)
 
     def release_part(self):
         if abs(self.wheel_angle_deg - 215) > 5:
@@ -705,6 +717,84 @@ class RobotControlGUI:
 
         ttk.Button(grasp_frame, text="前往释放点释放物件", command=lambda: self.release_part()).pack(side=tk.LEFT, padx=2)
 
+        inference_frame = ttk.Frame(frame)
+        inference_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(inference_frame, text="InferenceOnce", command=lambda: self.inference_once()).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(inference_frame, text="ExecuteInferenceResultOnce", command=lambda: self.execute_inference_result(once=True)).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(inference_frame, text="ExecuteInferenceResult", command=lambda: self.execute_inference_result()).pack(side=tk.LEFT, padx=2)
+
+    def inference_once(self):
+        # TODO: left_hand only
+        camera_images = self.camera_images["hand_left"]
+        assert camera_images is not None and len(camera_images) == 2
+        assert len(self.last_two_left_arm_joint_values) == 2
+
+        def _encode_image(rgb_image):
+            rgb_image_cv2 = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+            _, buffer = cv2.imencode('.jpg', rgb_image_cv2, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            base64_string = base64.b64encode(buffer).decode('utf-8')
+            return base64_string
+
+        req = {
+            'left_imgs': [_encode_image(image) for image in camera_images],
+            'state': self.last_two_left_arm_joint_values,
+        }
+
+        def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict:
+            body = json.dumps(req).encode('utf-8')
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            try:
+                conn.request(
+                    'POST', '/predict', body=body,
+                    headers={
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'Content-Length': str(len(body)),
+                    })
+                resp = conn.getresponse()
+                resp_body = resp.read()
+                try:
+                    resp_obj = json.loads(resp_body.decode('utf-8')) if resp_body else {}
+                except Exception as e:
+                    return {'error': f'failed to parse JSON response: {e!r} '
+                                     f'(status={resp.status})'}
+                if resp.status != 200:
+                    if isinstance(resp_obj, dict) and 'error' in resp_obj:
+                        return resp_obj
+                    return {'error': f'HTTP {resp.status}: {resp_obj!r}'}
+                return resp_obj
+            finally:
+                conn.close()
+
+        resp = post_predict(PC4080_HOST, PC4080_PORT, req, timeout=10)
+
+        if 'error' in resp:
+            print(f'\nServer error: {resp["error"]}')
+            return
+
+        action = np.asarray(resp['action'], dtype=np.float32)
+        self.robot_info.left_joint_predict_start_values = left_arm_state
+        self.robot_info.left_joint_predict_action_values = action.tolist()
+        print("left_joint_predict_start_values=", self.robot_info.left_joint_predict_start_values)
+        print("left_joint_predict_action_values=", self.robot_info.left_joint_predict_action_values)
+
+
+    def execute_inference_result(self, once: bool = False):
+        def safety_check():
+            return True
+        while self.robot_info.left_joint_predict_action_values:
+            action = self.robot_info.left_joint_predict_action_values.pop(0)
+            if not safety_check():
+                self.robot_info.left_joint_predict_start_values = None
+                self.robot_info.left_joint_predict_action_values = None
+                break
+            # DANGEROUS!!!!
+            self.run_trajectory([action[:7]], "left", 0.2, validate=True)
+            self.robot.move_gripper([1 if action[-1] > 0.5 else 0, 0])
+            if once:
+                break
         
     def setup_control_panel(self, parent):
         """设置控制面板"""
@@ -859,6 +949,12 @@ class RobotControlGUI:
         def update_camera_images():
             while True:
                 try:
+
+                    left_arm_state = self.left_arm_joint_values + [self.robot.gripper_states()[0][0]]
+                    if not self.last_two_left_arm_joint_values:
+                        self.last_two_left_arm_joint_values = [left_arm_state, left_arm_state]
+                    else:
+                        self.last_two_left_arm_joint_values = [self.last_two_left_arm_joint_values[-1], left_arm_state]
                     # 获取各个相机的最新图像和内参
                     for camera_name in self.camera_images.keys():
                         image, timestamp = self.camera.get_latest_image(camera_name)
@@ -872,7 +968,12 @@ class RobotControlGUI:
                             # 对于深度相机，保存原始图像数据
                             if camera_name == "head_depth":
                                 self.camera_images[camera_name] = image.copy()
-                            
+                            elif "hand" in camera_name:
+                                if self.camera_images[camera_name] is None:
+                                    self.camera_images[camera_name] = [image, image]
+                                else:
+                                    self.camera_images[camera_name] = [self.camera_images[camera_name][-1], image]
+
                             self.update_camera_display(camera_name, image)
                         
                         # 获取相机内参（只需获取一次）
@@ -918,7 +1019,12 @@ class RobotControlGUI:
                                 self.root.after(0, lambda label=self.arm_status_labels[i], value=state: 
                                               label.config(text=f"{value:.3f}"))
                     self.arm_status_labels[-1].config(text=f"{self.wheel_controller.agv_angle:.3f}")
-                    
+
+                    # update robot_info
+                    gripper_states, _ = self.robot.gripper_states()
+                    self.robot_info.left_joint_values = arm_states[:7] + [gripper_states[0]]
+                    self.robot_info.right_joint_values = arm_states[7:14] + [gripper_states[1]]
+
                     # 获取头部关节状态
                     head_states, _ = self.robot.head_joint_states()
                     if head_states and len(head_states) == 2:
@@ -939,13 +1045,13 @@ class RobotControlGUI:
                     
                     # 获取夹爪状态（使用arm_joint_states的最后两个值）
                     try:
-                        if arm_states and len(arm_states) >= 2:
-                            # 假设夹爪状态是手臂关节的最后两个值
-                            gripper_states = arm_states[-2:]
-                            for i, state in enumerate(gripper_states):
-                                if i < len(self.gripper_status_labels) and state is not None:
-                                    self.root.after(0, lambda label=self.gripper_status_labels[i], value=state:
-                                                  label.config(text=f"{value:.3f}"))
+                        # if arm_states and len(arm_states) >= 2:
+                        #     # 假设夹爪状态是手臂关节的最后两个值
+                        #     gripper_states = arm_states[-2:]
+                        for i, state in enumerate(gripper_states):
+                            if i < len(self.gripper_status_labels) and state is not None:
+                                self.root.after(0, lambda label=self.gripper_status_labels[i], value=state:
+                                              label.config(text=f"{value:.3f}"))
                     except Exception as e:
                         print(f"夹爪状态更新错误: {e}")
                     
