@@ -9,12 +9,15 @@ import numpy as np
 
 @dataclasses.dataclass
 class RobotInfo:
+    lock = threading.Lock()
+    timestamp: float = 0.0
     left_joint_values: list[float] = None  # 7 joint values + 1 gripper joint value
     right_joint_values: list[float] = None  # 7 joint values + 1 gripper joint value
-    left_joint_predict_start_values: list[float] = None
-    right_joint_predict_start_values: list[float] = None
+    left_joint_predict_start_values: list[list[float]] = None
+    right_joint_predict_start_values: list[list[float]] = None
     left_joint_predict_action_values: list[list[float]] = None
     right_joint_predict_action_values: list[list[float]] = None
+    inference_timestamp: float = 0.0
 
 
 # ---------------------------- request handling -------------------------- #
@@ -82,7 +85,8 @@ def create_robot_handler(robot_info: RobotInfo):
             self._send_json(200, resp)
 
         def log_message(self, fmt, *args):
-            print(f'[{self.address_string()}] {fmt % args}')
+            # print(f'[{self.address_string()}] {fmt % args}')
+            pass
 
     return RobotInfoHandler
 
