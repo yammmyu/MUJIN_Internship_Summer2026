@@ -207,24 +207,23 @@ class RobotControlGUI:
         # 相机图像缓存
         self.camera_images = {
             "hand_left": None,  # cache latest two images for inference
-            "hand_right": None,  # cache latest two images for inference
-            "head": None,
-            "head_depth": None,  # cache latest one image
-            "head_center_fisheye": None
+            # "hand_right": None,  # cache latest two images for inference
+            # "head": None,
+            # "head_depth": None,  # cache latest one image
+            # "head_center_fisheye": None
         }
         self.last_two_left_arm_joint_values = []
 
         # 相机内参缓存
         self.camera_intrinsics = {
             "hand_left": None,
-            "hand_right": None, 
-            "head": None,
-            "head_depth": None,
-            "head_center_fisheye": None
+            # "hand_right": None,
+            # "head": None,
+            # "head_depth": None,
+            # "head_center_fisheye": None
         }
 
         # update robot_info
-        self.joint_values_by_timestamp = []
         self.robot_info = RobotInfo()
         create_robot_info_http_server(self.robot_info)
 
@@ -288,6 +287,7 @@ class RobotControlGUI:
         }
         
         self.setup_ui()
+        self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
         
@@ -694,21 +694,22 @@ class RobotControlGUI:
         # self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 1)
         self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values, LEFT_HAND_HOME_JOINT_VALUES]), "left", 0.01)
 
-    def release_part(self):
-        if abs(self.wheel_angle_deg - 215) > 5:
-            self.wheel_controller.commands.append(215)
-            while True:
-                if abs(self.wheel_angle_deg - 205) <= 10:
-                    break
-                time.sleep(0.1)
-        self.run_trajectory(HOME_TO_RELEASE_PATHS, "left", 0.02, validate=True)
+    def release_part(self, path, target_wheel_angle_deg=None, home_wheel_angle_deg=None):
+        if target_wheel_angle_deg is not None:
+            if abs(self.wheel_angle_deg - target_wheel_angle_deg) > 5:
+                self.wheel_controller.commands.append(target_wheel_angle_deg)
+                while True:
+                    if abs(self.wheel_angle_deg - target_wheel_angle_deg) <= 10:
+                        break
+                    time.sleep(0.1)
+        self.run_trajectory(path, "left", 0.02, validate=True)
         self.robot.move_gripper([0, 0])
         time.sleep(1)
-        self.wheel_controller.commands.append(180)
-        reversed_paths = list(reversed(HOME_TO_RELEASE_PATHS))
+        if home_wheel_angle_deg is not None:
+            self.wheel_controller.commands.append(home_wheel_angle_deg)
+        reversed_paths = list(reversed(path))
         self.run_trajectory(reversed_paths, "left", 0.02, validate=False)
         self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.2)
-        time.sleep(0.2)
 
     def setup_pick_and_place_panel(self, parent):
         """设置控制面板"""
@@ -725,7 +726,9 @@ class RobotControlGUI:
 
         ttk.Button(home_frame, text="前往Pre Grasp位置(!处于Home位置)", command=lambda: self.run_trajectory(HOME_TO_LEFT_PRE_GRASP_PATHS, "left", 0.01, validate=True, release=True)).pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(home_frame, text="前往Ready位置(!处于Home位置)", command=lambda: self.run_trajectory(HOME_TO_READY_PATHS, "left", 0.02, validate=True, release=True)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(home_frame, text="将物品放回(!处于Home位置)", command=lambda: self.release_part(HOME_TO_PUT_BACK_TARGET)).pack(side=tk.LEFT, padx=2)
+
+        # ttk.Button(home_frame, text="前往Ready位置(!处于Home位置)", command=lambda: self.run_trajectory(HOME_TO_READY_PATHS, "left", 0.02, validate=True, release=True)).pack(side=tk.LEFT, padx=2)
 
         hand_frame = ttk.Frame(frame)
         hand_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -774,7 +777,7 @@ class RobotControlGUI:
 
         ttk.Button(grasp_frame, text="抓取并返回Home", command=lambda: self.grasp_depart_home(grasp=True, depart=True, validate=True, direct=True)).pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(grasp_frame, text="前往释放点释放物件", command=lambda: self.release_part()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(grasp_frame, text="前往释放点释放物件", command=lambda: self.release_part(HOME_TO_RELEASE_PATHS, target_wheel_angle_deg=220, home_wheel_angle_deg=180)).pack(side=tk.LEFT, padx=2)
 
         # 左夹爪
         left_gripper_frame = ttk.Frame(frame)
@@ -816,8 +819,10 @@ class RobotControlGUI:
         def _run_auto_inference():
             while self.is_auto_inference:
                 # TODO: test
-                self.inference_once(use_deep_copy=True)
-                time.sleep(0.02)
+                if self.inference_once(use_deep_copy=True):
+                    time.sleep(0.03)
+                else:
+                    time.sleep(0.01)
 
         def _run_auto_execution():
             exponential_smoother = ExponentialSmoother(alpha=0.2)
@@ -850,38 +855,44 @@ class RobotControlGUI:
                             self.robot.move_gripper([1, 0])
                             self.is_grabbing_target = True
                             self.actions = []
-                            time.sleep(1.5)
-                            for _ in range(10):
+                            time.sleep(1)
+                            for _ in range(20):
                                 self.move_arm_relative('left', [0, 0, 0.002], time_step=0.02)
                             last_inference_timestamp = time.time() + 1
                             continue
                     self.actions = self.actions[2:]
                 if not self.actions:
-                    # check robot postion when there's no action
                     x, y, z = self.left_hand_pos
+                    # stop and move to home
+                    if self.is_grabbing_target and x < 0.565 and z > 0.9:
+                        print("stop auto inference and move back to home position")
+                        self.is_auto_inference = False
+                        self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values, LEFT_HAND_HOME_JOINT_VALUES]), "left", 0.01)
+                        break
+                    # check robot postion when there's no action
                     # TODO: test: robot is next to container
                     if self.is_grabbing_target:
                         if z < 0.9:
                             alpha = 0.3
                             smooth_step = 0.002
-                        elif x > 0.6:
-                            alpha = 0.4
-                            smooth_step = 0.005
+                        # elif x > 0.6:
+                        #     alpha = 0.6
+                        #     smooth_step = 0.01
                         else:
-                            alpha = 0.4
+                            alpha = 0.6
                             smooth_step = 0.01
                     else:
-                        if x > 0.62:
+                        if x > 0.64:
                             alpha = 0.1
                             smooth_step = 0.002
                         elif x > 0.6:
-                            alpha = 0.4
+                            alpha = 0.2
                             smooth_step = 0.0025
                         elif x > 0.55:
                             alpha = 0.4
                             smooth_step = 0.005
                         else:
-                            alpha = 0.4
+                            alpha = 0.3
                             smooth_step = 0.01
                     exponential_smoother.set_alpha(alpha)
 
@@ -1152,6 +1163,53 @@ class RobotControlGUI:
         reset_frame = ttk.Frame(control_frame)
         reset_frame.pack(fill=tk.X, padx=10, pady=10)
         ttk.Button(reset_frame, text="机器人复位", command=self.reset_robot, style="Accent.TButton").pack()
+
+    def start_inference_data_collection_thread(self):
+        def update_inference_data():
+            camera_name = "hand_left"
+            # fps = 30  # hz
+            fps = 31  # hz
+            joint_values_by_timestamp = []
+            next_update_camera_image_timestamp = 0.0
+            while True:
+                now = time.time()
+                # update joint values
+                arm_states, _ = self.robot.arm_joint_states()
+                gripper_states, _ = self.robot.gripper_states()
+                joint_values_by_timestamp.append((now, arm_states[:7] + [1 if gripper_states[0] > 0.5 else 0], arm_states[7:14] + [1 if gripper_states[1] > 0.5 else 0]))
+                if now < next_update_camera_image_timestamp:
+                    time.sleep(0.01)
+                    continue
+                # update camera images
+                image, timestamp = self.camera.get_latest_image(camera_name)
+                if image is not None:
+                    timestamp_s = timestamp * 1e-9
+                    wait_time_s = 0.001
+                    if len(joint_values_by_timestamp) >= 2 and timestamp_s > self.robot_info.timestamp + wait_time_s:
+                        next_update_camera_image_timestamp = timestamp_s + 1.0 / fps
+                        if self.camera_images[camera_name] is None:
+                            self.camera_images[camera_name] = [image, image]
+                        else:
+                            self.camera_images[camera_name] = [self.camera_images[camera_name][-1], image]
+
+                        for i in range(len(joint_values_by_timestamp) - 1):
+                            if joint_values_by_timestamp[i][0] <= timestamp_s and joint_values_by_timestamp[i + 1][0] > timestamp_s:
+                                break
+                        with self.robot_info.lock:
+                            self.robot_info.timestamp = timestamp_s
+                            self.robot_info.left_joint_values = joint_values_by_timestamp[i][1]
+                            self.robot_info.right_joint_values = joint_values_by_timestamp[i][2]
+
+                            left_arm_state = copy.deepcopy(joint_values_by_timestamp[i][1])
+                            if not self.last_two_left_arm_joint_values:
+                                self.last_two_left_arm_joint_values = [left_arm_state, left_arm_state]
+                            else:
+                                self.last_two_left_arm_joint_values = [self.last_two_left_arm_joint_values[-1], left_arm_state]
+                        joint_values_by_timestamp = joint_values_by_timestamp[-1000:]
+                time.sleep(0.01)  # 10ms
+
+        inference_data_collection_thread = threading.Thread(target=update_inference_data, daemon=True)
+        inference_data_collection_thread.start()
         
     def start_camera_thread(self):
         """启动相机图像更新线程"""
@@ -1160,8 +1218,6 @@ class RobotControlGUI:
                 try:
                     # 获取各个相机的最新图像和内参
                     for camera_name in self.camera_images.keys():
-                        if camera_name != "hand_left":
-                            continue
                         image, timestamp = self.camera.get_latest_image(camera_name)
                         if image is not None:
                             # print(f"获取到 {camera_name} 相机图像，图像 shape: {image.shape}")
@@ -1173,58 +1229,6 @@ class RobotControlGUI:
                             # 对于深度相机，保存原始图像数据
                             if camera_name == "head_depth":
                                 self.camera_images[camera_name] = image.copy()
-                            elif "hand" in camera_name:
-                                # if self.camera_images[camera_name] is None:
-                                #     self.camera_images[camera_name] = [image, image]
-                                # else:
-                                #     self.camera_images[camera_name] = [self.camera_images[camera_name][-1], image]
-
-                                timestamp_s = timestamp * 1e-9
-                                # wait_time_s = 0.2 if self.is_grabbing_target else 0.001
-                                # wait_time_s = 0.02 if self.is_grabbing_target else 0.001
-                                wait_time_s = 0.001
-                                if "left" in camera_name and len(self.joint_values_by_timestamp) >= 2 and timestamp_s > self.robot_info.timestamp + wait_time_s:
-                                    if self.camera_images[camera_name] is None:
-                                        self.camera_images[camera_name] = [image, image]
-                                    else:
-                                        self.camera_images[camera_name] = [self.camera_images[camera_name][-1], image]
-
-
-                                    for i in range(len(self.joint_values_by_timestamp) - 1):
-                                        if self.joint_values_by_timestamp[i][0] <= timestamp_s and self.joint_values_by_timestamp[i + 1][0] > timestamp_s:
-                                            break
-                                    with self.robot_info.lock:
-                                        self.robot_info.timestamp = timestamp_s
-                                        self.robot_info.left_joint_values = self.joint_values_by_timestamp[i][1]
-                                        self.robot_info.right_joint_values = self.joint_values_by_timestamp[i][2]
-
-                                        left_arm_state = copy.deepcopy(self.joint_values_by_timestamp[i][1])
-                                        if not self.last_two_left_arm_joint_values:
-                                            self.last_two_left_arm_joint_values = [left_arm_state, left_arm_state]
-                                        else:
-                                            self.last_two_left_arm_joint_values = [self.last_two_left_arm_joint_values[-1], left_arm_state]
-                                    self.joint_values_by_timestamp = self.joint_values_by_timestamp[-1000:]
-
-                                # TODO: test
-                                # if "left" in camera_name and timestamp_s > self.robot_info.timestamp:
-                                # if "left" in camera_name:
-                                #     if self.camera_images[camera_name] is None:
-                                #         self.camera_images[camera_name] = [image, image]
-                                #     else:
-                                #         self.camera_images[camera_name] = [self.camera_images[camera_name][-1], image]
-                                #     # self.joint_values_by_timestamp = []
-                                #     arm_states, _ = self.robot.arm_joint_states()
-                                #     gripper_states, _ = self.robot.gripper_states()
-                                #     with self.robot_info.lock:
-                                #         self.robot_info.timestamp = timestamp_s
-                                #         self.robot_info.left_joint_values = arm_states[:7] + [1 if gripper_states[0] > 0.5 else 0]
-                                #         self.robot_info.right_joint_values = arm_states[7:14] + [1 if gripper_states[1] > 0.5 else 0]
-                                #
-                                #         left_arm_state = copy.deepcopy(self.robot_info.left_joint_values)
-                                #         if not self.last_two_left_arm_joint_values:
-                                #             self.last_two_left_arm_joint_values = [left_arm_state, left_arm_state]
-                                #         else:
-                                #             self.last_two_left_arm_joint_values = [self.last_two_left_arm_joint_values[-1], left_arm_state]
 
                             self.update_camera_display(camera_name, image)
                         
@@ -1250,19 +1254,7 @@ class RobotControlGUI:
                                 self.camera_intrinsics[camera_name] = self.get_default_camera_intrinsics(camera_name)
                                 print(f"使用默认内参 for {camera_name}: {info_e}")
 
-                    # update robot_info
-                    # gripper_states, _ = self.robot.gripper_states()
-                    # arm_states, _ = self.robot.arm_joint_states()
-                    # with self.robot_info.lock:
-                    #     self.robot_info.left_joint_values = arm_states[:7] + [gripper_states[0]]
-                    #     self.robot_info.right_joint_values = arm_states[7:14] + [gripper_states[1]]
-                    #     if not self.last_two_left_arm_joint_values:
-                    #         self.last_two_left_arm_joint_values = [self.robot_info.left_joint_values, self.robot_info.left_joint_values]
-                    #     else:
-                    #         self.last_two_left_arm_joint_values = [self.last_two_left_arm_joint_values[-1], self.robot_info.left_joint_values]
-                    # self.robot_info.timestamp = time.time()
-
-                    time.sleep(0.02)  # 20ms更新一次
+                    time.sleep(0.1)  # 100ms更新一次
                 except Exception as e:
                     print(f"相机更新错误: {e}")
                     time.sleep(1)
@@ -1283,11 +1275,6 @@ class RobotControlGUI:
                                 self.root.after(0, lambda label=self.arm_status_labels[i], value=state: 
                                               label.config(text=f"{value:.3f}"))
                     self.arm_status_labels[-1].config(text=f"{self.wheel_controller.agv_angle:.3f}")
-
-                    # arm_states, _ = self.robot.arm_joint_states()
-                    gripper_states, _ = self.robot.gripper_states()
-                    now = time.time()
-                    self.joint_values_by_timestamp.append((now, arm_states[:7] + [1 if gripper_states[0] > 0.5 else 0], arm_states[7:14] + [1 if gripper_states[1] > 0.5 else 0]))
 
                     # 获取头部关节状态
                     head_states, _ = self.robot.head_joint_states()
@@ -1319,7 +1306,7 @@ class RobotControlGUI:
                     # except Exception as e:
                     #     print(f"夹爪状态更新错误: {e}")
                     
-                    time.sleep(0.01)  # 10ms更新一次
+                    time.sleep(0.1)  # 100ms更新一次
                 except Exception as e:
                     print(f"状态更新错误: {e}")
                     time.sleep(1)
