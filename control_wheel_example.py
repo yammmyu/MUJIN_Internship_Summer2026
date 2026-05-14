@@ -18,12 +18,16 @@ class WheelController(Node):
         self.get_logger().info('Arm Controller Example node started. Publishing a target pose for the left arm.')
         self.shutdown = False
         self.commands = []
+        self._agv_angle = 0.0
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     @property
     def agv_angle(self) -> float:
         return self._agv_angle
+
+    def _update_agv_angle(self):
+        self._agv_angle = math.degrees(self.slam.get_chassis_position()[0]['agv_angle'])
 
     def _run(self):
         self.slam = Slam()
@@ -52,7 +56,7 @@ class WheelController(Node):
 
         # 4. 发布消息
         while not self.shutdown:
-            self._agv_angle = math.degrees(self.slam.get_chassis_position()[0]['agv_angle'])
+            self._update_agv_angle()
             if not self.commands:
                 time.sleep(0.1)
                 continue
@@ -60,7 +64,7 @@ class WheelController(Node):
             initial_angle_deg = copy.deepcopy(self._agv_angle)
             sign = 1 if target_angle_deg >= initial_angle_deg else -1
             while not self.shutdown:
-                self._agv_angle = math.degrees(self.slam.get_chassis_position()[0]['agv_angle'])
+                self._update_agv_angle()
                 current_angle_deg = self._agv_angle
                 new_sign = 1 if target_angle_deg >= current_angle_deg else -1
                 diff = abs(current_angle_deg % 360 - target_angle_deg)
