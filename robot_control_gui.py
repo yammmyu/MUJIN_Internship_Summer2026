@@ -1,4 +1,6 @@
 import copy
+import os
+import sys
 import tkinter as tk
 from tkinter import ttk
 import cv2
@@ -19,6 +21,13 @@ from camera_pose import compute_point_B_world
 from control_wheel_example import WheelController
 from robot_info_server import create_robot_info_http_server, RobotInfo
 from constants import *
+
+_PYOPENXR_EXAMPLES_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyopenxr", "pyopenxr_examples")
+)
+if _PYOPENXR_EXAMPLES_DIR not in sys.path:
+    sys.path.insert(0, _PYOPENXR_EXAMPLES_DIR)
+from xr_examples.pico_vr_server.server import DummyServer
 
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9000
@@ -225,6 +234,18 @@ class RobotControlGUI:
         self.robot_info = RobotInfo()
         create_robot_info_http_server(self.robot_info)
 
+        # VR 串流：把 camera_images 合成的画面通过 DummyServer 推给客户端
+        self.dummy_server = DummyServer(
+            host="0.0.0.0",
+            port=5555,
+            port2=5556,
+            image_path=None,
+            use_default_image=False,
+            rate_hz=30.0,
+            jpeg_quality=80,
+        )
+        self.dummy_server.start()
+
         # auto inference
         self.actions = []
         self.is_auto_inference: bool = False
@@ -288,6 +309,7 @@ class RobotControlGUI:
         self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
+        self.start_vr_stream_thread()
 
     def _setup_styles(self):
         """统一配置 ttk 视觉样式：颜色、字体、内边距，让界面更现代化。"""
@@ -1341,6 +1363,78 @@ class RobotControlGUI:
         camera_thread = threading.Thread(target=update_camera_images, daemon=True)
         camera_thread.start()
         
+    def start_vr_stream_thread(self):
+        """启动 VR 串流线程：将 self.camera_images 合成为一张 image，推给 DummyServer。"""
+        target_period = 1.0 / 30.0
+
+        def _to_rgb_uint8(img):
+            """Normalize an entry from self.camera_images to an HxWx3 RGB uint8 ndarray."""
+            if img is None:
+                return None
+            if isinstance(img, (list, tuple)):
+                if not img:
+                    return None
+                img = img[-1]
+            if not isinstance(img, np.ndarray):
+                return None
+            if img.ndim == 2:
+                # 深度或灰度：归一化到 8-bit，再展成三通道
+                arr = img.astype(np.float32)
+                if np.isfinite(arr).any():
+                    valid = arr[np.isfinite(arr)]
+                    vmin = float(valid.min()) if valid.size else 0.0
+                    vmax = float(valid.max()) if valid.size else 1.0
+                else:
+                    vmin, vmax = 0.0, 1.0
+                span = max(vmax - vmin, 1e-6)
+                arr = np.clip((arr - vmin) / span, 0.0, 1.0)
+                arr = (arr * 255.0).astype(np.uint8)
+                return np.stack([arr, arr, arr], axis=-1)
+            if img.ndim == 3 and img.shape[2] >= 3:
+                arr = img[:, :, :3]
+                if arr.dtype != np.uint8:
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+                return arr
+            return None
+
+        def _compose(frames):
+            """水平拼接所有相机的最新帧，统一到相同高度。"""
+            if not frames:
+                return None
+            target_h = max(f.shape[0] for f in frames)
+            resized = []
+            for f in frames:
+                h, w = f.shape[:2]
+                if h != target_h:
+                    new_w = max(1, int(round(w * target_h / h)))
+                    f = cv2.resize(f, (new_w, target_h), interpolation=cv2.INTER_AREA)
+                resized.append(f)
+            return np.concatenate(resized, axis=1)
+
+        def stream_loop():
+            next_tick = time.monotonic()
+            while True:
+                try:
+                    frames = []
+                    for name in sorted(self.camera_images.keys()):
+                        rgb = _to_rgb_uint8(self.camera_images.get(name))
+                        if rgb is not None:
+                            frames.append(rgb)
+                    composite = _compose(frames)
+                    if composite is not None:
+                        self.dummy_server.set_image(composite, color_order="RGB")
+                except Exception as e:
+                    print(f"VR 串流合成错误: {e}")
+                next_tick += target_period
+                sleep_for = next_tick - time.monotonic()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    next_tick = time.monotonic()
+
+        stream_thread = threading.Thread(target=stream_loop, daemon=True)
+        stream_thread.start()
+
     def start_status_thread(self):
         """启动状态更新线程"""
         def update_robot_status():
@@ -2308,6 +2402,10 @@ class RobotControlGUI:
     def on_closing(self):
         """窗口关闭时的处理"""
         try:
+            try:
+                self.dummy_server.stop()
+            except Exception as e:
+                print(f"关闭 VR 串流服务器出错: {e}")
             self.camera.close()
             self.robot.shutdown()
             self.root.destroy()
