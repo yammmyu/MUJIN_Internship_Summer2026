@@ -175,17 +175,15 @@ class RobotCoordinateTransformer:
             return res.x
         else:
             return None
- 
-class RobotControlGUI:
-    def __init__(self, root):
-        self.root = root
 
 
 class RobotControlGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("智元G1机器人控制界面")
-        self.root.geometry("1400x900")
+        self.root.geometry("1500x950")
+        self.root.minsize(1200, 800)
+        self._setup_styles()
         
         # 初始化机器人和相机
         self.robot = Robot()
@@ -290,186 +288,237 @@ class RobotControlGUI:
         self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
-        
+
+    def _setup_styles(self):
+        """统一配置 ttk 视觉样式：颜色、字体、内边距，让界面更现代化。"""
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+
+        # 调色板
+        PRIMARY = "#1976d2"      # 主操作（推理、抓取等）
+        PRIMARY_HOVER = "#1565c0"
+        SUCCESS = "#2e7d32"      # 安全/确认操作（回 Home、张开）
+        SUCCESS_HOVER = "#1b5e20"
+        WARN = "#ef6c00"         # 警示操作（前往抓取/释放）
+        WARN_HOVER = "#e65100"
+        DANGER = "#c62828"       # 危险操作（自动运行/复位）
+        DANGER_HOVER = "#8e0000"
+        MUTED = "#546e7a"        # 次要按钮（清除、复位坐标）
+        MUTED_HOVER = "#37474f"
+        TEXT = "#1a1a1a"
+        BG = "#f5f6f8"
+        CARD_BG = "#ffffff"
+
+        self.root.configure(bg=BG)
+
+        # ---- 文本/容器样式 ----
+        style.configure("TFrame", background=BG)
+        style.configure("Card.TFrame", background=CARD_BG)
+
+        style.configure("TLabel", background=BG, foreground=TEXT, font=("Microsoft YaHei", 10))
+        style.configure("Title.TLabel",
+                        background=BG, foreground=PRIMARY,
+                        font=("Microsoft YaHei", 18, "bold"))
+        style.configure("Subtitle.TLabel",
+                        background=BG, foreground="#666",
+                        font=("Microsoft YaHei", 10))
+        style.configure("Section.TLabel",
+                        background=BG, foreground=TEXT,
+                        font=("Microsoft YaHei", 11, "bold"))
+        style.configure("Value.TLabel",
+                        background=BG, foreground="#0d47a1",
+                        font=("Consolas", 10))
+        style.configure("Status.TLabel",
+                        background="#263238", foreground="#e0f7fa",
+                        font=("Consolas", 10), padding=(8, 4))
+
+        style.configure("TLabelframe", background=BG, borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label",
+                        background=BG, foreground=PRIMARY,
+                        font=("Microsoft YaHei", 10, "bold"))
+
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab",
+                        font=("Microsoft YaHei", 10, "bold"),
+                        padding=(16, 6))
+        style.map("TNotebook.Tab",
+                  background=[("selected", PRIMARY)],
+                  foreground=[("selected", "white")])
+
+        # ---- 按钮样式 ----
+        base_btn = dict(font=("Microsoft YaHei", 10), padding=(10, 6), borderwidth=0)
+        style.configure("TButton", **base_btn)
+
+        def _color_button(name, base, hover, fg="white"):
+            style.configure(name, background=base, foreground=fg, **base_btn)
+            style.map(name,
+                      background=[("active", hover), ("pressed", hover)],
+                      foreground=[("active", fg)])
+
+        _color_button("Primary.TButton", PRIMARY, PRIMARY_HOVER)
+        _color_button("Success.TButton", SUCCESS, SUCCESS_HOVER)
+        _color_button("Warn.TButton", WARN, WARN_HOVER)
+        _color_button("Danger.TButton", DANGER, DANGER_HOVER)
+        _color_button("Muted.TButton", MUTED, MUTED_HOVER)
+        _color_button("Accent.TButton", PRIMARY, PRIMARY_HOVER)  # 兼容旧引用
+
+        # 复选框
+        style.configure("TCheckbutton",
+                        background=BG, foreground=TEXT,
+                        font=("Microsoft YaHei", 10))
+        # 下拉框
+        style.configure("TCombobox", padding=4)
+
     def setup_ui(self):
-        """设置用户界面"""
-        # 主框架
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # 顶部标题
-        title_label = ttk.Label(main_frame, text="智元G1机器人控制面板")
-        title_label.pack(pady=10)
-        
-        # 创建左右分栏
-        left_frame = ttk.Frame(main_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        
-        right_frame = ttk.Frame(main_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        
-        # 左侧面板：相机图像
+        """设置用户界面：顶部标题栏 + 左右分栏 + 底部状态栏。"""
+        # ===== 顶部标题栏 =====
+        header = ttk.Frame(self.root)
+        header.pack(fill=tk.X, padx=16, pady=(12, 4))
+        ttk.Label(header, text="智元 G1 机器人控制面板",
+                  style="Title.TLabel").pack(side=tk.LEFT)
+        ttk.Label(header, text="Mujin · Humanoid Control Console",
+                  style="Subtitle.TLabel").pack(side=tk.LEFT, padx=12, pady=(8, 0))
+
+        # ===== 底部状态栏（先建，固定贴底） =====
+        status_bar = ttk.Frame(self.root)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 10))
+        self.status_label = ttk.Label(
+            status_bar, textvariable=self.status_text,
+            style="Status.TLabel", anchor=tk.W)
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(status_bar, text="清除",
+                   style="Muted.TButton",
+                   command=lambda: self.status_text.set("就绪")
+                   ).pack(side=tk.RIGHT, padx=(8, 0))
+
+        # ===== 主分栏 =====
+        body = ttk.Frame(self.root)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        left_frame = ttk.Frame(body)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        right_frame = ttk.Frame(body)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        # 左侧：相机画面
         self.setup_camera_panel(left_frame)
-        
-        # 右侧面板：状态和控制
-        self.setup_status_panel(right_frame)
 
+        # 右侧：单一统一 Notebook 包含 [关节状态 / 抓取任务 / 手动调试]
+        right_notebook = ttk.Notebook(right_frame)
+        right_notebook.pack(fill=tk.BOTH, expand=True)
 
-        jog_frame = ttk.LabelFrame(right_frame, text="Jog控制面板")
-        jog_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        # 创建标签页
-        notebook = ttk.Notebook(jog_frame)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        status_tab = ttk.Frame(right_notebook)
+        right_notebook.add(status_tab, text="📊  关节状态")
+        self.setup_status_panel(status_tab)
 
-        self.setup_pick_and_place_panel(notebook)
-        self.setup_control_panel(notebook)
-
-        # 底部状态栏
-        status_frame = ttk.Frame(self.root, relief=tk.SUNKEN)
-        status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
-        
-        self.status_label = ttk.Label(status_frame, textvariable=self.status_text, anchor=tk.W)
-        self.status_label.pack(side=tk.LEFT, padx=5, pady=2)
-        
-        # 清除状态按钮
-        ttk.Button(status_frame, text="清除", 
-                  command=lambda: self.status_text.set("就绪")).pack(side=tk.RIGHT, padx=5)
+        self.setup_pick_and_place_panel(right_notebook)
+        self.setup_control_panel(right_notebook)
         
     def setup_camera_panel(self, parent):
-        """设置相机图像面板"""
-        camera_frame = ttk.LabelFrame(parent, text="相机图像")
+        """设置相机图像面板：紧凑的 RGBD 控制条 + 居中相机显示。"""
+        camera_frame = ttk.LabelFrame(parent, text="  📷  相机视图  ")
         camera_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 添加RGBD坐标转换控制面板
-        rgbd_control_frame = ttk.Frame(camera_frame)
-        rgbd_control_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(rgbd_control_frame, text="RGBD坐标转换:").pack(side=tk.LEFT, padx=5)
+
+        # ---- RGBD 工具条 ----
+        toolbar = ttk.Frame(camera_frame)
+        toolbar.pack(fill=tk.X, padx=10, pady=(8, 6))
+
         self.rgbd_enabled_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rgbd_control_frame, text="启用3D坐标获取", 
-                         variable=self.rgbd_enabled_var,
-                         command=self.toggle_rgbd_mode).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(rgbd_control_frame, text="目标相机:").pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(toolbar, text="启用 3D 坐标点击",
+                        variable=self.rgbd_enabled_var,
+                        command=self.toggle_rgbd_mode).pack(side=tk.LEFT)
+
+        ttk.Label(toolbar, text="目标相机:").pack(side=tk.LEFT, padx=(16, 4))
         self.target_camera_var = tk.StringVar(value="head")
-        camera_combo = ttk.Combobox(rgbd_control_frame, textvariable=self.target_camera_var,
-                                   values=["head", "head_depth", "hand_left", "hand_right"],
-                                   state="readonly", width=12)
-        camera_combo.pack(side=tk.LEFT, padx=5)
+        camera_combo = ttk.Combobox(
+            toolbar, textvariable=self.target_camera_var,
+            values=["head", "head_depth", "hand_left", "hand_right"],
+            state="readonly", width=14)
+        camera_combo.pack(side=tk.LEFT)
         camera_combo.bind('<<ComboboxSelected>>', self.on_camera_selection_change)
-        
-        ttk.Button(rgbd_control_frame, text="清除记录", 
-                  command=self.clear_coordinate_records).pack(side=tk.LEFT, padx=5)
-        
-        # 创建3x2网格显示相机
+
+        ttk.Button(toolbar, text="清除坐标记录",
+                   style="Muted.TButton",
+                   command=self.clear_coordinate_records
+                   ).pack(side=tk.RIGHT)
+
+        # ---- 相机显示区 ----
         self.camera_labels = {}
-        
-        # 第一行：左手、右手和头部鱼眼相机
-        top_frame = ttk.Frame(camera_frame)
-        top_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # 左手相机
-        left_frame = ttk.Frame(top_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        ttk.Label(left_frame, text="左手相机").pack()
-        self.camera_labels["hand_left"] = ttk.Label(left_frame, borderwidth=2, relief="solid")
-        self.camera_labels["hand_left"].pack(pady=5)
+
+        display_area = ttk.Frame(camera_frame)
+        display_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # 左手相机（当前主显示）
+        cam_card = ttk.Frame(display_area)
+        cam_card.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(cam_card, text="🤚  左手相机 (点击获取像素坐标)",
+                  style="Section.TLabel").pack(anchor=tk.W, pady=(0, 4))
+        self.camera_labels["hand_left"] = ttk.Label(
+            cam_card, borderwidth=1, relief="solid", background="#222")
+        self.camera_labels["hand_left"].pack(fill=tk.BOTH, expand=True)
         self._bind_camera_click("hand_left")
-        
-        # # 右手相机
-        # right_frame = ttk.Frame(top_frame)
-        # right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        # ttk.Label(right_frame, text="右手相机").pack()
-        # self.camera_labels["hand_right"] = ttk.Label(right_frame, borderwidth=2, relief="solid")
-        # self.camera_labels["hand_right"].pack(pady=5)
-        # self._bind_camera_click("hand_right")
-        #
-        # depth_frame = ttk.Frame(top_frame)
-        # depth_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        # ttk.Label(depth_frame, text="头部深度相机").pack()
-        # self.camera_labels["head_depth"] = ttk.Label(depth_frame, borderwidth=2, relief="solid")
-        # self.camera_labels["head_depth"].pack(pady=5)
-        # self._bind_camera_click("head_depth")
-        
-        # 第二行：头部RGB和深度相机
-        # bottom_frame = ttk.Frame(camera_frame)
-        # bottom_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        #
-        # # 头部RGB相机
-        # head_frame = ttk.Frame(bottom_frame)
-        # head_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        # ttk.Label(head_frame, text="头部RGB相机 (点击获取3D坐标)").pack()
-        # self.camera_labels["head"] = ttk.Label(head_frame, borderwidth=2, relief="solid")
-        # self.camera_labels["head"].pack(pady=5)
-        # self._bind_camera_click("head")
-        
+
     def setup_status_panel(self, parent):
-        """设置状态面板"""
-        status_frame = ttk.LabelFrame(parent, text="关节状态")
-        status_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # 创建标签页
-        notebook = ttk.Notebook(status_frame)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 手臂关节状态
-        arm_frame = ttk.Frame(notebook)
-        notebook.add(arm_frame, text="手臂关节")
-        
+        """关节状态面板：左侧"手臂"，右侧"头部&腰部"+"夹爪"，用 grid 整齐对齐。"""
+        wrapper = ttk.Frame(parent)
+        wrapper.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # 让左右两列均分
+        wrapper.columnconfigure(0, weight=1, uniform="cols")
+        wrapper.columnconfigure(1, weight=1, uniform="cols")
+
+        def _make_kv_row(parent_frame, row, name):
+            ttk.Label(parent_frame, text=name + ":",
+                      anchor=tk.W).grid(row=row, column=0, sticky="w", padx=8, pady=3)
+            value_label = ttk.Label(parent_frame, text="0.000",
+                                    style="Value.TLabel", anchor=tk.E, width=10)
+            value_label.grid(row=row, column=1, sticky="e", padx=8, pady=3)
+            return value_label
+
+        # ---- 左列：手臂关节 ----
+        arm_box = ttk.LabelFrame(wrapper, text="  🦾  手臂关节  ")
+        arm_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        arm_box.columnconfigure(1, weight=1)
+
         self.arm_status_labels = []
         for i in range(14):
-            frame = ttk.Frame(arm_frame)
-            frame.pack(fill=tk.X, padx=5, pady=2)
-            name_label = ttk.Label(frame, text=f"{self.joint_names['arm'][i]}:", width=15)
-            name_label.pack(side=tk.LEFT)
-            value_label = ttk.Label(frame, text="0.000", width=10)
-            value_label.pack(side=tk.LEFT)
-            self.arm_status_labels.append(value_label)
-        # agv angle
-        frame = ttk.Frame(arm_frame)
-        frame.pack(fill=tk.X, padx=5, pady=2)
-        name_label = ttk.Label(frame, text="agv_angle:", width=15)
-        name_label.pack(side=tk.LEFT)
-        value_label = ttk.Label(frame, text="0.000", width=10)
-        value_label.pack(side=tk.LEFT)
-        self.arm_status_labels.append(value_label)
-        
-        # 头部和腰部状态
-        head_waist_frame = ttk.Frame(notebook)
-        notebook.add(head_waist_frame, text="头部&腰部")
-        
+            self.arm_status_labels.append(
+                _make_kv_row(arm_box, i, self.joint_names['arm'][i]))
+        # AGV 角度
+        self.arm_status_labels.append(_make_kv_row(arm_box, 14, "AGV 角度"))
+
+        # ---- 右列：头部&腰部 + 夹爪 ----
+        right_col = ttk.Frame(wrapper)
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        right_col.columnconfigure(0, weight=1)
+
+        head_waist_box = ttk.LabelFrame(right_col, text="  🧠  头部 & 腰部  ")
+        head_waist_box.grid(row=0, column=0, sticky="new", pady=(0, 8))
+        head_waist_box.columnconfigure(1, weight=1)
+
         self.head_waist_status_labels = {}
-        
-        # 头部状态
+        row_idx = 0
         for i, name in enumerate(self.joint_names['head']):
-            frame = ttk.Frame(head_waist_frame)
-            frame.pack(fill=tk.X, padx=5, pady=5)
-            ttk.Label(frame, text=f"{name}:", width=15).pack(side=tk.LEFT)
-            value_label = ttk.Label(frame, text="0.000", width=10)
-            value_label.pack(side=tk.LEFT)
-            self.head_waist_status_labels[f"head_{i}"] = value_label
-        
-        # 腰部状态 - 根据SDK文档: [pitch(rad), height(cm)]
+            self.head_waist_status_labels[f"head_{i}"] = _make_kv_row(
+                head_waist_box, row_idx, name)
+            row_idx += 1
         for i, name in enumerate(self.joint_names['waist']):
-            frame = ttk.Frame(head_waist_frame)
-            frame.pack(fill=tk.X, padx=5, pady=5)
-            ttk.Label(frame, text=f"{name}:", width=15).pack(side=tk.LEFT)
-            value_label = ttk.Label(frame, text="0.000", width=10)
-            value_label.pack(side=tk.LEFT)
-            self.head_waist_status_labels[f"waist_{i}"] = value_label
-        
-        # 夹爪状态
-        gripper_frame = ttk.Frame(notebook)
-        notebook.add(gripper_frame, text="夹爪")
-        
+            self.head_waist_status_labels[f"waist_{i}"] = _make_kv_row(
+                head_waist_box, row_idx, name)
+            row_idx += 1
+
+        gripper_box = ttk.LabelFrame(right_col, text="  🤏  夹爪  ")
+        gripper_box.grid(row=1, column=0, sticky="new")
+        gripper_box.columnconfigure(1, weight=1)
+
         self.gripper_status_labels = []
         for i, name in enumerate(self.joint_names['gripper']):
-            frame = ttk.Frame(gripper_frame)
-            frame.pack(fill=tk.X, padx=5, pady=5)
-            ttk.Label(frame, text=f"{name}:", width=15).pack(side=tk.LEFT)
-            value_label = ttk.Label(frame, text="0.000", width=10)
-            value_label.pack(side=tk.LEFT)
-            self.gripper_status_labels.append(value_label)
+            self.gripper_status_labels.append(
+                _make_kv_row(gripper_box, i, name))
 
     @property
     def wheel_angle_deg(self):
@@ -712,95 +761,159 @@ class RobotControlGUI:
         self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.2)
 
     def setup_pick_and_place_panel(self, parent):
-        """设置控制面板"""
-        # 创建滚动区域
-        frame = ttk.Frame(parent)
-        parent.add(frame, text="pickAndPlace")
+        """抓取任务面板：按"预设位置 / 坐标 / 抓取 / 推理 / 夹爪"分组。"""
+        tab = ttk.Frame(parent)
+        parent.add(tab, text="🎯  抓取任务")
 
-        home_frame = ttk.Frame(frame)
-        home_frame.pack(fill=tk.X, pady=5)
+        # 用 Canvas+滚动条 包裹，内容多时可滚动
+        canvas = tk.Canvas(tab, highlightthickness=0, bg="#f5f6f8")
+        sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
 
-        ttk.Button(home_frame, text="回Home位置(！直接模式)", command=lambda: self.run_trajectory([LEFT_HAND_HOME_JOINT_VALUES], "left", 0.5)).pack(side=tk.LEFT, padx=2)
+        # ===== 1. 预设位置 =====
+        sec_home = ttk.LabelFrame(body, text="  🏠  预设位置  ")
+        sec_home.pack(fill=tk.X, padx=10, pady=(10, 6))
+        row = ttk.Frame(sec_home)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="回 Home (直接)",
+                   style="Success.TButton",
+                   command=lambda: self.run_trajectory(
+                       [LEFT_HAND_HOME_JOINT_VALUES], "left", 0.5)
+                   ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="前往 Pre-Grasp",
+                   style="Primary.TButton",
+                   command=lambda: self.run_trajectory(
+                       HOME_TO_LEFT_PRE_GRASP_PATHS, "left", 0.01,
+                       validate=True, release=True)
+                   ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row, text="将物品放回",
+                   style="Warn.TButton",
+                   command=lambda: self.release_part(HOME_TO_PUT_BACK_TARGET)
+                   ).pack(side=tk.LEFT, padx=6)
 
-        # ttk.Button(home_frame, text="回Home位置(！步进模式)", command=lambda: self.grasp_depart_home(grasp=False, validate=False)).pack(side=tk.LEFT, padx=2)
+        # ===== 2. 坐标信息 =====
+        sec_coords = ttk.LabelFrame(body, text="  📍  坐标信息  ")
+        sec_coords.pack(fill=tk.X, padx=10, pady=6)
 
-        ttk.Button(home_frame, text="前往Pre Grasp位置(!处于Home位置)", command=lambda: self.run_trajectory(HOME_TO_LEFT_PRE_GRASP_PATHS, "left", 0.01, validate=True, release=True)).pack(side=tk.LEFT, padx=2)
+        def _coord_row(parent_frame, row, label_text, init_text):
+            ttk.Label(parent_frame, text=label_text,
+                      anchor=tk.W).grid(row=row, column=0, sticky="w", padx=8, pady=3)
+            value_label = ttk.Label(parent_frame, text=init_text,
+                                    style="Value.TLabel", anchor=tk.W)
+            value_label.grid(row=row, column=1, sticky="ew", padx=8, pady=3)
+            return value_label
 
-        ttk.Button(home_frame, text="将物品放回(!处于Home位置)", command=lambda: self.release_part(HOME_TO_PUT_BACK_TARGET)).pack(side=tk.LEFT, padx=2)
+        # 手部坐标块
+        hand_box = ttk.Frame(sec_coords)
+        hand_box.pack(fill=tk.X, padx=8, pady=(8, 4))
+        hand_box.columnconfigure(1, weight=1)
+        ttk.Label(hand_box, text="✋ 手部位置",
+                  style="Section.TLabel").grid(row=0, column=0, columnspan=2,
+                                               sticky="w", padx=8)
+        self.world_hand_coordinates_3d_value_label = _coord_row(
+            hand_box, 1, "  world_hand_3d",
+            f"{[round(v, 3) for v in self.world_hand_coordinates_3d]}")
+        self.camera_hand_coordinates_3d_value_label = _coord_row(
+            hand_box, 2, "  camera_hand_3d",
+            f"{[round(v, 3) for v in self.camera_hand_coordinates_3d]}")
+        ttk.Button(hand_box, text="🔄 更新手部位置",
+                   style="Primary.TButton",
+                   command=lambda: self.update_hand_position()
+                   ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 8))
 
-        # ttk.Button(home_frame, text="前往Ready位置(!处于Home位置)", command=lambda: self.run_trajectory(HOME_TO_READY_PATHS, "left", 0.02, validate=True, release=True)).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(sec_coords, orient="horizontal").pack(fill=tk.X, padx=8, pady=4)
 
-        hand_frame = ttk.Frame(frame)
-        hand_frame.pack(fill=tk.X, padx=5, pady=5)
+        # 目标坐标块
+        target_box = ttk.Frame(sec_coords)
+        target_box.pack(fill=tk.X, padx=8, pady=(4, 8))
+        target_box.columnconfigure(1, weight=1)
+        ttk.Label(target_box, text="🎯 目标位置",
+                  style="Section.TLabel").grid(row=0, column=0, columnspan=2,
+                                               sticky="w", padx=8)
+        self.world_target_coordinates_3d_value_label = _coord_row(
+            target_box, 1, "  world_target_3d", "0.000")
+        self.camera_target_coordinates_3d_value_label = _coord_row(
+            target_box, 2, "  camera_target_3d", "0.000")
+        self.delta_coordinates_3d_frame_value_label = _coord_row(
+            target_box, 3, "  delta_3d", "0.000")
+        ttk.Button(target_box, text="🔄 更新目标位置",
+                   style="Primary.TButton",
+                   command=lambda: self.update_target_position()
+                   ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 4))
 
-        world_hand_coordinates_3d_frame = ttk.Frame(hand_frame)
-        world_hand_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(world_hand_coordinates_3d_frame, text="world_hand_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.world_hand_coordinates_3d_value_label = ttk.Label(world_hand_coordinates_3d_frame, text=f"{[round(v, 3) for v in self.world_hand_coordinates_3d]}")
-        self.world_hand_coordinates_3d_value_label.pack(side=tk.LEFT)
+        # ===== 3. 抓取动作 =====
+        sec_grasp = ttk.LabelFrame(body, text="  🤖  抓取动作  ")
+        sec_grasp.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(sec_grasp)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="前往抓取点",
+                   style="Warn.TButton",
+                   command=lambda: self.grasp_approach()
+                   ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="抓取并返回 Home",
+                   style="Primary.TButton",
+                   command=lambda: self.grasp_depart_home(
+                       grasp=True, depart=True, validate=True, direct=True)
+                   ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row, text="前往释放点释放物件",
+                   style="Warn.TButton",
+                   command=lambda: self.release_part(
+                       HOME_TO_RELEASE_PATHS,
+                       target_wheel_angle_deg=220, home_wheel_angle_deg=180)
+                   ).pack(side=tk.LEFT, padx=6)
 
-        camera_hand_coordinates_3d_frame = ttk.Frame(hand_frame)
-        camera_hand_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(camera_hand_coordinates_3d_frame, text="camera_hand_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.camera_hand_coordinates_3d_value_label = ttk.Label(camera_hand_coordinates_3d_frame, text=f"{[round(v, 3) for v in self.camera_hand_coordinates_3d]}")
-        self.camera_hand_coordinates_3d_value_label.pack(side=tk.LEFT)
+        # ===== 4. 夹爪 =====
+        sec_grip = ttk.LabelFrame(body, text="  🤏  左夹爪  ")
+        sec_grip.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(sec_grip)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="张开",
+                   style="Success.TButton",
+                   command=lambda: self.move_gripper("left", 0.0)
+                   ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="闭合",
+                   style="Warn.TButton",
+                   command=lambda: self.move_gripper("left", 1.0)
+                   ).pack(side=tk.LEFT, padx=6)
 
-        ttk.Button(hand_frame, text="更新手部位置", command=lambda: self.update_hand_position()).pack(side=tk.LEFT, padx=2)
+        # ===== 5. 推理控制 =====
+        sec_inf = ttk.LabelFrame(body, text="  🧠  推理控制  ")
+        sec_inf.pack(fill=tk.X, padx=10, pady=6)
 
-        target_frame = ttk.Frame(frame)
-        target_frame.pack(fill=tk.X, padx=5, pady=5)
+        manual_row = ttk.Frame(sec_inf)
+        manual_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(manual_row, text="单步:",
+                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(manual_row, text="推理一次",
+                   style="Primary.TButton",
+                   command=lambda: self.inference_once()
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(manual_row, text="执行一次推理轨迹",
+                   style="Primary.TButton",
+                   command=lambda: self.execute_inference_result(once=True)
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(manual_row, text="执行剩余推理轨迹",
+                   style="Primary.TButton",
+                   command=lambda: self.execute_inference_result()
+                   ).pack(side=tk.LEFT, padx=4)
 
-        world_target_coordinates_3d_frame = ttk.Frame(target_frame)
-        world_target_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(world_target_coordinates_3d_frame, text="world_target_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.world_target_coordinates_3d_value_label = ttk.Label(world_target_coordinates_3d_frame, text="0.000")
-        self.world_target_coordinates_3d_value_label.pack(side=tk.LEFT)
-
-        camera_target_coordinates_3d_frame = ttk.Frame(target_frame)
-        camera_target_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(camera_target_coordinates_3d_frame, text="camera_target_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.camera_target_coordinates_3d_value_label = ttk.Label(camera_target_coordinates_3d_frame, text="0.000")
-        self.camera_target_coordinates_3d_value_label.pack(side=tk.LEFT)
-
-        delta_coordinates_3d_frame = ttk.Frame(target_frame)
-        delta_coordinates_3d_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(delta_coordinates_3d_frame, text="delta_coordinates_3d:\n").pack(side=tk.LEFT)
-        self.delta_coordinates_3d_frame_value_label = ttk.Label(delta_coordinates_3d_frame, text="0.000")
-        self.delta_coordinates_3d_frame_value_label.pack(side=tk.LEFT)
-
-        ttk.Button(target_frame, text="更新目标位置", command=lambda: self.update_target_position()).pack(side=tk.LEFT, padx=2)
-
-        grasp_frame = ttk.Frame(frame)
-        grasp_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Button(grasp_frame, text="前往抓取点", command=lambda: self.grasp_approach()).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(grasp_frame, text="抓取并返回Home", command=lambda: self.grasp_depart_home(grasp=True, depart=True, validate=True, direct=True)).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(grasp_frame, text="前往释放点释放物件", command=lambda: self.release_part(HOME_TO_RELEASE_PATHS, target_wheel_angle_deg=220, home_wheel_angle_deg=180)).pack(side=tk.LEFT, padx=2)
-
-        # 左夹爪
-        left_gripper_frame = ttk.Frame(frame)
-        left_gripper_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(left_gripper_frame, text="左夹爪:", width=8).pack(side=tk.LEFT)
-        ttk.Button(left_gripper_frame, text="张开", command=lambda: self.move_gripper("left", 0.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_gripper_frame, text="闭合", command=lambda: self.move_gripper("left", 1.0)).pack(side=tk.LEFT, padx=2)
-
-        inference_frame = ttk.Frame(frame)
-        inference_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Button(inference_frame, text="推理一次", command=lambda: self.inference_once()).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(inference_frame, text="执行推理轨迹一次", command=lambda: self.execute_inference_result(once=True)).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(inference_frame, text="执行剩余推理轨迹", command=lambda: self.execute_inference_result()).pack(side=tk.LEFT, padx=2)
-
-        inference_continue_frame = ttk.Frame(frame)
-        inference_continue_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Button(inference_continue_frame, text="开始自动运行(危险！！)", command=lambda: self.auto_inference()).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(inference_continue_frame, text="停止自动运行", command=lambda: self.auto_inference(stop=True)).pack(side=tk.LEFT, padx=2)
+        auto_row = ttk.Frame(sec_inf)
+        auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Label(auto_row, text="自动:",
+                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(auto_row, text="⚠ 开始自动运行",
+                   style="Danger.TButton",
+                   command=lambda: self.auto_inference()
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_row, text="■ 停止自动运行",
+                   style="Muted.TButton",
+                   command=lambda: self.auto_inference(stop=True)
+                   ).pack(side=tk.LEFT, padx=4)
 
     def auto_inference(self, stop: bool = False):
         if stop:
@@ -1017,152 +1130,118 @@ class RobotControlGUI:
                     break
         
     def setup_control_panel(self, parent):
-        """设置控制面板"""
-        # 创建滚动区域
-        scroll_frame = ttk.Frame(parent)
-        parent.add(scroll_frame, text="jog")
-        # scroll_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # 创建画布和滚动条
-        canvas = tk.Canvas(scroll_frame, height=400)
-        scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # 打包滚动组件
+        """手动调试面板：腰/头/夹爪/机械臂方向控制 + 预设姿态 + 复位。"""
+        tab = ttk.Frame(parent)
+        parent.add(tab, text="🕹  手动调试")
+
+        # 滚动容器
+        canvas = tk.Canvas(tab, highlightthickness=0, bg="#f5f6f8")
+        sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # 在可滚动框架中创建控制面板
-        control_frame = ttk.LabelFrame(scrollable_frame, text="机器人控制")
-        control_frame.pack(fill=tk.X, pady=5)
+        sb.pack(side="right", fill="y")
 
-        # 腰部控制
-        waist_frame = ttk.Frame(control_frame)
-        waist_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(waist_frame, text="腰部控制:").pack(anchor=tk.W)
-        
-        # 腰部升降
-        lift_frame = ttk.Frame(waist_frame)
-        lift_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(lift_frame, text="升降:", width=8).pack(side=tk.LEFT)
-        ttk.Button(lift_frame, text="上升", command=lambda: self.move_waist_lift(2.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(lift_frame, text="下降", command=lambda: self.move_waist_lift(-2.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(lift_frame, text="复位", command=lambda: self.move_waist_lift(0.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 腰部俯仰
-        pitch_frame = ttk.Frame(waist_frame)
-        pitch_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(pitch_frame, text="俯仰:", width=8).pack(side=tk.LEFT)
-        ttk.Button(pitch_frame, text="前倾", command=lambda: self.move_waist_pitch(0.5)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(pitch_frame, text="后仰", command=lambda: self.move_waist_pitch(-0.5)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(pitch_frame, text="复位", command=lambda: self.move_waist_pitch(0.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 头部控制
-        head_frame = ttk.Frame(control_frame)
-        head_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(head_frame, text="头部控制:").pack(anchor=tk.W)
-        
-        # 头部偏航
-        yaw_frame = ttk.Frame(head_frame)
-        yaw_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(yaw_frame, text="左右:", width=8).pack(side=tk.LEFT)
-        ttk.Button(yaw_frame, text="左转", command=lambda: self.move_head_yaw(0.3)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(yaw_frame, text="右转", command=lambda: self.move_head_yaw(-0.3)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(yaw_frame, text="复位", command=lambda: self.move_head_yaw(0.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 头部俯仰
-        head_pitch_frame = ttk.Frame(head_frame)
-        head_pitch_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(head_pitch_frame, text="俯仰:", width=8).pack(side=tk.LEFT)
-        ttk.Button(head_pitch_frame, text="上扬", command=lambda: self.move_head_pitch(-0.3)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(head_pitch_frame, text="下俯", command=lambda: self.move_head_pitch(0.3)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(head_pitch_frame, text="复位", command=lambda: self.move_head_pitch(0.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 夹爪控制
-        gripper_frame = ttk.Frame(control_frame)
-        gripper_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(gripper_frame, text="夹爪控制:").pack(anchor=tk.W)
-        
-        # 左夹爪
-        left_gripper_frame = ttk.Frame(gripper_frame)
-        left_gripper_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(left_gripper_frame, text="左夹爪:", width=8).pack(side=tk.LEFT)
-        ttk.Button(left_gripper_frame, text="张开", command=lambda: self.move_gripper("left", 0.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_gripper_frame, text="闭合", command=lambda: self.move_gripper("left", 1.0)).pack(side=tk.LEFT, padx=2)
-        
-        # 右夹爪
-        right_gripper_frame = ttk.Frame(gripper_frame)
-        right_gripper_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(right_gripper_frame, text="右夹爪:", width=8).pack(side=tk.LEFT)
-        ttk.Button(right_gripper_frame, text="张开", command=lambda: self.move_gripper("right", 0.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_gripper_frame, text="闭合", command=lambda: self.move_gripper("right", 1.0)).pack(side=tk.LEFT, padx=2)
+        def _arrow_btn(parent_frame, text, command, style="Primary.TButton"):
+            return ttk.Button(parent_frame, text=text, style=style,
+                              command=command, width=8)
 
-        # 机械臂末端位置控制
-        arm_frame = ttk.Frame(control_frame)
-        arm_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(arm_frame, text="机械臂末端控制:").pack(anchor=tk.W)
-        
-        # 左臂控制
-        left_arm_frame = ttk.Frame(arm_frame)
-        left_arm_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(left_arm_frame, text="左臂:", width=8).pack(side=tk.LEFT)
-        ttk.Button(left_arm_frame, text="向前", 
-                  command=lambda: self.move_arm_relative("left", [0.05, 0, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_arm_frame, text="向后", 
-                  command=lambda: self.move_arm_relative("left", [-0.05, 0, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_arm_frame, text="向左", 
-                  command=lambda: self.move_arm_relative("left", [0, 0.05, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_arm_frame, text="向右", 
-                  command=lambda: self.move_arm_relative("left", [0, -0.05, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_arm_frame, text="向上", 
-                  command=lambda: self.move_arm_relative("left", [0, 0, 0.05])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_arm_frame, text="向下", 
-                  command=lambda: self.move_arm_relative("left", [0, 0, -0.05])).pack(side=tk.LEFT, padx=2)
-        
-        # 右臂控制
-        right_arm_frame = ttk.Frame(arm_frame)
-        right_arm_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(right_arm_frame, text="右臂:", width=8).pack(side=tk.LEFT)
-        ttk.Button(right_arm_frame, text="向前", 
-                  command=lambda: self.move_arm_relative("right", [0.05, 0, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_arm_frame, text="向后", 
-                  command=lambda: self.move_arm_relative("right", [-0.05, 0, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_arm_frame, text="向左", 
-                  command=lambda: self.move_arm_relative("right", [0, 0.05, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_arm_frame, text="向右", 
-                  command=lambda: self.move_arm_relative("right", [0, -0.05, 0])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_arm_frame, text="向上", 
-                  command=lambda: self.move_arm_relative("right", [0, 0, 0.05])).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_arm_frame, text="向下", 
-                  command=lambda: self.move_arm_relative("right", [0, 0, -0.05])).pack(side=tk.LEFT, padx=2)
-        
-        # 预设位置
-        preset_frame = ttk.Frame(arm_frame)
-        preset_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(preset_frame, text="预设:", width=8).pack(side=tk.LEFT)
-        ttk.Button(preset_frame, text="双臂平举", 
-                  command=lambda: self.set_arm_preset("parallel")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(preset_frame, text="双臂下垂", 
-                  command=lambda: self.set_arm_preset("down")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(preset_frame, text="双臂前伸", 
-                  command=lambda: self.set_arm_preset("forward")).pack(side=tk.LEFT, padx=2)
+        # ===== 腰部 =====
+        sec_waist = ttk.LabelFrame(body, text="  🧍  腰部控制  ")
+        sec_waist.pack(fill=tk.X, padx=10, pady=(10, 6))
+        row1 = ttk.Frame(sec_waist); row1.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(row1, text="升降:", width=8).pack(side=tk.LEFT)
+        _arrow_btn(row1, "▲ 上升", lambda: self.move_waist_lift(2.0)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row1, "▼ 下降", lambda: self.move_waist_lift(-2.0)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row1, "复位", lambda: self.move_waist_lift(0.0),
+                   style="Muted.TButton").pack(side=tk.LEFT, padx=3)
+        row2 = ttk.Frame(sec_waist); row2.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Label(row2, text="俯仰:", width=8).pack(side=tk.LEFT)
+        _arrow_btn(row2, "↓ 前倾", lambda: self.move_waist_pitch(0.5)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row2, "↑ 后仰", lambda: self.move_waist_pitch(-0.5)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row2, "复位", lambda: self.move_waist_pitch(0.0),
+                   style="Muted.TButton").pack(side=tk.LEFT, padx=3)
 
-        # 复位按钮
-        reset_frame = ttk.Frame(control_frame)
-        reset_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(reset_frame, text="机器人复位", command=self.reset_robot, style="Accent.TButton").pack()
+        # ===== 头部 =====
+        sec_head = ttk.LabelFrame(body, text="  👀  头部控制  ")
+        sec_head.pack(fill=tk.X, padx=10, pady=6)
+        row1 = ttk.Frame(sec_head); row1.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(row1, text="左右:", width=8).pack(side=tk.LEFT)
+        _arrow_btn(row1, "← 左转", lambda: self.move_head_yaw(0.3)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row1, "→ 右转", lambda: self.move_head_yaw(-0.3)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row1, "复位", lambda: self.move_head_yaw(0.0),
+                   style="Muted.TButton").pack(side=tk.LEFT, padx=3)
+        row2 = ttk.Frame(sec_head); row2.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Label(row2, text="俯仰:", width=8).pack(side=tk.LEFT)
+        _arrow_btn(row2, "↑ 上扬", lambda: self.move_head_pitch(-0.3)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row2, "↓ 下俯", lambda: self.move_head_pitch(0.3)).pack(side=tk.LEFT, padx=3)
+        _arrow_btn(row2, "复位", lambda: self.move_head_pitch(0.0),
+                   style="Muted.TButton").pack(side=tk.LEFT, padx=3)
+
+        # ===== 夹爪 =====
+        sec_grip = ttk.LabelFrame(body, text="  🤏  夹爪控制  ")
+        sec_grip.pack(fill=tk.X, padx=10, pady=6)
+        for side, label in [("left", "左夹爪"), ("right", "右夹爪")]:
+            row = ttk.Frame(sec_grip); row.pack(fill=tk.X, padx=8, pady=5)
+            ttk.Label(row, text=label + ":", width=8).pack(side=tk.LEFT)
+            _arrow_btn(row, "张开", lambda s=side: self.move_gripper(s, 0.0),
+                       style="Success.TButton").pack(side=tk.LEFT, padx=3)
+            _arrow_btn(row, "闭合", lambda s=side: self.move_gripper(s, 1.0),
+                       style="Warn.TButton").pack(side=tk.LEFT, padx=3)
+
+        # ===== 机械臂方向控制（3x3 网格） =====
+        sec_arm = ttk.LabelFrame(body, text="  🦾  机械臂末端方向控制 (步长 5cm)  ")
+        sec_arm.pack(fill=tk.X, padx=10, pady=6)
+
+        def _build_dpad(parent_frame, side):
+            grid = ttk.Frame(parent_frame)
+            grid.pack(side=tk.LEFT, padx=12, pady=8)
+            ttk.Label(grid, text=("左臂" if side == "left" else "右臂"),
+                      style="Section.TLabel").grid(row=0, column=0, columnspan=3, pady=(0, 4))
+            # 第一排: 前 / 上
+            _arrow_btn(grid, "↑ 前", lambda: self.move_arm_relative(side, [0.05, 0, 0])
+                       ).grid(row=1, column=1, padx=2, pady=2)
+            _arrow_btn(grid, "▲ 上", lambda: self.move_arm_relative(side, [0, 0, 0.05])
+                       ).grid(row=1, column=2, padx=2, pady=2)
+            # 中排: 左 / 右
+            _arrow_btn(grid, "← 左", lambda: self.move_arm_relative(side, [0, 0.05, 0])
+                       ).grid(row=2, column=0, padx=2, pady=2)
+            _arrow_btn(grid, "→ 右", lambda: self.move_arm_relative(side, [0, -0.05, 0])
+                       ).grid(row=2, column=2, padx=2, pady=2)
+            # 末排: 后 / 下
+            _arrow_btn(grid, "↓ 后", lambda: self.move_arm_relative(side, [-0.05, 0, 0])
+                       ).grid(row=3, column=1, padx=2, pady=2)
+            _arrow_btn(grid, "▼ 下", lambda: self.move_arm_relative(side, [0, 0, -0.05])
+                       ).grid(row=3, column=2, padx=2, pady=2)
+
+        arms_row = ttk.Frame(sec_arm); arms_row.pack(fill=tk.X, padx=8, pady=4)
+        _build_dpad(arms_row, "left")
+        ttk.Separator(arms_row, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=8)
+        _build_dpad(arms_row, "right")
+
+        # ===== 预设姿态 =====
+        sec_preset = ttk.LabelFrame(body, text="  ⭐  预设姿态  ")
+        sec_preset.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(sec_preset); row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="双臂平举", style="Primary.TButton",
+                   command=lambda: self.set_arm_preset("parallel")
+                   ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row, text="双臂下垂", style="Primary.TButton",
+                   command=lambda: self.set_arm_preset("down")
+                   ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row, text="双臂前伸", style="Primary.TButton",
+                   command=lambda: self.set_arm_preset("forward")
+                   ).pack(side=tk.LEFT, padx=3)
+
+        # ===== 全局复位 =====
+        sec_reset = ttk.Frame(body)
+        sec_reset.pack(fill=tk.X, padx=10, pady=(10, 14))
+        ttk.Button(sec_reset, text="⚠  机器人全部复位",
+                   style="Danger.TButton",
+                   command=self.reset_robot
+                   ).pack(fill=tk.X, ipady=4)
 
     def start_inference_data_collection_thread(self):
         def update_inference_data():
@@ -2186,22 +2265,6 @@ class RobotControlGUI:
         """相机选择改变时的处理"""
         self.current_camera_for_3d = self.target_camera_var.get()
         print(f"当前目标相机切换为: {self.current_camera_for_3d}")
-    
-    def update_label_image(self, label, photo):
-        """更新标签图像"""
-        label.config(image=photo)
-        label.image = photo  # 保持引用
-    
-    def show_status(self, message, message_type="info"):
-        """在状态栏显示消息"""
-        timestamp = time.strftime("%H:%M:%S")
-        status_message = f"[{timestamp}] {message}"
-        self.status_text.set(status_message)
-        print(f"[{message_type.upper()}] {message}")
-    
-    def clear_status(self):
-        """清除状态栏"""
-        self.status_text.set("就绪")
 
     def clear_coordinate_records(self):
         """清除坐标记录"""
@@ -2254,21 +2317,13 @@ class RobotControlGUI:
 
 def main():
     root = tk.Tk()
-    
-    # 设置主题样式
-    style = ttk.Style()
-    style.theme_use('clam')
-    
-    # 配置按钮样式
-    style.configure("Accent.TButton", foreground="white", background="#007acc", padding=5)
-    
-    app = RobotControlGUI(root)
+    app = RobotControlGUI(root)  # 样式由 _setup_styles 统一配置
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    
     try:
         root.mainloop()
     except KeyboardInterrupt:
         app.on_closing()
+
 
 if __name__ == "__main__":
     main()
