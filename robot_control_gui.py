@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import os
 import sys
 import tkinter as tk
@@ -27,8 +28,15 @@ _PYOPENXR_EXAMPLES_DIR = os.path.normpath(
 )
 if _PYOPENXR_EXAMPLES_DIR not in sys.path:
     sys.path.insert(0, _PYOPENXR_EXAMPLES_DIR)
-from xr_examples.pico_vr_server.server import DummyServer
-
+from xr_examples.pico_vr_server.server import DummyServer, _TRIGGER_LABELS
+from xr_examples.pico_vr_common.protocol import (
+    JointState,
+    MSG_IMAGE,
+    MSG_JOINTS,
+    monotonic_timestamp,
+    recv_message,
+    send_message,
+)
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9000
 
@@ -243,8 +251,14 @@ class RobotControlGUI:
             use_default_image=False,
             rate_hz=30.0,
             jpeg_quality=80,
+            on_joints=self._handle_vr_joints,
         )
         self.dummy_server.start()
+        self.last_joint_update_timestamp: float = 0.0
+        self.previous_vr_positions = []
+        self.vr_actions = []
+        self.vr_execution_thread = None
+        self.is_vr_control: bool = False
 
         # auto inference
         self.actions = []
@@ -310,6 +324,269 @@ class RobotControlGUI:
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()
+
+    def _handle_vr_joints(self, state: JointState) -> None:
+        @dataclasses.dataclass(frozen=True)
+        class Position:
+            px: float
+            py: float
+            pz: float
+            yaw: float
+            pitch: float
+            roll: float
+
+            def format(self) -> str:
+                return (
+                    f"pos=({self.px:+.3f},{self.py:+.3f},{self.pz:+.3f}) "
+                    f"ypr=({math.degrees(self.yaw):+6.1f}°,{math.degrees(self.pitch):+6.1f}°,{math.degrees(self.roll):+6.1f}°)"
+                )
+
+            def get_action_delta(self, previous_position, mult=0.4, max_pose_value=0.02, min_pos_value=0.001, max_qut_value=0.02, min_qut_value=0.001) -> list[float]:
+                assert 1 >= mult > 0
+                action_delta = [self.px - previous_position.px, self.py - previous_position.py, self.pz - previous_position.pz, self.yaw - previous_position.yaw, self.pitch - previous_position.pitch, self.roll - previous_position.roll]
+                action_delta = [value * mult for value in action_delta]
+                for index in range(3):
+                    if abs(action_delta[index]) > max_pose_value:
+                        action_delta[index] = max_pose_value * np.sign(action_delta[index])
+                    elif abs(action_delta[index]) < min_pos_value:
+                        action_delta[index] = 0.0
+                for index in range(3, 6):
+                    if abs(action_delta[index]) > max_qut_value:
+                        action_delta[index] = max_qut_value * np.sign(action_delta[index])
+                    elif abs(action_delta[index]) < min_qut_value:
+                        action_delta[index] = 0.0
+                return action_delta
+
+        def _format_pose(slab: list[float]) -> Position:
+
+            def transform_vr_to_robot_full(px, py, pz, qx, qy, qz, qw):
+                """
+                完整转换VR手柄到机械臂坐标系（位置+姿态）
+
+                坐标系映射:
+                    X_robot = -Z_vr
+                    Y_robot = -X_vr
+                    Z_robot = Y_vr
+                """
+                # ========== 位置转换 ==========
+                pos_robot = np.array([-pz, -px, py])
+
+                # ========== 姿态转换 ==========
+                # 定义坐标系转换矩阵
+                # VR坐标系到机械臂坐标系的旋转矩阵
+                R_vr_to_robot = np.array([
+                    [0, 0, -1],  # 机械臂X轴 = -VR的Z轴
+                    [-1, 0, 0],  # 机械臂Y轴 = -VR的X轴
+                    [0, 1, 0]  # 机械臂Z轴 = VR的Y轴
+                ])
+
+                # VR手柄的四元数 → 旋转矩阵
+                q_vr = [qx, qy, qz, qw]
+                R_vr_hand = R.from_quat(q_vr).as_matrix()
+
+                # 转换到机械臂坐标系下的旋转矩阵
+                # R_robot_hand = R_vr_to_robot * R_vr_hand * R_vr_to_robot^T
+                R_robot_hand = R_vr_to_robot @ R_vr_hand @ R_vr_to_robot.T
+
+                # 旋转矩阵 → 四元数
+                q_robot = R.from_matrix(R_robot_hand).as_quat()
+
+                # TODO: 抓手与robot base坐标转换
+                q_robot[1] *= -1
+
+                return pos_robot, q_robot
+
+            pos, quat = transform_vr_to_robot_full(*slab)
+            # py, pz, -px, qx, qy, qz, qw = slab
+            px, py, pz = pos
+            qx, qy, qz, qw = quat
+            sin_p = 2.0 * (qw * qx - qz * qy)
+            if abs(sin_p) >= 1.0:
+                pitch = math.copysign(math.pi / 2.0, sin_p)
+            else:
+                pitch = math.asin(sin_p)
+            yaw = math.atan2(
+                2.0 * (qw * qy + qx * qz),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            )
+            roll = math.atan2(
+                2.0 * (qw * qz + qx * qy),
+                1.0 - 2.0 * (qz * qz + qx * qx),
+            )
+            return Position(px, py, pz, yaw, pitch, roll)
+
+        def _fmt_buttons(triggers: list[bool]) -> list[str]:
+            """Format face-button + thumbstick-click bits (triggers[2:8]). Empty if none set."""
+            pressed = [
+                _TRIGGER_LABELS[i]
+                for i in range(2, min(len(triggers), len(_TRIGGER_LABELS)))
+                if triggers[i]
+            ]
+            return pressed
+
+        def _fmt_stick(axes: list[float], offset: int) -> tuple[float, float]:
+            """Format one (x, y) thumbstick reading from axes[offset:offset+2]."""
+            return axes[offset], axes[offset + 1]
+
+        def _vr_auto_execution_thread() -> None:
+            print("Starting vr execution thread...")
+            while self.is_vr_control:
+                now = time.time()
+                if now - self.last_joint_update_timestamp > 0.2:
+                    print("Stopping vr execution thread, due to VR connection time out: 200ms")
+                    self.vr_actions = []
+                    self.is_vr_control = False
+                    break
+                while self.vr_actions:
+                    head, left_hand, right_hand, left_grab, right_grab = self.vr_actions.pop(0)
+                    if head is not None:
+                        head_yaw_pos = np.clip(math.radians(head.yaw), -1.0, 1.0)
+                        head_pitch_pos = np.clip(math.radians(head.pitch), -0.5, 0.5)
+                        self.robot.move_head([head_yaw_pos, head_pitch_pos])
+                    robot_actions = {}
+                    if left_hand is not None:
+                        robot_actions["left_arm"] = {
+                            "action_data": left_hand,
+                            "control_type": "DELTA_POSE"
+                        }
+                    if right_hand is not None:
+                        robot_actions["right_arm"] = {
+                            "action_data": right_hand,
+                            "control_type": "DELTA_POSE"
+                        }
+                    if left_grab is not None or right_grab is not None:
+                        self.robot.move_gripper([1 if left_grab else 0, 1 if right_grab else 0])
+                    if robot_actions:
+                        arm_states, _ = self.robot.arm_joint_states()
+                        head_states, _ = self.robot.head_joint_states()
+                        waist_states, _ = self.robot.waist_joint_states()
+                        assert arm_states
+                        assert head_states
+                        assert waist_states
+
+                        # 构建完整的机器人状态（参考SDK文档的格式）
+                        robot_states = {
+                            "head": head_states,
+                            "waist": waist_states,
+                            "arm": arm_states
+                        }
+
+                        # 使用轨迹跟踪控制
+                        print(f"Dummy execution, robot_actions: {robot_actions}")
+                        self.robot_controller.trajectory_tracking_control(
+                            int(time.time() * 1e9),
+                            robot_states,
+                            [robot_actions],
+                            "base_link",
+                            0.02  # 较短的执行时间
+                        )
+                        time.sleep(0.02)
+                time.sleep(0.02)
+            print("Stopping vr execution thread...")
+
+        if self.is_vr_control:
+            if self.vr_execution_thread is None:
+                self.vr_actions = []
+                self.vr_execution_thread = threading.Thread(target=_vr_auto_execution_thread, daemon=True)
+                self.vr_execution_thread.start()
+        elif self.vr_execution_thread is not None:
+            self.vr_actions = []
+            self.vr_execution_thread.join()
+            self.vr_execution_thread = None
+
+        now = time.time()
+
+        if self.is_vr_control and now - self.last_joint_update_timestamp > 0.2:
+            print("Resetting vr execution thread, due to VR connection time out: 200ms")
+            self.is_vr_control = False
+            self.vr_actions = []
+            self.previous_vr_positions = []
+
+        self.last_joint_update_timestamp = now
+
+        positions = state.positions
+        triggers = state.triggers
+        axes = state.axes
+        assert len(triggers) >= 2
+        left_grab = bool(triggers[0])
+        right_grab = bool(triggers[1])
+        buttons = _fmt_buttons(triggers)
+        assert len(axes) == 4
+        left_stick = _fmt_stick(axes, 0)
+        right_stick = _fmt_stick(axes, 2)
+        assert len(positions) == 21
+        head_position = _format_pose(positions[0:7])
+        left_hand_position = _format_pose(positions[7:14])
+        right_hand_position = _format_pose(positions[14:21])
+
+        # head, left, right, left gripper, right gripper
+        action = [None, None, None, None, None]
+        has_action = False
+        if self.previous_vr_positions and self.is_vr_control:
+            if "L_Y" in buttons:
+                has_action = True
+                action[1] = left_hand_position.get_action_delta(self.previous_vr_positions[1])
+            if "R_B" in buttons:
+                has_action = True
+                action[2] = right_hand_position.get_action_delta(self.previous_vr_positions[2])
+            # TODO: gripper
+            if left_grab != self.previous_vr_positions[3]:
+                action[3] = left_grab
+            if right_grab != self.previous_vr_positions[4]:
+                action[4] = right_grab
+        if has_action:
+            self.vr_actions.append(action)
+        else:
+            self.vr_actions = []
+
+        self.previous_vr_positions = [head_position, left_hand_position, right_hand_position, left_grab, right_grab]
+
+        if not hasattr(self, 'vr_info'):
+            self.vr_info = [now, 0]
+        else:
+            self.vr_info[-1] += 1
+            if now - self.vr_info[0] > 1:
+                print("now: ", now, "fps: ", self.vr_info[-1] / (now - self.vr_info[0]))
+                self.vr_info = [now, 0]
+            else:
+                return
+
+        print("=" * 10)
+        print("head_position: ", head_position.format())
+        print("left_hand_position: ", left_hand_position.format())
+        print("right_hand_position: ", right_hand_position.format())
+        print("buttons: ", buttons)
+        print("left_grab: ", left_grab)
+        print("right_grab: ", right_grab)
+        print("left_stick: ", left_stick)
+        print("right_stick: ", right_stick)
+        print("=" * 10)
+        # if len(positions) == 21:
+        #     head = positions[0:7]
+        #     left = positions[7:14]
+        #     right = positions[14:21]
+        #     logger.info(
+        #         f"xr pose t={state.timestamp:.3f}  "
+        #         f"{_format_pose('H', head)}  |  "
+        #         f"{_format_pose('L', left)} grab={_fmt_trigger(left_grab)} stk={left_stick}  |  "
+        #         f"{_format_pose('R', right)} grab={_fmt_trigger(right_grab)} stk={right_stick}  "
+        #         f"btn={buttons}"
+        #     )
+        # elif len(positions) == 14:
+        #     left = positions[0:7]
+        #     right = positions[7:14]
+        #     logger.info(
+        #         f"controller pose t={state.timestamp:.3f}  "
+        #         f"{_format_pose('L', left)} grab={_fmt_trigger(left_grab)} stk={left_stick}  |  "
+        #         f"{_format_pose('R', right)} grab={_fmt_trigger(right_grab)} stk={right_stick}  "
+        #         f"btn={buttons}"
+        #     )
+        # else:
+        #     preview = ", ".join(f"{p:+.3f}" for p in positions[:6])
+        #     logger.info(
+        #         f"upstream joints t={state.timestamp:.3f} n={len(positions)} "
+        #         f"positions=[{preview}] triggers={triggers} axes={axes}"
+        #     )
 
     def _setup_styles(self):
         """统一配置 ttk 视觉样式：颜色、字体、内边距，让界面更现代化。"""
@@ -937,6 +1214,23 @@ class RobotControlGUI:
                    command=lambda: self.auto_inference(stop=True)
                    ).pack(side=tk.LEFT, padx=4)
 
+        # ===== 6. VR控制 =====
+        sec_vr = ttk.LabelFrame(body, text="  ●  VR控制  ")
+        sec_vr.pack(fill=tk.X, padx=10, pady=6)
+
+        vr_auto_row = ttk.Frame(sec_vr)
+        vr_auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Label(vr_auto_row, text="自动:",
+                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(vr_auto_row, text="⚠ 开始遥操",
+                   style="Danger.TButton",
+                   command=lambda: setattr(self, 'is_vr_control', True)
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(vr_auto_row, text="■ 停止遥操",
+                   style="Muted.TButton",
+                   command=lambda: setattr(self, 'is_vr_control', False)
+                   ).pack(side=tk.LEFT, padx=4)
+
     def auto_inference(self, stop: bool = False):
         if stop:
             self.is_auto_inference = False
@@ -1328,7 +1622,7 @@ class RobotControlGUI:
                                 height, width = image.shape[0]
                             # print(f"获取到 {camera_name} 相机图像，图像 height, width: {height} {width}")
                             # 对于深度相机，保存原始图像数据
-                            if camera_name == "head_depth":
+                            if camera_name in ["head_depth", "head", "hand_right"]:
                                 self.camera_images[camera_name] = image.copy()
 
                             self.update_camera_display(camera_name, image)
