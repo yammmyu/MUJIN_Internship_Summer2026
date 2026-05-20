@@ -1,7 +1,5 @@
 import copy
 import dataclasses
-import os
-import sys
 import tkinter as tk
 from tkinter import ttk
 import cv2
@@ -22,21 +20,11 @@ from camera_pose import compute_point_B_world
 from control_wheel_example import WheelController
 from robot_info_server import create_robot_info_http_server, RobotInfo
 from constants import *
+# pico vr
+from pico_vr.pico_vr_server.server import DummyServer, _TRIGGER_LABELS
+from pico_vr.pico_vr_common.protocol import JointState
 
-_PYOPENXR_EXAMPLES_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyopenxr", "pyopenxr_examples")
-)
-if _PYOPENXR_EXAMPLES_DIR not in sys.path:
-    sys.path.insert(0, _PYOPENXR_EXAMPLES_DIR)
-from xr_examples.pico_vr_server.server import DummyServer, _TRIGGER_LABELS
-from xr_examples.pico_vr_common.protocol import (
-    JointState,
-    MSG_IMAGE,
-    MSG_JOINTS,
-    monotonic_timestamp,
-    recv_message,
-    send_message,
-)
+
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9000
 
