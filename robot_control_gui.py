@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import tkinter as tk
+import typing
 from tkinter import ttk
 import cv2
 import base64
@@ -209,9 +210,9 @@ class RobotControlGUI:
         
         # 相机图像缓存
         self.camera_images = {
-            "hand_left": None,  # cache latest two images for inference
+            # "hand_left": None,  # cache latest two images for inference
             # "hand_right": None,  # cache latest two images for inference
-            # "head": None,
+            "head": None,
             # "head_depth": None,  # cache latest one image
             # "head_center_fisheye": None
         }
@@ -219,9 +220,9 @@ class RobotControlGUI:
 
         # 相机内参缓存
         self.camera_intrinsics = {
-            "hand_left": None,
+            # "hand_left": None,
             # "hand_right": None,
-            # "head": None,
+            "head": None,
             # "head_depth": None,
             # "head_center_fisheye": None
         }
@@ -308,7 +309,7 @@ class RobotControlGUI:
         }
         
         self.setup_ui()
-        self.start_inference_data_collection_thread()
+        # self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()
@@ -329,21 +330,25 @@ class RobotControlGUI:
                     f"ypr=({math.degrees(self.yaw):+6.1f}°,{math.degrees(self.pitch):+6.1f}°,{math.degrees(self.roll):+6.1f}°)"
                 )
 
-            def get_action_delta(self, previous_position, mult=0.4, max_pose_value=0.02, min_pos_value=0.001, max_qut_value=0.02, min_qut_value=0.001) -> list[float]:
-                assert 1 >= mult > 0
+            def get_action_delta(self, previous_position, pose_mult=1.0, qut_mult=0.5, max_pose_value=0.02, min_pos_value=0.0005, max_qut_value=0.02, min_qut_value=0.001) -> typing.Optional[list[float]]:
+                assert 1.0 >= pose_mult > 0
+                assert 0.5 >= qut_mult > 0
                 action_delta = [self.px - previous_position.px, self.py - previous_position.py, self.pz - previous_position.pz, self.yaw - previous_position.yaw, self.pitch - previous_position.pitch, self.roll - previous_position.roll]
-                action_delta = [value * mult for value in action_delta]
                 for index in range(3):
+                    action_delta[index] *= pose_mult
                     if abs(action_delta[index]) > max_pose_value:
                         action_delta[index] = max_pose_value * np.sign(action_delta[index])
                     elif abs(action_delta[index]) < min_pos_value:
                         action_delta[index] = 0.0
                 for index in range(3, 6):
+                    action_delta[index] *= qut_mult
                     if abs(action_delta[index]) > max_qut_value:
                         action_delta[index] = max_qut_value * np.sign(action_delta[index])
                     elif abs(action_delta[index]) < min_qut_value:
                         action_delta[index] = 0.0
-                return action_delta
+                if any(abs(value) > 1e-5 for value in action_delta):
+                    return action_delta
+                return None
 
         def _format_pose(slab: list[float]) -> Position:
 
@@ -443,7 +448,7 @@ class RobotControlGUI:
                             "control_type": "DELTA_POSE"
                         }
                     if left_grab is not None or right_grab is not None:
-                        self.robot.move_gripper([1 if left_grab else 0, 1 if right_grab else 0])
+                        self.robot.move_gripper([self.left_gripper_pos, self.right_gripper_pos])
                     if robot_actions:
                         arm_states, _ = self.robot.arm_joint_states()
                         head_states, _ = self.robot.head_joint_states()
@@ -466,9 +471,9 @@ class RobotControlGUI:
                             robot_states,
                             [robot_actions],
                             "base_link",
-                            0.02  # 较短的执行时间
+                            0.001  # 较短的执行时间
                         )
-                        time.sleep(0.02)
+                        time.sleep(0.001)
                 time.sleep(0.02)
             print("Stopping vr execution thread...")
 
@@ -509,22 +514,22 @@ class RobotControlGUI:
 
         # head, left, right, left gripper, right gripper
         action = [None, None, None, None, None]
-        has_action = False
         if self.previous_vr_positions and self.is_vr_control:
             if "L_Y" in buttons:
-                has_action = True
                 action[1] = left_hand_position.get_action_delta(self.previous_vr_positions[1])
             if "R_B" in buttons:
-                has_action = True
                 action[2] = right_hand_position.get_action_delta(self.previous_vr_positions[2])
             # TODO: gripper
-            if left_grab != self.previous_vr_positions[3]:
-                action[3] = left_grab
-            if right_grab != self.previous_vr_positions[4]:
-                action[4] = right_grab
-        if has_action:
+            if left_grab and left_grab != self.previous_vr_positions[3]:
+                self.left_gripper_pos = 0.0 if self.left_gripper_pos > 0.5 else 1.0
+                action[3] = self.left_gripper_pos > 0.5
+            if right_grab and right_grab != self.previous_vr_positions[4]:
+                self.right_gripper_pos = 0.0 if self.right_gripper_pos > 0.5 else 1.0
+                action[4] = self.right_gripper_pos > 0.5
+        if any(act is not None for act in action):
             self.vr_actions.append(action)
-        else:
+        elif any(any(value is not None for value in act[:3]) for act in self.vr_actions):
+            # clear all pending move action when buttons released
             self.vr_actions = []
 
         self.previous_vr_positions = [head_position, left_hand_position, right_hand_position, left_grab, right_grab]
@@ -740,14 +745,23 @@ class RobotControlGUI:
         display_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         # 左手相机（当前主显示）
+        # cam_card = ttk.Frame(display_area)
+        # cam_card.pack(fill=tk.BOTH, expand=True)
+        # ttk.Label(cam_card, text="🤚  左手相机 (点击获取像素坐标)",
+        #           style="Section.TLabel").pack(anchor=tk.W, pady=(0, 4))
+        # self.camera_labels["hand_left"] = ttk.Label(
+        #     cam_card, borderwidth=1, relief="solid", background="#222")
+        # self.camera_labels["hand_left"].pack(fill=tk.BOTH, expand=True)
+        # self._bind_camera_click("hand_left")
+
         cam_card = ttk.Frame(display_area)
         cam_card.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(cam_card, text="🤚  左手相机 (点击获取像素坐标)",
+        ttk.Label(cam_card, text="🤚  头部相机 (点击获取像素坐标)",
                   style="Section.TLabel").pack(anchor=tk.W, pady=(0, 4))
-        self.camera_labels["hand_left"] = ttk.Label(
+        self.camera_labels["head"] = ttk.Label(
             cam_card, borderwidth=1, relief="solid", background="#222")
-        self.camera_labels["hand_left"].pack(fill=tk.BOTH, expand=True)
-        self._bind_camera_click("hand_left")
+        self.camera_labels["head"].pack(fill=tk.BOTH, expand=True)
+        self._bind_camera_click("head")
 
     def setup_status_panel(self, parent):
         """关节状态面板：左侧"手臂"，右侧"头部&腰部"+"夹爪"，用 grid 整齐对齐。"""
