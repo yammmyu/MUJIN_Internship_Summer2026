@@ -1,0 +1,177 @@
+<robot name="kawasaki-BX130X-C00X">
+	<kinbody>
+		<!--Geometries-->
+		<body name="link0">
+			<translation>0 0 0</translation>
+			<geom type="trimesh" name="link0">
+				<collision>stl/link0_reduced.stl 0.001</collision>
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<translation>0 0 0</translation>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+			</geom>
+		</body>
+		<body name="link1">
+			<translation>0 0 0.25</translation>
+			<geom type="trimesh" name="link1">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link1_reduced.stl 0.001</collision>
+				<translation>0 0 -0.25</translation>
+			</geom>
+			<geom type="box" name="hinge_box">
+				<extents>0.055 0.07 0.375</extents>
+				<translation>0 0 -0.25</translation>
+                                <!-- <translation>0.2 0.020 0.47</translation> -->
+                                <translation>0.020 -0.2 0.47</translation>
+                                <rotationaxis>1 0 0 -77</rotationaxis>
+                                <rotationaxis>1 0 0 0</rotationaxis>
+			        <rotationaxis>0 0 1 -90</rotationaxis>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+				<transparency>0</transparency>
+			</geom>
+			<geom type="box" name="lowerHarness">
+				<extents>0.055 0.05 0.18</extents>
+				<translation>0 0 -0.25</translation>
+				<!-- <translation>0.27 0.13 0.425</translation> -->
+				<translation>0.13 -0.27 0.425</translation>
+				<rotationaxis>1 0 0 -28</rotationaxis>
+				<rotationaxis>0 1 0 13</rotationaxis>
+			        <rotationaxis>0 0 1 -90</rotationaxis>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+				<transparency>0</transparency>
+			</geom>
+		</body>
+		<body name="link2">
+			<translation>0.2 0 0.53</translation>
+			<geom type="trimesh" name="link2">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link2_reduced.stl 0.001</collision>
+			        <translation>-0.2 0 -0.53</translation>
+			</geom>
+			<geom type="box" name="midHarness">
+				<extents>0.055 0.05 0.2</extents>
+			        <translation>-0.2 0 -0.53</translation>
+				<!-- <translation>0.225 0.2 0.75</translation> -->
+				<translation>0.2 -0.225 0.75</translation>
+				<rotationaxis>1 0 0 8</rotationaxis>
+				<rotationaxis>0 1 0 -10</rotationaxis>
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+				<transparency>0</transparency>
+			</geom>
+		</body>
+		<body name="link3">
+			<translation>0.2 0 1.690</translation>
+			<geom type="trimesh" name="link3">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link3_reduced.stl 0.001</collision>
+			        <translation>-0.2 0 -1.690</translation>
+			</geom>
+			<geom type="trimesh" name="link3_downstream">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link3_downstream_reduced.stl 0.001</collision>
+			        <translation>-0.2 0 -1.690</translation>
+			</geom>
+			<geom type="trimesh" name="upperHarness">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link2_upperharness_reduced.stl 0.001</collision>
+			        <translation>-0.2 0 -1.690</translation>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+			</geom>
+		</body>
+		<body name="link4">
+			<translation>1.35 0 1.920</translation>
+			<geom type="trimesh" name="link4">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link4_reduced.stl 0.001</collision>
+			        <translation>-1.35 0 -1.920</translation>
+			</geom>
+		</body>
+		<body name="link5">
+			<translation>1.85 0 1.920</translation>
+			<geom type="trimesh" name="link5">
+				<rotationaxis>0 0 1 -90</rotationaxis>
+				<collision>stl/link5_reduced.stl 0.001</collision>
+			        <translation>-1.85 0 -1.920</translation>
+			</geom>
+		</body>
+		<body name="link6">
+			<translation>2.075 0 1.920</translation>
+        		<rotationaxis>0 1 0 90</rotationaxis>
+			<geom type="cylinder" name="link6">
+				<radius>0.095</radius>
+				<height>0.025</height>
+			        <rotationaxis>1 0 0 90</rotationaxis>
+				<translation>0 0 -0.0125</translation>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+			</geom>
+		</body>
+
+		<!-- Joints -->
+		<joint type="revolute" enable="true" name="JT1">
+			<body>link0</body>
+			<body>link1</body>
+			<limitsdeg>-160 160</limitsdeg>
+			<maxveldeg>105</maxveldeg>
+			<maxacceldeg>105</maxacceldeg>
+			<offsetfrom>link1</offsetfrom>
+			<axis>0 0 -1</axis>
+		</joint>
+
+		<joint type="revolute" enable="true" name="JT2">
+			<body>link1</body>
+			<body>link2</body>
+			<limitsdeg>-60 76</limitsdeg>
+			<maxveldeg>90</maxveldeg>
+			<maxacceldeg>90</maxacceldeg>
+			<offsetfrom>link2</offsetfrom>
+			<axis>0 1 0</axis>
+		</joint>
+
+		<joint type="revolute" enable="true" name="JT3">
+			<body>link2</body>
+			<body>link3</body>
+			<limitsdeg>-75 90</limitsdeg>
+			<maxveldeg>130</maxveldeg>
+			<maxacceldeg>130</maxacceldeg>
+			<offsetfrom>link3</offsetfrom>
+			<axis>0 -1 0</axis>
+		</joint>
+
+		<joint type="revolute" enable="true" name="JT4">
+			<body>link3</body>
+			<body>link4</body>
+			<limitsdeg>-210 210</limitsdeg>
+			<maxveldeg>200</maxveldeg>
+			<maxacceldeg>200</maxacceldeg>
+			<offsetfrom>link4</offsetfrom>
+			<axis>1 0 0</axis>
+		</joint>
+
+		<joint type="revolute" enable="true" name="JT5">
+			<body>link4</body>
+			<body>link5</body>
+			<limitsdeg>-125 125</limitsdeg>
+			<maxveldeg>160</maxveldeg>
+			<maxacceldeg>160</maxacceldeg>
+			<offsetfrom>link5</offsetfrom>
+			<axis>0 -1 0</axis>
+		</joint>
+
+		<joint type="revolute" enable="true" name="JT6">
+			<body>link5</body>
+			<body>link6</body>
+			<limitsdeg>-210 210</limitsdeg>
+			<maxveldeg>300</maxveldeg>
+			<maxacceldeg>300</maxacceldeg>
+			<offsetfrom>link6</offsetfrom>
+			<axis>0 0 1</axis>
+		</joint>
+	</kinbody>
+
+	<!-- Manipulators -->
+	<manipulator name="flange">
+		<base>link0</base>
+		<effector>link6</effector>
+	</manipulator>
+
+</robot>
