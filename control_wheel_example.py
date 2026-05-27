@@ -15,7 +15,7 @@ class WheelController(Node):
             TwistStamped,
             '/mbc/wheel_command',
             10)
-        self.get_logger().info('Arm Controller Example node started. Publishing a target pose for the left arm.')
+        self.get_logger().info('Wheel Controller Example node started. Publishing a target pose for the robot base.')
         self.shutdown = False
         self.commands = []
         self._agv_angle = 0.0
