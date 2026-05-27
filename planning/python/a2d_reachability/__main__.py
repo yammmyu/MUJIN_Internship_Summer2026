@@ -26,10 +26,12 @@ from openravepy import (
     IkParameterization,
     IkParameterizationType,
     PlanningError,
+    RaveCreateKinBody,
     RaveGetDefaultViewerType,
     RaveSetDebugLevel,
     interfaces,
     misc,
+    quatFromRotationMatrix,
 )
 from openravepy.databases import inversekinematics, linkstatistics
 
@@ -157,12 +159,16 @@ def BuildTargetPose(args):
     )
 
 
-def SolveAndScoreIk(env, robot, manip, targetPose):
-    """Find best IK solution at targetPose. Returns (best_solution, all_solutions)."""
+def SolveAndScoreIk(env, robot, manip, targetPose, target=None):
+    """Find best IK solution at targetPose. Returns (best_solution, all_solutions).
+
+    target: optional KinBody (e.g. the box being grasped) whose collisions with
+    the gripper are ignored, so a grasp pose touching the object stays feasible.
+    """
     RaveSetDebugLevel(DebugLevel.Error)
     with env:
         robot.Enable(True)
-        solutions = FindIkSolutions(manip, targetPose)
+        solutions = FindIkSolutions(manip, targetPose, target=target)
 
     bestScore = -1.0
     bestSolution = None
@@ -251,6 +257,222 @@ def ReplayTrajectory(robot, traj, dt=0.01):
 
 def DrawTarget(env, pose, handles):
     handles.append(misc.DrawAxes(env, pose, dist=0.2, linewidth=4))
+
+
+# --------------------------------------------------------------------------- #
+# Box management
+# --------------------------------------------------------------------------- #
+def AddBox(env, name="box0", halfExtents=(0.10, 0.06, 0.18), pose=None,
+           color=(0.85, 0.35, 0.10)):
+    """Add (or replace) a box KinBody in the environment.
+
+    halfExtents: (hx, hy, hz) in meters.
+    pose:        7-element [qw, qx, qy, qz, x, y, z]; default places the box in
+                 front of the robot at a graspable height.
+    Returns the KinBody. Call from the IPython session to populate the scene.
+    """
+    old = env.GetKinBody(name)
+    if old is not None:
+        env.Remove(old)
+
+    body = RaveCreateKinBody(env, "")
+    body.InitFromBoxes(
+        np.array([[0.0, 0.0, 0.0, halfExtents[0], halfExtents[1], halfExtents[2]]]),
+        True,
+    )
+    body.SetName(name)
+    env.Add(body)
+
+    if pose is None:
+        pose = [1.0, 0.0, 0.0, 0.0, 0.45, 0.0, 1.0]
+    body.SetTransform(np.array(pose, dtype=float))
+
+    for link in body.GetLinks():
+        for geom in link.GetGeometries():
+            geom.SetDiffuseColor(np.array(color, dtype=float))
+
+    log.warning("AddBox %r: halfExtents=%s, pose=%s", name, list(halfExtents), list(pose))
+    return body
+
+
+def DeleteBox(env, name="box0"):
+    """Remove a box (or any KinBody) by name. Returns True if something was removed."""
+    body = env.GetKinBody(name)
+    if body is None:
+        log.warning("DeleteBox: no body named %r", name)
+        return False
+    env.Remove(body)
+    log.warning("DeleteBox: removed %r", name)
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Grasp IK generation
+# --------------------------------------------------------------------------- #
+def _BoxFaceGrasps(box, gripperOffset=0.0):
+    """Build one candidate grasp per box face.
+
+    For each of the 6 faces: approach is along the face's inward normal (tool +Z
+    points into the box), and the tool X axis is aligned with the shorter of the
+    two in-plane edges (the direction a parallel gripper would close on).
+
+    Returns a list of dicts with keys:
+        axisIdx, sign, center (3,), normal (3, outward), edgeLens [e1, e2],
+        graspWidth, pose (spatial.P, [qw qx qy qz x y z]).
+    """
+    T = np.array(box.GetTransform())
+    R = T[:3, :3]
+    c = T[:3, 3]
+    geom = box.GetLinks()[0].GetGeometries()[0]
+    he = np.array(geom.GetBoxExtents(), dtype=float)  # (hx, hy, hz)
+    axes = [R[:, 0], R[:, 1], R[:, 2]]
+
+    grasps = []
+    for axisIdx in range(3):
+        inplaneIdx = [i for i in range(3) if i != axisIdx]
+        for sign in (+1.0, -1.0):
+            outward = sign * axes[axisIdx]
+            faceCenter = c + outward * he[axisIdx]
+            approach = -outward  # tool +Z points into the box
+
+            # in-plane edges (full lengths) and axes
+            edges = [(i, axes[i], 2.0 * he[i]) for i in inplaneIdx]
+            edges.sort(key=lambda e: e[2])  # shorter edge first
+            shortAxis = edges[0][1]
+
+            tz = approach / np.linalg.norm(approach)
+            tx = shortAxis - tz * np.dot(shortAxis, tz)  # orthogonalize (already ⊥)
+            tx = tx / np.linalg.norm(tx)
+            ty = np.cross(tz, tx)
+            Rtool = np.column_stack([tx, ty, tz])
+            quat = quatFromRotationMatrix(Rtool)
+
+            target = faceCenter + outward * gripperOffset
+            pose = P([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]),
+                      float(target[0]), float(target[1]), float(target[2])])
+
+            grasps.append({
+                "axisIdx": axisIdx,
+                "sign": sign,
+                "center": faceCenter,
+                "normal": outward,
+                "edgeLens": [edges[0][2], edges[1][2]],
+                "graspWidth": edges[0][2],
+                "pose": pose,
+            })
+    return grasps
+
+
+def GenerateBoxIK(env, robot, box, manipName, gripperOffset=0.0,
+                  visualize=True, handles=None):
+    """Compute and visualize grasp IK candidates for a box.
+
+    Faces are prioritized: the short-side faces (perpendicular to the box's
+    longest axis) first, then by proximity to the arm base. Each candidate gets
+    an IK solve (gripper-vs-box collisions ignored). Feasible grasps are drawn
+    with green axes, infeasible with red. Returns the candidate list sorted by
+    priority, each annotated with a "solution" key (None if unreachable).
+    """
+    manip = PrepareManipulator(robot, manipName)
+    grasps = _BoxFaceGrasps(box, gripperOffset)
+
+    geom = box.GetLinks()[0].GetGeometries()[0]
+    he = np.array(geom.GetBoxExtents(), dtype=float)
+    longestAxis = int(np.argmax(he))
+    armBase = np.array(manip.GetBase().GetTransform()[:3, 3])
+
+    for g in grasps:
+        g["isShortFace"] = (g["axisIdx"] == longestAxis)
+        g["distToArm"] = float(np.linalg.norm(g["center"] - armBase))
+    # short-side face first, then nearest to the arm base
+    grasps.sort(key=lambda g: (not g["isShortFace"], g["distToArm"]))
+
+    for g in grasps:
+        bestSolution, _ = SolveAndScoreIk(env, robot, manip, g["pose"], target=box)
+        g["solution"] = bestSolution
+        feasible = bestSolution is not None
+        if visualize and handles is not None:
+            colormode = "rgb" if feasible else None
+            h = misc.DrawAxes(env, g["pose"], dist=0.08, linewidth=3)
+            handles.append(h)
+        log.warning("  face axis=%d sign=%+d shortFace=%s dist=%.3f width=%.3f -> %s",
+                    g["axisIdx"], int(g["sign"]), g["isShortFace"], g["distToArm"],
+                    g["graspWidth"], "OK" if feasible else "unreachable")
+
+    feasible = [g for g in grasps if g["solution"] is not None]
+    log.warning("GenerateBoxIK: %d/%d feasible grasp(s) for %s on %r",
+                len(feasible), len(grasps), manipName, box.GetName())
+    return grasps
+
+
+# --------------------------------------------------------------------------- #
+# Grasp trajectory
+# --------------------------------------------------------------------------- #
+def Grab(env, robot, manipName, box, gripperOffset=0.0,
+         maxvelmult=0.2, replayDt=0.01, handles=None, attach=True):
+    """Select a hand + box, plan and visualize a grasp trajectory.
+
+    Picks the highest-priority reachable grasp from GenerateBoxIK, plans a path
+    from the arm's current configuration to that grasp (box collisions disabled
+    during planning so the TCP can coincide with the box surface), replays it,
+    and optionally Grab()s the box so it follows the gripper afterwards.
+    """
+    if handles is None:
+        handles = []
+    manip = PrepareManipulator(robot, manipName)
+    grasps = GenerateBoxIK(env, robot, box, manipName, gripperOffset=gripperOffset,
+                           visualize=True, handles=handles)
+    feasible = [g for g in grasps if g["solution"] is not None]
+    if not feasible:
+        log.error("Grab: no feasible grasp for %r with %s", box.GetName(), manipName)
+        return False
+
+    best = feasible[0]
+    log.warning("Grab: chosen face axis=%d sign=%+d center=%s",
+                best["axisIdx"], int(best["sign"]), list(best["center"]))
+    DrawTarget(env, best["pose"], handles)
+
+    boxWasEnabled = box.IsEnabled()
+    box.Enable(False)  # let the TCP reach the box surface during planning
+    try:
+        startDof = robot.GetDOFValues(manip.GetArmIndices())
+        traj = PlanTrajectory(env, robot, manip, startDof, best["pose"],
+                              maxvelmult=maxvelmult)
+    finally:
+        box.Enable(boxWasEnabled)
+
+    if traj is None:
+        log.error("Grab: trajectory planning failed")
+        return False
+
+    log.warning("Grab: trajectory duration=%.3fs", traj.GetDuration())
+    ReplayTrajectory(robot, traj, dt=replayDt)
+
+    if attach:
+        robot.SetActiveManipulator(manipName)
+        robot.Grab(box)
+        log.warning("Grab: %s now holding %r", manipName, box.GetName())
+    return True
+
+
+def ReleaseBox(env, robot, box=None):
+    """Release a grabbed box so it stops following the gripper.
+
+    box: a KinBody to release. If None, releases everything the robot holds.
+    Returns the list of released body names.
+    """
+    if box is None:
+        released = [b.GetName() for b in robot.GetGrabbed()]
+        robot.ReleaseAllGrabbed()
+        log.warning("ReleaseBox: released all grabbed %s", released)
+        return released
+
+    if box not in robot.GetGrabbed():
+        log.warning("ReleaseBox: robot is not holding %r", box.GetName())
+        return []
+    robot.Release(box)
+    log.warning("ReleaseBox: released %r", box.GetName())
+    return [box.GetName()]
 
 
 def RunArm(env, robot, manipName, targetPose, label, handles,
@@ -346,6 +568,43 @@ def Main():
         print("\033[32;1mBoth arms reached their targets.\033[0m")
     else:
         print("\033[31;1mOne or more arms failed (see logs above).\033[0m")
+
+    # IPython helpers bound to this env/robot so the user can build a scene and
+    # try grasps interactively without re-passing env/robot every time.
+    def add_box(name="box0", halfExtents=(0.10, 0.06, 0.18), pose=None,
+                color=(0.85, 0.35, 0.10)):
+        return AddBox(env, name, halfExtents, pose, color)
+
+    def del_box(name="box0"):
+        return DeleteBox(env, name)
+
+    def gen_box_ik(name="box0", manip=LEFT_MANIP, gripperOffset=0.0):
+        body = env.GetKinBody(name)
+        if body is None:
+            print("No box named %r; call add_box(%r) first" % (name, name))
+            return None
+        return GenerateBoxIK(env, robot, body, manip, gripperOffset=gripperOffset,
+                             handles=handles)
+
+    def grab(name="box0", manip=LEFT_MANIP, gripperOffset=0.0):
+        body = env.GetKinBody(name)
+        if body is None:
+            print("No box named %r; call add_box(%r) first" % (name, name))
+            return False
+        return Grab(env, robot, manip, body, gripperOffset=gripperOffset,
+                    maxvelmult=args.maxvelmult, replayDt=args.replayDt, handles=handles)
+
+    def release(name=None):
+        # name=None releases everything the robot holds.
+        return ReleaseBox(env, robot, env.GetKinBody(name) if name else None)
+
+    print("\nIPython helpers (env/robot already bound):")
+    print("  add_box(name='box0', halfExtents=(hx,hy,hz), pose=[qw,qx,qy,qz,x,y,z])")
+    print("  del_box(name='box0')")
+    print("  gen_box_ik(name='box0', manip='gripper_center')   # visualize grasp IK")
+    print("  grab(name='box0', manip='gripper_center')         # plan+replay grasp")
+    print("  release(name='box0')   # release a held box; release() releases all")
+    print("  manips: LEFT='%s', RIGHT='%s'" % (LEFT_MANIP, RIGHT_MANIP))
 
     from IPython import embed
     embed()
