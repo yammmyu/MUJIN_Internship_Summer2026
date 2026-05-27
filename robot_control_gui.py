@@ -1,5 +1,7 @@
 import copy
 import dataclasses
+import os
+import signal
 import tkinter as tk
 import typing
 from tkinter import ttk
@@ -210,20 +212,24 @@ class RobotControlGUI:
         
         # 相机图像缓存
         self.camera_images = {
-            # "hand_left": None,  # cache latest two images for inference
+            "hand_left": None,  # cache latest two images for inference
             # "hand_right": None,  # cache latest two images for inference
             "head": None,
-            # "head_depth": None,  # cache latest one image
+            "head_depth": None,  # cache latest one image
             # "head_center_fisheye": None
         }
         self.last_two_left_arm_joint_values = []
+        # 由推理数据采集线程独占缓存的相机（start_camera_thread 不再重复 cache）
+        self.inference_managed_cameras = set()
+        # 相机显示缩放尺寸（由 _rebuild_camera_display 根据排版动态更新）
+        self.camera_tile_size = (320, 240)
 
         # 相机内参缓存
         self.camera_intrinsics = {
-            # "hand_left": None,
+            "hand_left": None,
             # "hand_right": None,
             "head": None,
-            # "head_depth": None,
+            "head_depth": None,
             # "head_center_fisheye": None
         }
 
@@ -309,7 +315,7 @@ class RobotControlGUI:
         }
         
         self.setup_ui()
-        # self.start_inference_data_collection_thread()
+        self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()
@@ -711,9 +717,20 @@ class RobotControlGUI:
         self.setup_control_panel(right_notebook)
         
     def setup_camera_panel(self, parent):
-        """设置相机图像面板：紧凑的 RGBD 控制条 + 居中相机显示。"""
+        """设置相机图像面板：RGBD 控制条 + 相机勾选条 + 动态网格显示区。"""
         camera_frame = ttk.LabelFrame(parent, text="  📷  相机视图  ")
         camera_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 可显示的相机及其中文名（须为 Camera() 初始化时声明的相机）
+        self.available_cameras = [
+            "head", "head_depth", "hand_left", "hand_right", "head_center_fisheye"]
+        self.camera_titles = {
+            "head": "头部相机",
+            "head_depth": "深度相机",
+            "hand_left": "左手相机",
+            "hand_right": "右手相机",
+            "head_center_fisheye": "头部鱼眼相机",
+        }
 
         # ---- RGBD 工具条 ----
         toolbar = ttk.Frame(camera_frame)
@@ -738,30 +755,113 @@ class RobotControlGUI:
                    command=self.clear_coordinate_records
                    ).pack(side=tk.RIGHT)
 
-        # ---- 相机显示区 ----
+        # ---- 相机勾选条：选择要显示的相机 ----
+        select_bar = ttk.Frame(camera_frame)
+        select_bar.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ttk.Label(select_bar, text="显示相机:").pack(side=tk.LEFT, padx=(0, 4))
+        # 默认显示当前缓存中已有的相机（head / head_depth）
+        self.camera_display_vars = {
+            name: tk.BooleanVar(value=name in self.camera_images)
+            for name in self.available_cameras
+        }
+        for name in self.available_cameras:
+            ttk.Checkbutton(
+                select_bar, text=self.camera_titles[name],
+                variable=self.camera_display_vars[name],
+                command=self._rebuild_camera_display).pack(side=tk.LEFT, padx=4)
+
+        # ---- 相机显示区（动态网格） ----
+        self.camera_labels = {}
+        self.camera_display_area = ttk.Frame(camera_frame)
+        self.camera_display_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._rebuild_camera_display()
+
+    def _compute_camera_tile_size(self, ncols, nrows):
+        """根据可用面板尺寸与网格规模，计算保持 4:3 的单格图像尺寸。"""
+        try:
+            self.root.update_idletasks()
+            win_w = self.root.winfo_width()
+            win_h = self.root.winfo_height()
+        except Exception:
+            win_w = win_h = 0
+        if win_w < 100:
+            win_w = 1500
+        if win_h < 100:
+            win_h = 950
+        # 左侧相机面板约占窗口一半宽；高度扣除标题/工具条/状态栏
+        panel_w = max(360, win_w // 2 - 60)
+        panel_h = max(360, win_h - 220)
+        # 每格扣除标题栏(~44)与内边距
+        cell_w = max(160, panel_w // ncols - 16)
+        cell_h = max(120, panel_h // nrows - 44)
+        # 保持 4:3 比例，取受限的一边
+        tile_w = min(cell_w, int(cell_h * 4 / 3))
+        tile_h = int(tile_w * 3 / 4)
+        return max(120, tile_w), max(90, tile_h)
+
+    def _rebuild_camera_display(self):
+        """根据用户勾选的相机重建显示区：动态网格排版 + 自适应缩放尺寸。"""
+        # 当前选中的相机（按固定顺序）
+        selected = [name for name in self.available_cameras
+                    if self.camera_display_vars[name].get()]
+
+        # 同步缓存字典的键：新增的置 None，取消的移除（停止抓取）
+        for name in selected:
+            self.camera_images.setdefault(name, None)
+            self.camera_intrinsics.setdefault(name, None)
+        for name in list(self.camera_images.keys()):
+            if name not in selected:
+                self.camera_images.pop(name, None)
+                self.camera_intrinsics.pop(name, None)
+
+        # 清空旧控件并重置标签字典
+        for child in self.camera_display_area.winfo_children():
+            child.destroy()
         self.camera_labels = {}
 
-        display_area = ttk.Frame(camera_frame)
-        display_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        if not selected:
+            self.camera_tile_size = (320, 240)
+            return
 
-        # 左手相机（当前主显示）
-        # cam_card = ttk.Frame(display_area)
-        # cam_card.pack(fill=tk.BOTH, expand=True)
-        # ttk.Label(cam_card, text="🤚  左手相机 (点击获取像素坐标)",
-        #           style="Section.TLabel").pack(anchor=tk.W, pady=(0, 4))
-        # self.camera_labels["hand_left"] = ttk.Label(
-        #     cam_card, borderwidth=1, relief="solid", background="#222")
-        # self.camera_labels["hand_left"].pack(fill=tk.BOTH, expand=True)
-        # self._bind_camera_click("hand_left")
+        # 计算网格列数（1→1，2~4→2，5→3）与每格缩放尺寸
+        n = len(selected)
+        ncols = 1 if n == 1 else 2 if n <= 4 else 3
+        nrows = math.ceil(n / ncols)
+        self.camera_tile_size = self._compute_camera_tile_size(ncols, nrows)
 
-        cam_card = ttk.Frame(display_area)
-        cam_card.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(cam_card, text="🤚  头部相机 (点击获取像素坐标)",
-                  style="Section.TLabel").pack(anchor=tk.W, pady=(0, 4))
-        self.camera_labels["head"] = ttk.Label(
-            cam_card, borderwidth=1, relief="solid", background="#222")
-        self.camera_labels["head"].pack(fill=tk.BOTH, expand=True)
-        self._bind_camera_click("head")
+        # 让各行各列均分空间
+        for c in range(ncols):
+            self.camera_display_area.columnconfigure(c, weight=1, uniform="cam")
+        for r in range(nrows):
+            self.camera_display_area.rowconfigure(r, weight=1, uniform="cam")
+        # 取消旧的多余行列权重
+        for c in range(ncols, ncols + 3):
+            self.camera_display_area.columnconfigure(c, weight=0, uniform="")
+        for r in range(nrows, nrows + 5):
+            self.camera_display_area.rowconfigure(r, weight=0, uniform="")
+
+        for idx, name in enumerate(selected):
+            r, c = divmod(idx, ncols)
+            card = ttk.Frame(self.camera_display_area)
+            card.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
+
+            header = ttk.Frame(card)
+            header.pack(fill=tk.X, pady=(0, 4))
+            ttk.Label(header, text=f"📷  {self.camera_titles.get(name, name)}",
+                      style="Section.TLabel").pack(side=tk.LEFT, anchor=tk.W)
+            ttk.Button(header, text="💾 保存图片",
+                       style="Primary.TButton",
+                       command=lambda n=name: self.save_camera_frame(n)
+                       ).pack(side=tk.RIGHT)
+
+            label = ttk.Label(card, borderwidth=1, relief="solid",
+                              background="#222", anchor=tk.CENTER)
+            label.pack(fill=tk.BOTH, expand=True)
+            self.camera_labels[name] = label
+            self._bind_camera_click(name)
+
+        # 重新应用鼠标样式
+        self.toggle_rgbd_mode()
 
     def setup_status_panel(self, parent):
         """关节状态面板：左侧"手臂"，右侧"头部&腰部"+"夹爪"，用 grid 整齐对齐。"""
@@ -1562,6 +1662,10 @@ class RobotControlGUI:
                    ).pack(fill=tk.X, ipady=4)
 
     def start_inference_data_collection_thread(self):
+        # 由本线程独占采集/缓存的相机，start_camera_thread 不再重复 cache，
+        # 以免覆盖与关节时间戳精确配对的帧
+        self.inference_managed_cameras.add("hand_left")
+
         def update_inference_data():
             camera_name = "hand_left"
             # fps = 30  # hz
@@ -1614,7 +1718,11 @@ class RobotControlGUI:
             while True:
                 try:
                     # 获取各个相机的最新图像和内参
-                    for camera_name in self.camera_images.keys():
+                    # 用快照遍历，避免显示区重建时（主线程改键）触发字典迭代错误
+                    for camera_name in list(self.camera_images.keys()):
+                        # 相机可能在遍历期间被取消勾选而移除
+                        if camera_name not in self.camera_images:
+                            continue
                         image, timestamp = self.camera.get_latest_image(camera_name)
                         if image is not None:
                             # print(f"获取到 {camera_name} 相机图像，图像 shape: {image.shape}")
@@ -1623,14 +1731,22 @@ class RobotControlGUI:
                             else:
                                 height, width = image.shape[0]
                             # print(f"获取到 {camera_name} 相机图像，图像 height, width: {height} {width}")
-                            # 对于深度相机，保存原始图像数据
-                            if camera_name in ["head_depth", "head", "hand_right"]:
-                                self.camera_images[camera_name] = image.copy()
+                            # 缓存最近两帧（与 hand_left 一致的 list 结构），
+                            # 供推理 / VR 串流 / 保存图片 / 3D 点击等统一消费。
+                            # 推理线程独占的相机（如 hand_left）不在此重复缓存，
+                            # 避免覆盖其与关节时间戳精确配对的帧。
+                            if (camera_name in self.camera_images
+                                    and camera_name not in self.inference_managed_cameras):
+                                prev = self.camera_images[camera_name]
+                                if isinstance(prev, list) and len(prev) == 2:
+                                    self.camera_images[camera_name] = [prev[-1], image.copy()]
+                                else:
+                                    self.camera_images[camera_name] = [image.copy(), image.copy()]
 
                             self.update_camera_display(camera_name, image)
-                        
+
                         # 获取相机内参（只需获取一次）
-                        if self.camera_intrinsics[camera_name] is None:
+                        if self.camera_intrinsics.get(camera_name) is None:
                             try:
                                 # 尝试获取相机信息 - 根据SDK文档，CosineCamera可能有不同的接口
                                 camera_info = None
@@ -1783,6 +1899,55 @@ class RobotControlGUI:
         status_thread = threading.Thread(target=update_robot_status, daemon=True)
         status_thread.start()
         
+    def save_camera_frame(self, camera_name):
+        """将指定相机的当前帧保存为本地 jpg 图片。"""
+        try:
+            image = self.camera_images.get(camera_name)
+            # 部分相机缓存的是最近两帧的列表，取最新一帧
+            if isinstance(image, (list, tuple)):
+                image = image[-1] if image else None
+            if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+                self.status_text.set(f"保存失败：{camera_name} 相机暂无图像")
+                return
+
+            # 转换为可保存的 RGB PIL 图像（与显示逻辑保持一致）
+            if len(image.shape) == 3 and image.shape[2] == 3:
+                arr = image if image.dtype == np.uint8 else image.astype(np.uint8)
+                if hasattr(self, "bgr_cameras") and camera_name in self.bgr_cameras:
+                    arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(arr)
+            else:
+                # 深度 / 灰度图：归一化并做伪彩色映射后保存
+                depth_2d = image[:, :, 0] if len(image.shape) == 3 else image
+                if depth_2d.dtype == np.uint16:
+                    valid_pixels = depth_2d[depth_2d > 0]
+                    if valid_pixels.size > 0:
+                        min_val, max_val = np.min(valid_pixels), np.max(valid_pixels)
+                    else:
+                        min_val, max_val = 0, 1
+                    if max_val > min_val:
+                        depth_norm = ((depth_2d.astype(np.float32) - min_val) /
+                                      (max_val - min_val) * 255).astype(np.uint8)
+                    else:
+                        depth_norm = np.zeros_like(depth_2d, dtype=np.uint8)
+                else:
+                    depth_norm = depth_2d.astype(np.uint8)
+                depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO)
+                depth_rgb = cv2.cvtColor(depth_color, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(depth_rgb)
+
+            save_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "saved_images")
+            os.makedirs(save_dir, exist_ok=True)
+            filename = f"{camera_name}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            filepath = os.path.join(save_dir, filename)
+            pil_image.convert("RGB").save(filepath, "JPEG", quality=95)
+            self.status_text.set(f"已保存图片: {filepath}")
+            print(f"已保存图片: {filepath}")
+        except Exception as e:
+            self.status_text.set(f"保存图片失败: {e}")
+            print(f"保存图片失败: {e}")
+
     def update_camera_display(self, camera_name, image):
         """更新相机图像显示"""
         try:
@@ -1812,8 +1977,6 @@ class RobotControlGUI:
             # ================= 深度 / 灰度 =================
             elif len(image.shape) == 2 or (len(image.shape) == 3 and image.shape[2] == 1):
 
-                original_depth = image.copy()
-
                 depth_2d = image[:, :, 0] if len(image.shape) == 3 else image
 
                 # ========= 归一化 =========
@@ -1841,21 +2004,17 @@ class RobotControlGUI:
                 depth_rgb = cv2.cvtColor(depth_color, cv2.COLOR_BGR2RGB)
 
                 pil_image = Image.fromarray(depth_rgb)
-
-                if camera_name == "head_depth":
-                    self.camera_images[camera_name] = original_depth
+                # 原始深度数据的缓存改由 start_camera_thread 统一以 list 结构维护
 
             else:
                 print(f"不支持shape: {image.shape}")
                 return
 
             # ================= resize =================
-            # if camera_name == "head":
-            #     pil_image = pil_image.resize((800, 600), Image.Resampling.LANCZOS)
-            # else:
-            #     # pil_image = pil_image.resize((320, 240), Image.Resampling.LANCZOS)
-            #     pil_image = pil_image.resize((256, 195), Image.Resampling.LANCZOS)
-            pil_image = pil_image.resize((800, 600), Image.Resampling.LANCZOS)
+            # 使用按排版动态计算的尺寸，避免多相机时画面超出显示区
+            tile_w, tile_h = getattr(self, "camera_tile_size", (320, 240))
+            pil_image = pil_image.resize((tile_w, tile_h), Image.Resampling.LANCZOS)
+
 
             photo = ImageTk.PhotoImage(pil_image)
 
@@ -1871,8 +2030,12 @@ class RobotControlGUI:
     
     def update_label_image(self, label, photo):
         """更新标签图像"""
-        label.config(image=photo)
-        label.image = photo  # 保持引用
+        try:
+            label.config(image=photo)
+            label.image = photo  # 保持引用
+        except tk.TclError:
+            # 标签可能在重建显示区时已被销毁，忽略这次延迟回调
+            pass
     
     def show_status(self, message, message_type="info"):
         """在状态栏显示消息"""
@@ -1958,18 +2121,29 @@ class RobotControlGUI:
             print(f"像素到3D坐标转换失败: {e}")
             return [None, None, None]
     
+    def _latest_camera_frame(self, camera_name):
+        """从 camera_images 取指定相机的最新一帧。
+
+        camera_images 内所有相机统一为「最近两帧」的 list 结构，
+        此处返回最新一帧（list[-1]）；兼容历史的单帧 ndarray。
+        """
+        entry = self.camera_images.get(camera_name)
+        if isinstance(entry, (list, tuple)):
+            return entry[-1] if entry else None
+        return entry
+
     def get_depth_at_pixel(self, camera_name, pixel_x, pixel_y):
         """获取指定像素位置的深度值"""
         try:
             # 获取深度图像
             if camera_name == "head":
                 # 如果是RGB相机，尝试获取对应的深度相机图像
-                depth_image = self.camera_images.get("head_depth")
+                depth_image = self._latest_camera_frame("head_depth")
                 if depth_image is None:
                     print("无法获取深度图像")
                     return None
             elif camera_name == "head_depth":
-                depth_image = self.camera_images.get("head_depth")
+                depth_image = self._latest_camera_frame("head_depth")
             else:
                 # 手部相机可能没有深度信息
                 print(f"{camera_name} 没有深度信息")
@@ -2696,23 +2870,49 @@ class RobotControlGUI:
             self.show_status(f"导出失败: {e}", "error")
     
     def on_closing(self):
-        """窗口关闭时的处理"""
-        try:
+        """窗口关闭时的处理：依次释放各资源，最后强制退出进程。
+
+        每个资源单独 try/except，避免前一个清理失败阻断后续；
+        最后用 os._exit() 兜底，绕过被 DDS/rclpy 原生线程卡住的解释器退出。
+        """
+        # 防止重复进入（信号 + 窗口关闭可能同时触发）
+        if getattr(self, "_is_closing", False):
+            return
+        self._is_closing = True
+
+        for label, fn in [
+            ("VR 串流服务器", self.dummy_server.stop),
+            ("相机", self.camera.close),
+            ("机器人", self.robot.shutdown),
+            ("ROS 节点", self.wheel_controller.destroy_node),
+            ("rclpy", rclpy.shutdown),
+        ]:
             try:
-                self.dummy_server.stop()
+                fn()
             except Exception as e:
-                print(f"关闭 VR 串流服务器出错: {e}")
-            self.camera.close()
-            self.robot.shutdown()
+                print(f"关闭{label}出错: {e}")
+
+        try:
             self.root.destroy()
         except Exception as e:
-            print(f"关闭时出错: {e}")
-            self.root.destroy()
+            print(f"销毁窗口出错: {e}")
+        finally:
+            os._exit(0)
 
 def main():
     root = tk.Tk()
     app = RobotControlGUI(root)  # 样式由 _setup_styles 统一配置
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
+
+    # Ctrl+C：注册 SIGINT 处理器，转交主线程的 on_closing
+    signal.signal(signal.SIGINT, lambda *_: app.on_closing())
+
+    # 心跳：周期性把控制权交还给 Python 解释器，
+    # 否则 Tk 的 C 事件循环在空闲时不会处理挂起的 SIGINT。
+    def _tick():
+        root.after(200, _tick)
+    root.after(200, _tick)
+
     try:
         root.mainloop()
     except KeyboardInterrupt:
