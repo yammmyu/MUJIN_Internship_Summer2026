@@ -23,6 +23,7 @@ from constants import *
 from pico_vr.pico_vr_server.server import DummyServer
 
 from kinematics import RobotCoordinateTransformer
+from MDM_data_collection.robot_data_collect import RobotDataCollector
 from gui import (
     StyleMixin,
     CameraMixin,
@@ -32,6 +33,7 @@ from gui import (
     InferenceMixin,
     ManualControlMixin,
     VRMixin,
+    DataCollectionMixin,
 )
 
 
@@ -44,6 +46,7 @@ class RobotControlGUI(
     InferenceMixin,
     ManualControlMixin,
     VRMixin,
+    DataCollectionMixin,
 ):
     def __init__(self, root):
         self.root = root
@@ -65,9 +68,6 @@ class RobotControlGUI(
 
         # 等待初始化
         time.sleep(1.0)
-        # 状态栏用于显示消息（替代messagebox）
-        self.status_text = tk.StringVar()
-        self.status_text.set("就绪")
 
         # 相机图像缓存
         self.camera_images = {
@@ -149,6 +149,14 @@ class RobotControlGUI(
         # 坐标转换处理器
         self.transformer = RobotCoordinateTransformer()
 
+        # 数据采集器（共享已有的 robot / camera 实例，不重复初始化硬件）
+        self.data_collector = RobotDataCollector(
+            output_dir="recordings",
+            robot=self.robot,
+            camera=self.camera,
+            robot_controller=self.robot_controller,
+        )
+
         # 状态栏相关
         self.status_text = tk.StringVar()
         self.status_text.set("就绪")
@@ -224,6 +232,7 @@ class RobotControlGUI(
 
         self.setup_pick_and_place_panel(right_notebook)
         self.setup_control_panel(right_notebook)
+        self.setup_data_collection_panel(right_notebook)
 
     def on_closing(self):
         """窗口关闭时的处理：依次释放各资源，最后强制退出进程。

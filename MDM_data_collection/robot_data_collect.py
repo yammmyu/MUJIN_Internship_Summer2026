@@ -14,11 +14,13 @@ RECORD_HZ    = 30
 
 
 class RobotDataCollector:
-    def __init__(self, output_dir="recordings", record_hz=RECORD_HZ):
-        self.robot            = Robot()
-        self.camera           = Camera(CAMERA_NAMES)
-        self.robot_controller = RobotController()
-        time.sleep(1.0)
+    def __init__(self, output_dir="recordings", record_hz=RECORD_HZ,
+                 robot=None, camera=None, robot_controller=None):
+        self.robot            = robot            or Robot()
+        self.camera           = camera           or Camera(CAMERA_NAMES)
+        self.robot_controller = robot_controller or RobotController()
+        if robot is None or camera is None:
+            time.sleep(1.0)
 
         self.output_dir = pathlib.Path(output_dir)
         self.record_hz  = record_hz
@@ -89,6 +91,16 @@ class RobotDataCollector:
         while self._is_recording:
             t = time.time()
 
+            # --- Camera frames (snapshot first) ---
+            with self._frame_lock:
+                snapshot = {name: self._latest_frames[name] for name in CAMERA_NAMES}
+
+            # Skip this tick if any camera hasn't delivered its first frame yet.
+            # This keeps robot_states.npz row count in sync with video frame count.
+            if any(frame is None for frame in snapshot.values()):
+                time.sleep(0.001)
+                continue
+
             # --- End-effector poses (position + quaternion) ---
             left_list.append(self.left_hand_status)    # (7,): x,y,z,qx,qy,qz,qw
             right_list.append(self.right_hand_status)  # (7,): x,y,z,qx,qy,qz,qw
@@ -98,10 +110,6 @@ class RobotDataCollector:
             gripper_list.append(list(self.robot.gripper_states()[0]))        # 2 floats (0=open,1=closed)
 
             timestamps.append(t)
-
-            # --- Camera frames ---
-            with self._frame_lock:
-                snapshot = {name: self._latest_frames[name] for name in CAMERA_NAMES}
 
             for name, frame in snapshot.items():
                 if frame is None:
@@ -184,8 +192,12 @@ class RobotDataCollector:
             return
         print("Stopping recording...")
         self._is_recording = False
+        if self._camera_thread:
+            self._camera_thread.join()
+            self._camera_thread = None
         if self._record_thread:
             self._record_thread.join()
+            self._record_thread = None
         print("Recording stopped.")
 
     def shutdown(self):
