@@ -309,16 +309,47 @@ def DeleteBox(env, name="box0"):
 # --------------------------------------------------------------------------- #
 # Grasp IK generation
 # --------------------------------------------------------------------------- #
-def _BoxFaceGrasps(box, gripperOffset=0.0):
-    """Build one candidate grasp per box face.
+def _AxisAngleMatrix(axis, angle):
+    """Rodrigues rotation matrix from a unit axis + radians angle."""
+    a = np.asarray(axis, dtype=float)
+    n = np.linalg.norm(a)
+    if n == 0:
+        return np.eye(3)
+    a = a / n
+    K = np.array([
+        [0.0, -a[2], a[1]],
+        [a[2], 0.0, -a[0]],
+        [-a[1], a[0], 0.0],
+    ])
+    return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * K.dot(K)
 
-    For each of the 6 faces: approach is along the face's inward normal (tool +Z
-    points into the box), and the tool X axis is aligned with the shorter of the
-    two in-plane edges (the direction a parallel gripper would close on).
 
-    Returns a list of dicts with keys:
-        axisIdx, sign, center (3,), normal (3, outward), edgeLens [e1, e2],
-        graspWidth, pose (spatial.P, [qw qx qy qz x y z]).
+def _BoxFaceGrasps(box, gripperOffset=0.0,
+                   zRotsDeg=(0, 90, 180, 270),
+                   tiltsDeg=(0, 2, 4, 6, 8, 10),
+                   tiltAzimuthsDeg=(0, 2, 4, 6, 8, 10),
+                   maxGraspWidth=0.10):
+    """Build candidate grasps for every box face, optionally with tilt.
+
+    Each face contributes a base tool frame: approach (tool +Z) along the face's
+    inward normal, tool X aligned with the shorter in-plane edge. The tool frame
+    is then spun about its own approach axis by each zRotsDeg, AND tilted by
+    each (tiltDeg, azimDeg) pair where tiltDeg rotates the approach axis by
+    tiltDeg toward in-plane direction (cos azim, sin azim) of the tool frame.
+
+    The position stays at the face center (offset by gripperOffset along the
+    outward normal) — only orientation varies. This lets the IK solver pick a
+    "roughly aligned" gripper pose when an exactly perpendicular grasp is
+    unreachable.
+
+    Candidate count = 6 faces × len(zRotsDeg) × (1 + (len(tiltsDeg)-1) * len(tiltAzimuthsDeg)),
+    minus any zRot orientations whose in-plane edge along tool X exceeds
+    maxGraspWidth (the gripper's max opening, in meters; default 0.10 = 10 cm,
+    pass None to disable). With defaults (4, (0,), 4) that's 24; with
+    tiltsDeg=(0,15,30) it's 6×4×(1+2·4)=216.
+
+    Each grasp dict carries: axisIdx, sign, zRotDeg, tiltDeg, tiltAzimDeg,
+    center, normal, edgeLens, graspWidth, pose.
     """
     T = np.array(box.GetTransform())
     R = T[:3, :3]
@@ -344,37 +375,82 @@ def _BoxFaceGrasps(box, gripperOffset=0.0):
             tx = shortAxis - tz * np.dot(shortAxis, tz)  # orthogonalize (already ⊥)
             tx = tx / np.linalg.norm(tx)
             ty = np.cross(tz, tx)
-            Rtool = np.column_stack([tx, ty, tz])
-            quat = quatFromRotationMatrix(Rtool)
-
+            Rbase = np.column_stack([tx, ty, tz])
             target = faceCenter + outward * gripperOffset
-            pose = P([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]),
-                      float(target[0]), float(target[1]), float(target[2])])
 
-            grasps.append({
-                "axisIdx": axisIdx,
-                "sign": sign,
-                "center": faceCenter,
-                "normal": outward,
-                "edgeLens": [edges[0][2], edges[1][2]],
-                "graspWidth": edges[0][2],
-                "pose": pose,
-            })
+            for zRotDeg in zRotsDeg:
+                # The gripper closes along the tool X axis. After a 90/270°
+                # z-spin tool X points along the LONGER in-plane edge, so the
+                # grasp width grows. Skip the whole zRot (and every tilt under
+                # it) if the gripper can't open that wide.
+                graspWidth = edges[0][2] if zRotDeg % 180 == 0 else edges[1][2]
+                if maxGraspWidth is not None and graspWidth > maxGraspWidth:
+                    continue
+
+                th = np.deg2rad(zRotDeg)
+                Rz = np.array([[np.cos(th), -np.sin(th), 0.0],
+                               [np.sin(th), np.cos(th), 0.0],
+                               [0.0, 0.0, 1.0]])
+                RtoolZ = Rbase.dot(Rz)  # spin about tool's own Z (approach) axis
+
+                # tiltDeg=0 has no meaningful azimuth → emit once; non-zero
+                # tilts use every azimuth so the approach cone is sampled.
+                for tiltDeg in tiltsDeg:
+                    azimList = (0,) if tiltDeg == 0 else tiltAzimuthsDeg
+                    for azimDeg in azimList:
+                        a = np.deg2rad(azimDeg)
+                        t = np.deg2rad(tiltDeg)
+                        # Rotation axis (in current tool frame) that tilts +Z
+                        # toward the in-plane direction (cos azim, sin azim).
+                        # Derived from z × (cos a, sin a, 0) = (-sin a, cos a, 0).
+                        ax = np.array([-np.sin(a), np.cos(a), 0.0])
+                        Rtilt = _AxisAngleMatrix(ax, t)
+                        Rtool = RtoolZ.dot(Rtilt)
+                        quat = quatFromRotationMatrix(Rtool)
+                        pose = P([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]),
+                                  float(target[0]), float(target[1]), float(target[2])])
+                        grasps.append({
+                            "axisIdx": axisIdx,
+                            "sign": sign,
+                            "zRotDeg": zRotDeg,
+                            "tiltDeg": tiltDeg,
+                            "tiltAzimDeg": azimDeg,
+                            "center": faceCenter,
+                            "normal": outward,
+                            "edgeLens": [edges[0][2], edges[1][2]],
+                            "graspWidth": graspWidth,
+                            "pose": pose,
+                        })
     return grasps
 
 
 def GenerateBoxIK(env, robot, box, manipName, gripperOffset=0.0,
-                  visualize=True, handles=None):
+                  tiltsDeg=(0, 2, 4, 6, 8, 10), tiltAzimuthsDeg=(0, 2, 4, 6, 8, 10),
+                  maxGraspWidth=0.10,
+                  visualize=True, drawFailed=False, handles=None):
     """Compute and visualize grasp IK candidates for a box.
 
-    Faces are prioritized: the short-side faces (perpendicular to the box's
-    longest axis) first, then by proximity to the arm base. Each candidate gets
-    an IK solve (gripper-vs-box collisions ignored). Feasible grasps are drawn
-    with green axes, infeasible with red. Returns the candidate list sorted by
-    priority, each annotated with a "solution" key (None if unreachable).
+    Each face produces multiple orientation candidates: the 4 zRot spins
+    crossed with a tilt cone (`tiltsDeg` × `tiltAzimuthsDeg`). Allowing some
+    tilt is the main escape hatch when the perpendicular grasp is unreachable
+    on the redundant A2D arm — xyz stays exact but the approach axis is
+    allowed to lean by tiltDeg degrees.
+
+    Sort priority: short-side face → near arm base → SMALL tilt → zRot →
+    azimuth. So the "least tilted feasible grasp" comes out first.
+
+    visualize=True draws axes for feasible candidates (and infeasible ones too
+    if drawFailed=True, useful when debugging a fully unreachable box).
     """
     manip = PrepareManipulator(robot, manipName)
-    grasps = _BoxFaceGrasps(box, gripperOffset)
+    grasps = _BoxFaceGrasps(box, gripperOffset,
+                            tiltsDeg=tiltsDeg, tiltAzimuthsDeg=tiltAzimuthsDeg,
+                            maxGraspWidth=maxGraspWidth)
+    if not grasps:
+        log.warning("GenerateBoxIK: 0 candidates — every face's grasp width "
+                    "exceeds maxGraspWidth=%s m; raise the limit or rotate "
+                    "the box.", maxGraspWidth)
+        return []
 
     geom = box.GetLinks()[0].GetGeometries()[0]
     he = np.array(geom.GetBoxExtents(), dtype=float)
@@ -384,24 +460,30 @@ def GenerateBoxIK(env, robot, box, manipName, gripperOffset=0.0,
     for g in grasps:
         g["isShortFace"] = (g["axisIdx"] == longestAxis)
         g["distToArm"] = float(np.linalg.norm(g["center"] - armBase))
-    # short-side face first, then nearest to the arm base
-    grasps.sort(key=lambda g: (not g["isShortFace"], g["distToArm"]))
+    # short-side face first, then nearest to the arm base, then smallest tilt
+    grasps.sort(key=lambda g: (not g["isShortFace"], g["distToArm"],
+                               g["tiltDeg"], g["zRotDeg"], g["tiltAzimDeg"]))
 
     for g in grasps:
         bestSolution, _ = SolveAndScoreIk(env, robot, manip, g["pose"], target=box)
         g["solution"] = bestSolution
         feasible = bestSolution is not None
-        if visualize and handles is not None:
-            colormode = "rgb" if feasible else None
-            h = misc.DrawAxes(env, g["pose"], dist=0.08, linewidth=3)
-            handles.append(h)
-        log.warning("  face axis=%d sign=%+d shortFace=%s dist=%.3f width=%.3f -> %s",
-                    g["axisIdx"], int(g["sign"]), g["isShortFace"], g["distToArm"],
-                    g["graspWidth"], "OK" if feasible else "unreachable")
+        if visualize and handles is not None and (feasible or drawFailed):
+            dist = 0.08 if feasible else 0.03
+            handles.append(misc.DrawAxes(env, g["pose"], dist=dist, linewidth=3 if feasible else 1))
+        log.info("  face axis=%d sign=%+d zRot=%3d tilt=%+d@%3d shortFace=%s dist=%.3f -> %s",
+                 g["axisIdx"], int(g["sign"]), g["zRotDeg"], g["tiltDeg"], g["tiltAzimDeg"],
+                 g["isShortFace"], g["distToArm"], "OK" if feasible else "X")
 
     feasible = [g for g in grasps if g["solution"] is not None]
     log.warning("GenerateBoxIK: %d/%d feasible grasp(s) for %s on %r",
                 len(feasible), len(grasps), manipName, box.GetName())
+    if feasible:
+        minTilt = min(g["tiltDeg"] for g in feasible)
+        log.warning("  best feasible candidate: face axis=%d sign=%+d zRot=%d tilt=%+d@%d",
+                    feasible[0]["axisIdx"], int(feasible[0]["sign"]),
+                    feasible[0]["zRotDeg"], feasible[0]["tiltDeg"], feasible[0]["tiltAzimDeg"])
+        log.warning("  smallest tilt among feasible = %d°", minTilt)
     return grasps
 
 
@@ -409,18 +491,24 @@ def GenerateBoxIK(env, robot, box, manipName, gripperOffset=0.0,
 # Grasp trajectory
 # --------------------------------------------------------------------------- #
 def Grab(env, robot, manipName, box, gripperOffset=0.0,
+         tiltsDeg=(0, 2, 4, 6, 8, 10), tiltAzimuthsDeg=(0, 2, 4, 6, 8, 10),
+         maxGraspWidth=0.10,
          maxvelmult=0.2, replayDt=0.01, handles=None, attach=True):
     """Select a hand + box, plan and visualize a grasp trajectory.
 
-    Picks the highest-priority reachable grasp from GenerateBoxIK, plans a path
-    from the arm's current configuration to that grasp (box collisions disabled
-    during planning so the TCP can coincide with the box surface), replays it,
-    and optionally Grab()s the box so it follows the gripper afterwards.
+    Picks the highest-priority reachable grasp from GenerateBoxIK (which sorts
+    by face/proximity then smallest tilt, so the chosen grasp is the closest
+    to perpendicular among the feasible ones), plans a path from the arm's
+    current configuration to that grasp (box collisions disabled during
+    planning so the TCP can coincide with the box surface), replays it, and
+    optionally Grab()s the box so it follows the gripper afterwards.
     """
     if handles is None:
         handles = []
     manip = PrepareManipulator(robot, manipName)
     grasps = GenerateBoxIK(env, robot, box, manipName, gripperOffset=gripperOffset,
+                           tiltsDeg=tiltsDeg, tiltAzimuthsDeg=tiltAzimuthsDeg,
+                           maxGraspWidth=maxGraspWidth,
                            visualize=True, handles=handles)
     feasible = [g for g in grasps if g["solution"] is not None]
     if not feasible:
@@ -428,8 +516,10 @@ def Grab(env, robot, manipName, box, gripperOffset=0.0,
         return False
 
     best = feasible[0]
-    log.warning("Grab: chosen face axis=%d sign=%+d center=%s",
-                best["axisIdx"], int(best["sign"]), list(best["center"]))
+    log.warning("Grab: chosen face axis=%d sign=%+d zRot=%d tilt=%+d@%d center=%s",
+                best["axisIdx"], int(best["sign"]),
+                best["zRotDeg"], best["tiltDeg"], best["tiltAzimDeg"],
+                list(best["center"]))
     DrawTarget(env, best["pose"], handles)
 
     boxWasEnabled = box.IsEnabled()
@@ -578,20 +668,24 @@ def Main():
     def del_box(name="box0"):
         return DeleteBox(env, name)
 
-    def gen_box_ik(name="box0", manip=LEFT_MANIP, gripperOffset=0.0):
+    def gen_box_ik(name="box0", manip=LEFT_MANIP, gripperOffset=0.0,
+                   tiltsDeg=(0, 2, 4, 6, 8, 10), maxGraspWidth=0.10, drawFailed=False, visualize=True):
         body = env.GetKinBody(name)
         if body is None:
             print("No box named %r; call add_box(%r) first" % (name, name))
             return None
         return GenerateBoxIK(env, robot, body, manip, gripperOffset=gripperOffset,
-                             handles=handles)
+                             tiltsDeg=tiltsDeg, maxGraspWidth=maxGraspWidth,
+                             drawFailed=drawFailed, handles=handles,  visualize=visualize)
 
-    def grab(name="box0", manip=LEFT_MANIP, gripperOffset=0.0):
+    def grab(name="box0", manip=LEFT_MANIP, gripperOffset=0.0,
+             tiltsDeg=(0, 2, 4, 6, 8, 10), maxGraspWidth=0.10):
         body = env.GetKinBody(name)
         if body is None:
             print("No box named %r; call add_box(%r) first" % (name, name))
             return False
         return Grab(env, robot, manip, body, gripperOffset=gripperOffset,
+                    tiltsDeg=tiltsDeg, maxGraspWidth=maxGraspWidth,
                     maxvelmult=args.maxvelmult, replayDt=args.replayDt, handles=handles)
 
     def release(name=None):
@@ -601,8 +695,12 @@ def Main():
     print("\nIPython helpers (env/robot already bound):")
     print("  add_box(name='box0', halfExtents=(hx,hy,hz), pose=[qw,qx,qy,qz,x,y,z])")
     print("  del_box(name='box0')")
-    print("  gen_box_ik(name='box0', manip='gripper_center')   # visualize grasp IK")
-    print("  grab(name='box0', manip='gripper_center')         # plan+replay grasp")
+    print("  gen_box_ik(name='box0', manip='gripper_center', tiltsDeg=(0, 2, 4, 6, 8, 10), maxGraspWidth=0.10)")
+    print("  grab(name='box0',       manip='gripper_center', tiltsDeg=(0, 2, 4, 6, 8, 10), maxGraspWidth=0.10)")
+    print("    tiltsDeg:      how far the gripper may lean from perpendicular")
+    print("                   (0,) strict; (0,15,30) up to 30°.")
+    print("    maxGraspWidth: drop candidates whose closing-direction edge")
+    print("                   exceeds this width (meters). None disables.")
     print("  release(name='box0')   # release a held box; release() releases all")
     print("  manips: LEFT='%s', RIGHT='%s'" % (LEFT_MANIP, RIGHT_MANIP))
 
