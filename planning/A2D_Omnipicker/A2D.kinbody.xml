@@ -40,6 +40,12 @@
 				<collision>meshes/link_pitch_head.STL 1.0</collision>
 				<rotationaxis>0 1 0 180</rotationaxis>
 			</geom>
+			<!-- Dummy camera in head -->
+			<geom type="box" name="head_camera">
+				<translation>-0.11 0.04 0</translation>
+				<extents>0.005 0.01 0.05</extents>
+				<diffusecolor>1 0.5 0</diffusecolor>
+			</geom>
 		</body>
 		<body name="base_link_l">
 			<translation>0.130999 0.025 0.9535</translation>
@@ -159,6 +165,27 @@
 			<geom type="trimesh" name="left_base_link">
 				<collision>meshes/gripper_base_link.STL 1.0</collision>
 			</geom>
+			<!-- Two simple boxes replacing the 8-link parallel finger mechanism.
+			     Local frame: +Z toward gripper_center (finger length),
+			     +Y = inner/outer jaw separation, +X = vertical (world +Z). -->
+			<geom type="box" name="left_finger_inner">
+				<translation>0 -0.025 0.075</translation>
+			    <rotationaxis>1 0 0 30</rotationaxis>
+				<extents>0.015 0.005 0.075</extents>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+			</geom>
+			<geom type="box" name="left_finger_outer">
+				<translation>0 0.025 0.075</translation>
+			    <rotationaxis>1 0 0 -30</rotationaxis>
+				<extents>0.015 0.005 0.075</extents>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
+			</geom>
+			<!-- Dummy camera in hand -->
+			<geom type="box" name="left_hand_camera">
+				<translation>0.071 0 0</translation>
+				<extents>0.04 0.025 0.025</extents>
+				<diffusecolor>1 0.5 0</diffusecolor>
+			</geom>
 		</body>
 		<body name="right_base_link">
 			<translation>0.131001 -0.8965 0.953503</translation>
@@ -166,130 +193,35 @@
 			<geom type="trimesh" name="right_base_link">
 				<collision>meshes/gripper_base_link.STL 1.0</collision>
 			</geom>
-		</body>
-		<body name="left_narrow1_Link">
-			<translation>0.111492 0.953 0.9535</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_narrow1_Link">
-				<collision>meshes/narrow1_Link.STL 1.0</collision>
+			<geom type="box" name="right_finger_inner">
+				<translation>0 -0.025 0.075</translation>
+			    <rotationaxis>1 0 0 30</rotationaxis>
+				<extents>0.015 0.005 0.075</extents>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
 			</geom>
-		</body>
-		<body name="left_narrow2_Link">
-			<translation>0.109358 0.97037 0.953501</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_narrow2_Link">
-				<collision>meshes/narrow2_Link.STL 1.0</collision>
+			<geom type="box" name="right_finger_outer">
+				<translation>0 0.025 0.075</translation>
+			    <rotationaxis>1 0 0 -30</rotationaxis>
+				<extents>0.015 0.005 0.075</extents>
+				<diffusecolor>0.3 0.3 0.3</diffusecolor>
 			</geom>
-		</body>
-		<body name="left_wide1_Link">
-			<translation>0.150492 0.953 0.9535</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_wide1_Link">
-				<collision>meshes/wide1_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="left_wide2_Link">
-			<translation>0.152624 0.97037 0.9535</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_wide2_Link">
-				<collision>meshes/wide2_Link.STL 1.0</collision>
+			<geom type="box" name="right_hand_camera">
+				<translation>0.071 0 0</translation>
+				<extents>0.04 0.025 0.025</extents>
+				<diffusecolor>1 0.5 0</diffusecolor>
 			</geom>
 		</body>
 		<body name="gripper_center">
-			<translation>0.130991 1.1265 0.953502</translation>
+			<translation>0.130991 1.0065 0.953502</translation>
 			<rotationaxis>-2.5974e-06 -0.707104 -0.707109 179.999</rotationaxis>
 		</body>
-		<body name="right_narrow1_Link">
-			<translation>0.150502 -0.953 0.953503</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_narrow1_Link">
-				<collision>meshes/narrow1_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_narrow2_Link">
-			<translation>0.152635 -0.97037 0.953503</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_narrow2_Link">
-				<collision>meshes/narrow2_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_wide1_Link">
-			<translation>0.111502 -0.953 0.953503</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_wide1_Link">
-				<collision>meshes/wide1_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_wide2_Link">
-			<translation>0.109369 -0.97037 0.953503</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_wide2_Link">
-				<collision>meshes/wide2_Link.STL 1.0</collision>
-			</geom>
-		</body>
 		<body name="right_gripper_center">
-			<translation>0.131003 -1.1235 0.953504</translation>
+			<translation>0.131003 -1.0035 0.953504</translation>
 			<rotationaxis>1 8.67322e-06 2.34642e-06 89.9996</rotationaxis>
-		</body>
-		<body name="left_narrow3_Link">
-			<translation>0.092942 0.983852 0.953257</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_narrow3_Link">
-				<collision>meshes/narrow3_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="left_wide3_Link">
-			<translation>0.169041 0.983852 0.953744</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_wide3_Link">
-				<collision>meshes/wide3_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_narrow3_Link">
-			<translation>0.169051 -0.983852 0.953259</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_narrow3_Link">
-				<collision>meshes/narrow3_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_wide3_Link">
-			<translation>0.0929525 -0.983852 0.953747</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_wide3_Link">
-				<collision>meshes/wide3_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="left_narrow4_Link">
-			<translation>0.108681 1.00197 0.953464</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_narrow4_Link">
-				<collision>meshes/narrow4_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="left_wide4_Link">
-			<translation>0.153302 1.00197 0.953537</translation>
-			<rotationaxis>-0.00656609 -0.00656983 0.999957 90.0026</rotationaxis>
-			<geom type="trimesh" name="left_wide4_Link">
-				<collision>meshes/wide4_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_narrow4_Link">
-			<translation>0.153313 -1.00197 0.953466</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_narrow4_Link">
-				<collision>meshes/narrow4_Link.STL 1.0</collision>
-			</geom>
-		</body>
-		<body name="right_wide4_Link">
-			<translation>0.108691 -1.00197 0.95354</translation>
-			<rotationaxis>-0.00657858 0.00657479 -0.999957 90.0019</rotationaxis>
-			<geom type="trimesh" name="right_wide4_Link">
-				<collision>meshes/wide4_Link.STL 1.0</collision>
-			</geom>
 		</body>
 
 		<!-- Joints -->
-		<joint type="slider" enable="false" name="joint_lift_body">
+		<joint type="slider" enable="true" name="joint_lift_body">
 			<body>base_link</body>
 			<body>link_up_down_body</body>
 			<offsetfrom>link_up_down_body</offsetfrom>
@@ -297,7 +229,7 @@
 			<limits>0 0.5</limits>
 			<maxvel>2.61</maxvel>
 		</joint>
-		<joint type="revolute" enable="false" name="joint_body_pitch">
+		<joint type="revolute" enable="true" name="joint_body_pitch">
 			<body>link_up_down_body</body>
 			<body>link_pitch_body</body>
 			<offsetfrom>link_pitch_body</offsetfrom>
@@ -305,14 +237,14 @@
 			<limitsdeg>0 60</limitsdeg>
 			<maxveldeg>149.542</maxveldeg>
 		</joint>
-		<joint type="hinge" enable="false" name="joint_head_yaw">
+		<joint type="hinge" enable="true" name="joint_head_yaw">
 			<body>link_pitch_body</body>
 			<body>link_yaw_head</body>
 			<offsetfrom>link_yaw_head</offsetfrom>
 			<axis>0 0 1</axis>
 			<limitsdeg>0 0</limitsdeg>
 		</joint>
-		<joint type="hinge" enable="false" name="joint_head_pitch">
+		<joint type="hinge" enable="true" name="joint_head_pitch">
 			<body>link_yaw_head</body>
 			<body>link_pitch_head</body>
 			<offsetfrom>link_pitch_head</offsetfrom>
@@ -465,134 +397,6 @@
 			<offsetfrom>right_base_link</offsetfrom>
 			<axis>1 0 0</axis>
 			<limitsdeg>0 0</limitsdeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_narrow1_joint">
-			<body>left_base_link</body>
-			<body>left_narrow1_Link</body>
-			<offsetfrom>left_narrow1_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_narrow3_joint">
-			<body>left_narrow1_Link</body>
-			<body>left_narrow3_Link</body>
-			<offsetfrom>left_narrow3_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_narrow4_joint">
-			<body>left_narrow3_Link</body>
-			<body>left_narrow4_Link</body>
-			<offsetfrom>left_narrow4_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_narrow2_joint">
-			<body>left_base_link</body>
-			<body>left_narrow2_Link</body>
-			<offsetfrom>left_narrow2_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_wide1_joint">
-			<body>left_base_link</body>
-			<body>left_wide1_Link</body>
-			<offsetfrom>left_wide1_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_wide3_joint">
-			<body>left_wide1_Link</body>
-			<body>left_wide3_Link</body>
-			<offsetfrom>left_wide3_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_wide4_joint">
-			<body>left_wide3_Link</body>
-			<body>left_wide4_Link</body>
-			<offsetfrom>left_wide4_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="left_wide2_joint">
-			<body>left_base_link</body>
-			<body>left_wide2_Link</body>
-			<offsetfrom>left_wide2_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_narrow1_joint">
-			<body>right_base_link</body>
-			<body>right_narrow1_Link</body>
-			<offsetfrom>right_narrow1_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_narrow3_joint">
-			<body>right_narrow1_Link</body>
-			<body>right_narrow3_Link</body>
-			<offsetfrom>right_narrow3_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_narrow4_joint">
-			<body>right_narrow3_Link</body>
-			<body>right_narrow4_Link</body>
-			<offsetfrom>right_narrow4_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_narrow2_joint">
-			<body>right_base_link</body>
-			<body>right_narrow2_Link</body>
-			<offsetfrom>right_narrow2_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_wide1_joint">
-			<body>right_base_link</body>
-			<body>right_wide1_Link</body>
-			<offsetfrom>right_wide1_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_wide3_joint">
-			<body>right_wide1_Link</body>
-			<body>right_wide3_Link</body>
-			<offsetfrom>right_wide3_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_wide4_joint">
-			<body>right_wide3_Link</body>
-			<body>right_wide4_Link</body>
-			<offsetfrom>right_wide4_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
-		</joint>
-		<joint type="revolute" enable="false" name="right_wide2_joint">
-			<body>right_base_link</body>
-			<body>right_wide2_Link</body>
-			<offsetfrom>right_wide2_Link</offsetfrom>
-			<axis>0 0 -1</axis>
-			<limitsdeg>-114.592 114.592</limitsdeg>
-			<maxveldeg>90.00</maxveldeg>
 		</joint>
 		<joint type="hinge" enable="false" name="gripper_center_joint">
 			<body>left_base_link</body>
