@@ -50,6 +50,92 @@ _DEFAULT_MODEL_TYPE = "rfdetr0m"
 # Mirrors `categorySetToProcess={CategoryType.BOX}` in the reference detector.
 _SPLITTABLE_NAMES = {"box", "irregularMultiPack"}
 
+# Rotation mapping a point from the camera optical frame to the output frame.
+# Camera optical frame: x = image-right, y = image-down, z = depth/forward.
+# Output frame (camera at origin, per the requested convention):
+#   +X = depth/forward            (= camera  z)
+#   +Y = image-left               (= camera -x, so image-right is -Y)
+#   +Z = up                       (= camera -y, fixed by right-handedness)
+# So p_out = (z_cam, -x_cam, -y_cam).
+CAMERA_TO_OUTPUT_ROTATION = numpy.array([
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0],
+])
+
+
+def CameraToOutputFrame(pointsCamera: NDArray) -> NDArray:
+    """Transforms (..., 3) points from the camera optical frame to the output frame.
+
+    The camera is the origin of both frames; only the axes are reoriented so that
+    +X is depth (forward), -Y is image-right (pixel x) and +Z is up.
+    """
+    pts = numpy.asarray(pointsCamera, dtype=numpy.float64)
+    return pts @ CAMERA_TO_OUTPUT_ROTATION.T
+
+
+def CameraMountingRotation(yawDeg: float, pitchDeg: float, rollDeg: float = 0.0) -> NDArray:
+    """Rotation that levels the output frame given the camera's mounting yaw/pitch.
+
+    The camera is mounted rotated relative to a gravity-aligned world frame. This
+    returns the rotation `R` such that `p_world = R @ p_output`, i.e. it maps a
+    point expressed in the (tilted) camera output frame into the leveled world
+    frame, compensating the camera's own orientation.
+
+    Angles are applied in the output frame (+X forward, +Y left, +Z up) as
+    `Rz(yaw) @ Ry(pitch) @ Rx(roll)`:
+        yawDeg:   rotation about +Z (up).   Camera panned left is positive.
+        pitchDeg: rotation about +Y (left). Camera tilted to look DOWN is positive.
+        rollDeg:  rotation about +X (forward).
+    """
+    y, p, r = numpy.deg2rad([yawDeg, pitchDeg, rollDeg])
+    cz, sz = numpy.cos(y), numpy.sin(y)
+    cy, sy = numpy.cos(p), numpy.sin(p)
+    cx, sx = numpy.cos(r), numpy.sin(r)
+    rz = numpy.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+    ry = numpy.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+    rx = numpy.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+    return rz @ ry @ rx
+
+
+def _QuatMultiply(qa: NDArray, qb: NDArray) -> NDArray:
+    """Hamilton product of two (w, x, y, z) quaternions."""
+    w1, x1, y1, z1 = qa
+    w2, x2, y2, z2 = qb
+    return numpy.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
+
+def CompensateCameraOrientation(
+    results: list["DetectionResult"],
+    yawDeg: float,
+    pitchDeg: float,
+    rollDeg: float = 0.0,
+) -> list["DetectionResult"]:
+    """Post-processes Detect results to compensate the camera mounting yaw/pitch.
+
+    Rotates every object's `orientedBox3D` (position and orientation) by
+    `CameraMountingRotation(yaw, pitch, roll)`, so the resulting poses are
+    expressed in a gravity-leveled, yaw-compensated world frame instead of the
+    tilted camera output frame. Modifies the results in place and returns them.
+
+    `size` is unchanged (a rigid rotation preserves extents). Grasp faces, which
+    are reported in the camera optical frame, are left untouched.
+    """
+    rot = CameraMountingRotation(yawDeg, pitchDeg, rollDeg)
+    qRot = Detector._RotationMatrixToQuaternion(rot)
+    for result in results:
+        box = result.orientedBox3D
+        if box is None:
+            continue
+        box.position = rot @ box.position
+        box.quaternion = _QuatMultiply(qRot, box.quaternion)
+    return results
+
 
 # --------------------------------------------------------------------------- #
 # Input data structures
@@ -148,10 +234,37 @@ class GraspFace:
 
 
 @dataclass
+class OrientedBox3D:
+    """Oriented 3D cuboid (pose) of a detected object in the output frame.
+
+    The frame has the camera at the origin with +X depth (forward), -Y image-right
+    (pixel x) and +Z up. The cuboid is described by its center and orientation:
+
+        position:   (3,) center (x, y, z) in meters.
+        quaternion: (4,) orientation as (w, x, y, z), rotating box-local axes into
+                    the output frame. The box-local axes are
+                    (long face edge, short face edge, face normal).
+        size:       (3,) full extents along those box-local axes, in meters.
+
+    Derived from a single view: the extent along the face normal (size[2]) only
+    covers the observed surface, so it is a lower bound on the true box depth.
+    """
+    position: NDArray[numpy.float64]    # (3,) center in output frame, meters
+    quaternion: NDArray[numpy.float64]  # (4,) (w, x, y, z)
+    size: NDArray[numpy.float64]        # (3,) extents along box-local axes, meters
+
+
+@dataclass
 class DetectionResult:
-    """An instance segmentation detection plus its post-processed grasp faces."""
+    """An instance segmentation detection plus its post-processed grasp faces.
+
+    `orientedBox3D` is the object's oriented cuboid pose in the output frame
+    (camera origin, +X depth / -Y image-right / +Z up); None if no 3D pose
+    could be estimated.
+    """
     instance: "InstanceResult"
     faces: list[GraspFace] = field(default_factory=list)
+    orientedBox3D: Optional["OrientedBox3D"] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -202,9 +315,12 @@ class Detector:
         faceSplitTiltThresholdDeg: float = 30.0,
         graspFaceMaxTiltDeg: float = 75.0,
         horizontalFaceAngleThresholdDeg: float = 30.0,
-        minFaceArea: float = 0.01,
+        minFaceArea: float = 0.0001,
         includeTopFacesAsGraspable: bool = False,
         containerMargin: float = 0.02,
+        cameraYawDeg: float = 0.0,
+        cameraPitchDeg: float = 0.0,
+        cameraRollDeg: float = 0.0,
     ) -> list[DetectionResult]:
         """Runs the full RGB-D detection + face post-processing pipeline.
 
@@ -231,6 +347,11 @@ class Detector:
                 criteria as side faces.
             containerMargin: Margin (m) added to the container bounds when
                 testing whether a face center is inside the container.
+            cameraYawDeg, cameraPitchDeg, cameraRollDeg: The camera's mounting
+                orientation. When non-zero, each object's `orientedBox3D` is
+                rotated by `CameraMountingRotation(...)` so the returned pose is
+                in a gravity-leveled, yaw-compensated world frame rather than the
+                tilted camera output frame (pitch > 0 = camera looking down).
 
         Returns:
             One DetectionResult per detected instance, each carrying its
@@ -258,6 +379,9 @@ class Detector:
             instanceMask = result.instance.mask & validMask
             if int(instanceMask.sum()) < 3:
                 continue
+
+            instancePoints = points[instanceMask]
+            instancePoints = instancePoints[numpy.isfinite(instancePoints[:, 0])]
 
             splittable = result.instance.name in _SPLITTABLE_NAMES
             faceMasks, facePlanes = self._SplitInstanceIntoFaces(
@@ -288,11 +412,116 @@ class Detector:
                 if face is not None:
                     result.faces.append(face)
 
+            # Object-level oriented 3D cuboid pose (center + quaternion + size).
+            result.orientedBox3D = self._ComputeOrientedBox3D(
+                faces=result.faces,
+                instancePoints=instancePoints,
+            )
+
+        # Compensate the camera mounting yaw/pitch/roll so object poses are in a
+        # gravity-leveled world frame instead of the tilted camera output frame.
+        if cameraYawDeg or cameraPitchDeg or cameraRollDeg:
+            CompensateCameraOrientation(results, cameraYawDeg, cameraPitchDeg, cameraRollDeg)
+
         return results
 
     # ------------------------------------------------------------------ #
     # Geometry helpers
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ComputeOrientedBox3D(
+        faces: list[GraspFace],
+        instancePoints: NDArray,
+    ) -> Optional["OrientedBox3D"]:
+        """Estimates an object's oriented cuboid pose in the output frame.
+
+        Orientation comes from the largest detected face (its long edge, short
+        edge and outward normal define the box-local axes). If no face is
+        available, the axes fall back to the PCA of the visible points. The
+        center and extents are the oriented bounding box of all visible points in
+        that frame; the result is then expressed in the output frame.
+
+        Args:
+            faces: Grasp faces already extracted for this instance (camera frame).
+            instancePoints: (N, 3) finite visible points of the instance, camera frame.
+
+        Returns:
+            An OrientedBox3D, or None if no pose could be estimated.
+        """
+        if len(instancePoints) < 3:
+            return None
+
+        if faces:
+            primary = max(faces, key=lambda f: f.area)
+            ez = primary.normal3D / numpy.linalg.norm(primary.normal3D)
+            # In-plane edge directions from the face OBB corners.
+            edge1 = primary.corners3D[1] - primary.corners3D[0]
+            edge2 = primary.corners3D[3] - primary.corners3D[0]
+            ex = edge1 if numpy.linalg.norm(edge1) >= numpy.linalg.norm(edge2) else edge2
+            ex = ex - (ex @ ez) * ez
+            nrm = numpy.linalg.norm(ex)
+            if nrm < 1e-9:
+                return None
+            ex = ex / nrm
+            ey = numpy.cross(ez, ex)
+        else:
+            # PCA fallback: principal axes of the visible points.
+            centroid = instancePoints.mean(axis=0)
+            _, _, vh = numpy.linalg.svd(instancePoints - centroid, full_matrices=False)
+            ex, ey, ez = vh[0], vh[1], vh[2]
+
+        rotCam = numpy.column_stack((ex, ey, ez))  # box-local -> camera frame
+
+        # Oriented bounding box of all visible points in the box-local frame.
+        coords = instancePoints @ rotCam  # project onto (ex, ey, ez)
+        lo = coords.min(axis=0)
+        hi = coords.max(axis=0)
+        centerCam = rotCam @ ((lo + hi) / 2.0)
+        size = hi - lo
+
+        # Express in the output frame.
+        centerOut = CameraToOutputFrame(centerCam)
+        rotOut = CAMERA_TO_OUTPUT_ROTATION @ rotCam
+        quat = Detector._RotationMatrixToQuaternion(rotOut)
+
+        return OrientedBox3D(
+            position=centerOut,
+            quaternion=quat,
+            size=numpy.abs(size),
+        )
+
+    @staticmethod
+    def _RotationMatrixToQuaternion(rot: NDArray) -> NDArray:
+        """Converts a 3x3 rotation matrix to a (w, x, y, z) unit quaternion."""
+        r = numpy.asarray(rot, dtype=numpy.float64)
+        trace = r[0, 0] + r[1, 1] + r[2, 2]
+        if trace > 0.0:
+            s = 0.5 / numpy.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (r[2, 1] - r[1, 2]) * s
+            y = (r[0, 2] - r[2, 0]) * s
+            z = (r[1, 0] - r[0, 1]) * s
+        elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+            s = 2.0 * numpy.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2])
+            w = (r[2, 1] - r[1, 2]) / s
+            x = 0.25 * s
+            y = (r[0, 1] + r[1, 0]) / s
+            z = (r[0, 2] + r[2, 0]) / s
+        elif r[1, 1] > r[2, 2]:
+            s = 2.0 * numpy.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2])
+            w = (r[0, 2] - r[2, 0]) / s
+            x = (r[0, 1] + r[1, 0]) / s
+            y = 0.25 * s
+            z = (r[1, 2] + r[2, 1]) / s
+        else:
+            s = 2.0 * numpy.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1])
+            w = (r[1, 0] - r[0, 1]) / s
+            x = (r[0, 2] + r[2, 0]) / s
+            y = (r[1, 2] + r[2, 1]) / s
+            z = 0.25 * s
+        quat = numpy.array([w, x, y, z])
+        return quat / numpy.linalg.norm(quat)
+
     @staticmethod
     def _DepthToPointCloud(depth: NDArray, intr: CameraIntrinsics) -> NDArray:
         """Back-projects a depth image into a structured (H, W, 3) point cloud.
@@ -304,12 +533,15 @@ class Detector:
         z = numpy.asarray(depth)
         if z.ndim == 3:
             z = z[..., 0]
-        z = z.astype(numpy.float64) * intr.depthScale
+        # float32 throughout matches the mujin point-cloud / ComputeNormals /
+        # SegmentBoxFacesIteratively convention (those C++ bindings reject float64).
+        z = z.astype(numpy.float32) * numpy.float32(intr.depthScale)
         h, w = z.shape[:2]
-        us, vs = numpy.meshgrid(numpy.arange(w), numpy.arange(h))
+        us, vs = numpy.meshgrid(numpy.arange(w, dtype=numpy.float32),
+                                numpy.arange(h, dtype=numpy.float32))
         x = (us - intr.cx) * z / intr.fx
         y = (vs - intr.cy) * z / intr.fy
-        points = numpy.stack((x, y, z), axis=-1)
+        points = numpy.stack((x, y, z), axis=-1).astype(numpy.float32)
         points[z <= 0] = numpy.nan
         return points
 
@@ -423,12 +655,33 @@ class Detector:
         # Quick tilt check: how far is the face normal from the camera z-axis?
         cosToCameraZ = abs(planeModel[2])
         minCosToSplit = numpy.cos(numpy.deg2rad(faceSplitTiltThresholdDeg))
+
+        # Diagnostics: these are the quantities that drive the split decision and
+        # the *internal* minimum face area used by SegmentBoxFacesIteratively.
+        pixelSize = float(centroid[2]) / ((intrinsics.fx + intrinsics.fy) / 2.0)
+        effectiveMinArea = max(minFaceArea, 0.015 ** 2)  # reference clamps below this
+        minAreaFacePixels = (effectiveMinArea / pixelSize ** 2) * 0.8 if pixelSize > 0 else float("inf")
+        tiltDeg = numpy.rad2deg(numpy.arccos(numpy.clip(cosToCameraZ, 0.0, 1.0)))
+        log.info(
+            "[split] points=%d centroidZ=%.3fm planeNormal=%s tilt=%.1fdeg "
+            "(splitIf>%.1f) pixelSize=%.5fm minFaceAreaPx=%.0f",
+            len(instancePoints), float(centroid[2]), numpy.round(planeModel[:3], 3).tolist(),
+            tiltDeg, faceSplitTiltThresholdDeg, pixelSize, minAreaFacePixels,
+        )
+        if minAreaFacePixels > instanceMask.sum():
+            log.warning(
+                "[split] internal min face area (%.0f px) exceeds the whole instance "
+                "(%d px) -> SegmentBoxFacesIteratively will reject every face. "
+                "Check depthScale: centroidZ=%.3fm looks %s.",
+                minAreaFacePixels, int(instanceMask.sum()), float(centroid[2]),
+                "too small" if float(centroid[2]) < 0.2 else "off",
+            )
+
         if cosToCameraZ >= minCosToSplit:
             # Not tilted enough to expose a second face; treat as one face.
             return [instanceMask], [planeModel]
 
         # Tilted: try to split into two perpendicular faces.
-        pixelSize = float(centroid[2]) / ((intrinsics.fx + intrinsics.fy) / 2.0)
         faceMasks, facePlanes = self._SegmentFaces(
             component=instanceMask,
             componentPlaneModel=planeModel,
@@ -468,11 +721,12 @@ class Detector:
                     _mujinpointcloud.SegmentBoxFacesIteratively(
                         component=component,
                         componentPlaneModel=list(componentPlaneModel),
-                        points=points,
-                        normals=normals,
+                        # The C++ binding requires float32 buffers (rejects float64).
+                        points=numpy.ascontiguousarray(points, dtype=numpy.float32),
+                        normals=numpy.ascontiguousarray(normals, dtype=numpy.float32),
                         nonNanNormalsMask2D=validNormalsMask,
                         pixelSizeOfComponent=pixelSize,
-                        centroid3DOfComponent=centroid,
+                        centroid3DOfComponent=numpy.asarray(centroid, dtype=numpy.float32),
                         minAreaFace=minFaceArea,
                         maxAngleDifferenceDegInSameFace=30,
                         minAngleDifferenceDegBetweenDifferentFaces=80,
@@ -695,6 +949,8 @@ def _main() -> None:
 
     import cv2
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
     parser = argparse.ArgumentParser(
         description="Detect boxes and their valid grasp faces from an RGB-D pair."
     )
@@ -707,6 +963,12 @@ def _main() -> None:
     parser.add_argument("--depth-scale", dest="depthScale", type=float, default=0.001,
                         help="Multiply raw depth by this to get meters (0.001 for uint16 mm).")
     parser.add_argument("--conf", type=float, default=0.5)
+    parser.add_argument("--cam-yaw", dest="camYaw", type=float, default=0.0,
+                        help="Camera mounting yaw (deg, about up axis).")
+    parser.add_argument("--cam-pitch", dest="camPitch", type=float, default=0.0,
+                        help="Camera mounting pitch (deg, >0 = looking down).")
+    parser.add_argument("--cam-roll", dest="camRoll", type=float, default=0.0,
+                        help="Camera mounting roll (deg, about forward axis).")
     parser.add_argument("--model-type", dest="modelType", default=_DEFAULT_MODEL_TYPE)
     parser.add_argument("--model", default=None, help="Explicit .onnx weights path.")
     parser.add_argument("-o", "--output", help="If set, save an annotated image here.")
@@ -724,19 +986,45 @@ def _main() -> None:
     if depth is None:
         raise SystemExit(f"Failed to read depth image: {args.depthPath}")
 
+    # Sanity check the depth: after scaling, values should be plausible meters.
+    rawMax = float(numpy.asarray(depth).max())
+    scaledMax = rawMax * args.depthScale
+    log.info(
+        "Depth: shape=%s dtype=%s rawRange=[0, %.1f] -> scaledMax=%.3fm (depthScale=%g)",
+        numpy.asarray(depth).shape, numpy.asarray(depth).dtype, rawMax, scaledMax, args.depthScale,
+    )
+    if numpy.asarray(depth).dtype == numpy.uint8 or rawMax <= 255:
+        log.warning(
+            "Depth looks 8-bit (max=%.0f). An 8-bit/JPEG depth is lossy and almost "
+            "certainly NOT metric depth -> the 3D geometry and face splitting will be "
+            "unreliable. Use a 16-bit PNG or a float .npy of real depth.", rawMax,
+        )
+
     intr = CameraIntrinsics(
         fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy,
         width=rgb.shape[1], height=rgb.shape[0], depthScale=args.depthScale,
     )
 
     detector = Detector(modelType=args.modelType, modelFilePath=args.model)
-    results = detector.Detect(rgb, depth, intr, minConfidenceThreshold=args.conf)
+    results = detector.Detect(
+        rgb, depth, intr, minConfidenceThreshold=args.conf,
+        cameraYawDeg=args.camYaw, cameraPitchDeg=args.camPitch, cameraRollDeg=args.camRoll,
+    )
 
     nFaces = sum(len(r.faces) for r in results)
     nValid = sum(1 for r in results for f in r.faces if f.isValidGraspFace)
     print(f"Detected {len(results)} instance(s), {nFaces} face(s), {nValid} valid grasp face(s):")
     for i, r in enumerate(results):
         print(f"  [{i}] {r.instance.name} score={r.instance.score:.3f} faces={len(r.faces)}")
+        if r.orientedBox3D is not None:
+            ob = r.orientedBox3D
+            print(
+                "      cuboid(output frame +X depth/-Y right/+Z up): "
+                f"pos=({ob.position[0]:.3f},{ob.position[1]:.3f},{ob.position[2]:.3f})m "
+                f"quat(wxyz)=({ob.quaternion[0]:.3f},{ob.quaternion[1]:.3f},"
+                f"{ob.quaternion[2]:.3f},{ob.quaternion[3]:.3f}) "
+                f"size=({ob.size[0]:.3f},{ob.size[1]:.3f},{ob.size[2]:.3f})m"
+            )
         for j, f in enumerate(r.faces):
             print(
                 f"      face {j}: type={f.faceType} valid={f.isValidGraspFace} "
