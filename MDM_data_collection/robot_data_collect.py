@@ -33,29 +33,33 @@ class RobotDataCollector:
         self._camera_thread = None
         self._record_thread = None
 
+        # Latest end-effector positions — updated by _get_hand_statuses() at
+        # RECORD_HZ while recording; None when no data has been fetched yet.
+        self.latest_left_pos  = None  # (x, y, z)
+        self.latest_right_pos = None  # (x, y, z)
+
     # ------------------------------------------------------------------ #
-    #  End-effector properties — separate SDK calls per arm               #
+    #  End-effector snapshot — single SDK call returns both arms          #
     # ------------------------------------------------------------------ #
 
-    @property
-    def left_hand_status(self):
-        frame = self.robot_controller.get_motion_status()['frames']['arm_left_link7']
-        pos   = frame['position']
-        quat  = frame['orientation']['quaternion']
-        return (
-            pos['x'],  pos['y'],  pos['z'],
-            quat['x'], quat['y'], quat['z'], quat['w'],
-        )
+    def _get_hand_statuses(self):
+        """Return (left_7, right_7) from a single get_motion_status() call."""
+        status = self.robot_controller.get_motion_status()
+        frames = status['frames']
 
-    @property
-    def right_hand_status(self):
-        frame = self.robot_controller.get_motion_status()['frames']['arm_right_link7']
-        pos   = frame['position']
-        quat  = frame['orientation']['quaternion']
-        return (
-            pos['x'],  pos['y'],  pos['z'],
-            quat['x'], quat['y'], quat['z'], quat['w'],
-        )
+        def _extract(link):
+            f    = frames[link]
+            pos  = f['position']
+            quat = f['orientation']['quaternion']
+            return (
+                pos['x'],  pos['y'],  pos['z'],
+                quat['x'], quat['y'], quat['z'], quat['w'],
+            )
+
+        left, right = _extract('arm_left_link7'), _extract('arm_right_link7')
+        self.latest_left_pos  = left[:3]
+        self.latest_right_pos = right[:3]
+        return left, right
 
     # ------------------------------------------------------------------ #
     #  Camera background thread — keeps _latest_frames fresh at ~100 Hz  #
@@ -101,9 +105,10 @@ class RobotDataCollector:
                 time.sleep(0.001)
                 continue
 
-            # --- End-effector poses (position + quaternion) ---
-            left_list.append(self.left_hand_status)    # (7,): x,y,z,qx,qy,qz,qw
-            right_list.append(self.right_hand_status)  # (7,): x,y,z,qx,qy,qz,qw
+            # --- End-effector poses (single SDK call for both arms) ---
+            left_status, right_status = self._get_hand_statuses()
+            left_list.append(left_status)    # (7,): x,y,z,qx,qy,qz,qw
+            right_list.append(right_status)  # (7,): x,y,z,qx,qy,qz,qw
 
             # --- Joint and gripper states ---
             arm_joints_list.append(list(self.robot.arm_joint_states()[0]))  # 14 floats (rad)

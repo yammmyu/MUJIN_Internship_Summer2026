@@ -1,5 +1,6 @@
 import shutil
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -130,6 +131,30 @@ class DataCollectionMixin:
             ttk.Label(keys_body, text=action).grid(
                 row=i, column=1, sticky="w", padx=8, pady=2)
 
+        # ── 末端位置实时显示 ───────────────────────────────────────────
+        sec_pos = ttk.LabelFrame(body, text="  📡  末端位置实时  ")
+        sec_pos.pack(fill=tk.X, padx=10, pady=6)
+
+        pos_grid = ttk.Frame(sec_pos)
+        pos_grid.pack(fill=tk.X, padx=8, pady=8)
+        pos_grid.columnconfigure(1, weight=1)
+
+        self._dc_left_pos_var  = tk.StringVar(value="—")
+        self._dc_right_pos_var = tk.StringVar(value="—")
+
+        ttk.Label(pos_grid, text="左手 (x, y, z):").grid(
+            row=0, column=0, sticky="w", pady=3)
+        ttk.Label(pos_grid, textvariable=self._dc_left_pos_var,
+                  style="Value.TLabel").grid(row=0, column=1, sticky="w", padx=8)
+
+        ttk.Label(pos_grid, text="右手 (x, y, z):").grid(
+            row=1, column=0, sticky="w", pady=3)
+        ttk.Label(pos_grid, textvariable=self._dc_right_pos_var,
+                  style="Value.TLabel").grid(row=1, column=1, sticky="w", padx=8)
+
+        self._dc_hand_pos_running = True
+        threading.Thread(target=self._dc_hand_pos_loop, daemon=True).start()
+
         # ── 键盘绑定（挂在根窗口，全局生效） ──────────────────────────
         self.root.bind("<r>",      lambda e: self.recording_start())
         self.root.bind("<R>",      lambda e: self.recording_start())
@@ -212,4 +237,43 @@ class DataCollectionMixin:
         self._dc_status_var.set("🗑  已删除")
         self._dc_btn_start.config(state=tk.NORMAL)
         self.show_status(f"已删除录制: {name}", "info")
+
+    # ── 末端位置后台轮询 ─────────────────────────────────────────────────
+
+    def _dc_hand_pos_loop(self):
+        """后台线程：更新末端位置 UI 标签。
+
+        录制中时从 data_collector 的缓存读取（_record_loop 已在 30 Hz 刷新，
+        无需额外 SDK 调用）；空闲时以 5 Hz 直接调用 SDK。
+        """
+        while getattr(self, '_dc_hand_pos_running', False):
+            try:
+                if self._dc_is_recording:
+                    left_xyz  = self.data_collector.latest_left_pos
+                    right_xyz = self.data_collector.latest_right_pos
+                    if left_xyz is None or right_xyz is None:
+                        time.sleep(0.05)
+                        continue
+                    left_text  = f"[{left_xyz[0]:.3f},  {left_xyz[1]:.3f},  {left_xyz[2]:.3f}]"
+                    right_text = f"[{right_xyz[0]:.3f},  {right_xyz[1]:.3f},  {right_xyz[2]:.3f}]"
+                    sleep_s = 0.033  # ~30 Hz read cadence matches record loop
+                else:
+                    status = self.robot_controller.get_motion_status()
+                    frames = status['frames']
+
+                    def _fmt(link):
+                        pos = frames[link]['position']
+                        return f"[{pos['x']:.3f},  {pos['y']:.3f},  {pos['z']:.3f}]"
+
+                    left_text  = _fmt('arm_left_link7')
+                    right_text = _fmt('arm_right_link7')
+                    sleep_s = 0.2  # 5 Hz is fine when idle
+
+                self.root.after(0, lambda l=left_text, r=right_text: (
+                    self._dc_left_pos_var.set(l),
+                    self._dc_right_pos_var.set(r),
+                ))
+            except Exception:
+                sleep_s = 0.2
+            time.sleep(sleep_s)
 
