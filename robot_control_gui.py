@@ -150,11 +150,19 @@ class RobotControlGUI(
         self.transformer = RobotCoordinateTransformer()
 
         # 数据采集器（共享已有的 robot / camera 实例，不重复初始化硬件）
+        # get_camera_frame reads from camera_images — the single SDK reader is
+        # start_camera_thread(); the recorder must not compete with a second reader.
+        def _get_camera_frame(name):
+            img = self.camera_images.get(name)
+            if isinstance(img, list) and img:
+                return img[-1]
+            return None
+
         self.data_collector = RobotDataCollector(
             output_dir="recordings",
             robot=self.robot,
-            camera=self.camera,
             robot_controller=self.robot_controller,
+            get_camera_frame=_get_camera_frame,
         )
 
         # 状态栏相关

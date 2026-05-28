@@ -15,28 +15,45 @@ RECORD_HZ    = 30
 
 class RobotDataCollector:
     def __init__(self, output_dir="recordings", record_hz=RECORD_HZ,
-                 robot=None, camera=None, robot_controller=None):
+                 robot=None, camera=None, robot_controller=None,
+                 get_camera_frame=None):
         self.robot            = robot            or Robot()
-        self.camera           = camera           or Camera(CAMERA_NAMES)
         self.robot_controller = robot_controller or RobotController()
-        if robot is None or camera is None:
+
+        # get_camera_frame(name) -> ndarray | None
+        # When running standalone (no GUI), fall back to reading the SDK directly.
+        if get_camera_frame is not None:
+            self._get_camera_frame = get_camera_frame
+            self.camera = camera  # kept for shutdown(), may be None
+        else:
+            self.camera = camera or Camera(CAMERA_NAMES)
+            self._get_camera_frame = self._sdk_get_frame
+
+        if robot is None or (camera is None and get_camera_frame is None):
             time.sleep(1.0)
 
         self.output_dir = pathlib.Path(output_dir)
         self.record_hz  = record_hz
         self._interval  = 1.0 / record_hz
 
-        self._latest_frames = {name: None for name in CAMERA_NAMES}
-        self._frame_lock    = threading.Lock()
-
         self._is_recording  = False
-        self._camera_thread = None
         self._record_thread = None
 
-        # Latest end-effector positions — updated by _get_hand_statuses() at
+        # Latest end-effector poses — updated by _get_hand_statuses() at
         # RECORD_HZ while recording; None when no data has been fetched yet.
-        self.latest_left_pos  = None  # (x, y, z)
-        self.latest_right_pos = None  # (x, y, z)
+        self.latest_left_pos   = None  # (x, y, z)
+        self.latest_right_pos  = None  # (x, y, z)
+        self.latest_left_quat  = None  # (qx, qy, qz, qw)
+        self.latest_right_quat = None  # (qx, qy, qz, qw)
+
+    # ------------------------------------------------------------------ #
+    #  Camera frame accessor                                               #
+    # ------------------------------------------------------------------ #
+
+    def _sdk_get_frame(self, name):
+        """Fallback used in standalone mode — reads directly from the SDK."""
+        image, _ = self.camera.get_latest_image(name)
+        return image
 
     # ------------------------------------------------------------------ #
     #  End-effector snapshot — single SDK call returns both arms          #
@@ -57,22 +74,11 @@ class RobotDataCollector:
             )
 
         left, right = _extract('arm_left_link7'), _extract('arm_right_link7')
-        self.latest_left_pos  = left[:3]
-        self.latest_right_pos = right[:3]
+        self.latest_left_pos   = left[:3]
+        self.latest_right_pos  = right[:3]
+        self.latest_left_quat  = left[3:]
+        self.latest_right_quat = right[3:]
         return left, right
-
-    # ------------------------------------------------------------------ #
-    #  Camera background thread — keeps _latest_frames fresh at ~100 Hz  #
-    # ------------------------------------------------------------------ #
-
-    def _camera_loop(self):
-        while self._is_recording:
-            for name in CAMERA_NAMES:
-                image, _ = self.camera.get_latest_image(name)
-                if image is not None:
-                    with self._frame_lock:
-                        self._latest_frames[name] = image.copy()
-            time.sleep(0.01)
 
     # ------------------------------------------------------------------ #
     #  Recording loop — paced at RECORD_HZ                                #
@@ -83,6 +89,7 @@ class RobotDataCollector:
         cameras_dir.mkdir(parents=True, exist_ok=True)
 
         writers         = {}
+        _needs_bgr      = {}   # name -> bool; set once on first frame
         timestamps      = []
         left_list       = []
         right_list      = []
@@ -94,10 +101,10 @@ class RobotDataCollector:
 
         while self._is_recording:
             t = time.time()
-
-            # --- Camera frames (snapshot first) ---
-            with self._frame_lock:
-                snapshot = {name: self._latest_frames[name] for name in CAMERA_NAMES}
+            left_status, right_status = self._get_hand_statuses()
+            
+            # --- Camera frames — read from shared cache (no competing SDK call) ---
+            snapshot = {name: self._get_camera_frame(name) for name in CAMERA_NAMES}
 
             # Skip this tick if any camera hasn't delivered its first frame yet.
             # This keeps robot_states.npz row count in sync with video frame count.
@@ -106,28 +113,25 @@ class RobotDataCollector:
                 continue
 
             # --- End-effector poses (single SDK call for both arms) ---
-            left_status, right_status = self._get_hand_statuses()
             left_list.append(left_status)    # (7,): x,y,z,qx,qy,qz,qw
             right_list.append(right_status)  # (7,): x,y,z,qx,qy,qz,qw
 
             # --- Joint and gripper states ---
-            arm_joints_list.append(list(self.robot.arm_joint_states()[0]))  # 14 floats (rad)
-            gripper_list.append(list(self.robot.gripper_states()[0]))        # 2 floats (0=open,1=closed)
+            arm_joints_list.append(self.robot.arm_joint_states()[0])  # 14 floats (rad)
+            gripper_list.append(self.robot.gripper_states()[0])        # 2 floats (0=open,1=closed)
 
             timestamps.append(t)
 
             for name, frame in snapshot.items():
-                if frame is None:
-                    continue
                 if name not in writers:
                     h, w   = frame.shape[:2]
                     path   = str(cameras_dir / f'{name}.mp4')
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    writers[name] = cv2.VideoWriter(path, fourcc, self.record_hz, (w, h))
+                    writers[name]    = cv2.VideoWriter(path, fourcc, self.record_hz, (w, h))
+                    _needs_bgr[name] = frame.ndim == 3
                     print(f"  opened cameras/{name}.mp4  ({w}x{h})")
 
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.ndim == 3 else frame
-                writers[name].write(bgr)
+                writers[name].write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if _needs_bgr[name] else frame)
 
             # --- Pace to RECORD_HZ ---
             next_tick += self._interval
@@ -177,14 +181,10 @@ class RobotDataCollector:
             return
 
         if episode_name is None:
-            existing     = sorted(self.output_dir.glob('episode_*'))
-            episode_name = f'episode_{len(existing):03d}'
+            episode_name = f'episode_{sum(1 for _ in self.output_dir.glob("episode_*")):03d}'
 
         episode_dir        = self.output_dir / episode_name
         self._is_recording = True
-
-        self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
-        self._camera_thread.start()
 
         self._record_thread = threading.Thread(
             target=self._record_loop, args=(episode_dir,), daemon=False
@@ -197,9 +197,6 @@ class RobotDataCollector:
             return
         print("Stopping recording...")
         self._is_recording = False
-        if self._camera_thread:
-            self._camera_thread.join()
-            self._camera_thread = None
         if self._record_thread:
             self._record_thread.join()
             self._record_thread = None

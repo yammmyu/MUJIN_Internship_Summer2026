@@ -139,18 +139,33 @@ class DataCollectionMixin:
         pos_grid.pack(fill=tk.X, padx=8, pady=8)
         pos_grid.columnconfigure(1, weight=1)
 
-        self._dc_left_pos_var  = tk.StringVar(value="—")
-        self._dc_right_pos_var = tk.StringVar(value="—")
+        self._dc_left_pos_var   = tk.StringVar(value="—")
+        self._dc_left_quat_var  = tk.StringVar(value="—")
+        self._dc_right_pos_var  = tk.StringVar(value="—")
+        self._dc_right_quat_var = tk.StringVar(value="—")
 
-        ttk.Label(pos_grid, text="左手 (x, y, z):").grid(
-            row=0, column=0, sticky="w", pady=3)
+        ttk.Label(pos_grid, text="左手 pos (x,y,z):").grid(
+            row=0, column=0, sticky="w", pady=2)
         ttk.Label(pos_grid, textvariable=self._dc_left_pos_var,
                   style="Value.TLabel").grid(row=0, column=1, sticky="w", padx=8)
 
-        ttk.Label(pos_grid, text="右手 (x, y, z):").grid(
-            row=1, column=0, sticky="w", pady=3)
-        ttk.Label(pos_grid, textvariable=self._dc_right_pos_var,
+        ttk.Label(pos_grid, text="左手 quat (x,y,z,w):").grid(
+            row=1, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, textvariable=self._dc_left_quat_var,
                   style="Value.TLabel").grid(row=1, column=1, sticky="w", padx=8)
+
+        ttk.Separator(pos_grid, orient="horizontal").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Label(pos_grid, text="右手 pos (x,y,z):").grid(
+            row=3, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, textvariable=self._dc_right_pos_var,
+                  style="Value.TLabel").grid(row=3, column=1, sticky="w", padx=8)
+
+        ttk.Label(pos_grid, text="右手 quat (x,y,z,w):").grid(
+            row=4, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, textvariable=self._dc_right_quat_var,
+                  style="Value.TLabel").grid(row=4, column=1, sticky="w", padx=8)
 
         self._dc_hand_pos_running = True
         threading.Thread(target=self._dc_hand_pos_loop, daemon=True).start()
@@ -249,29 +264,42 @@ class DataCollectionMixin:
         while getattr(self, '_dc_hand_pos_running', False):
             try:
                 if self._dc_is_recording:
-                    left_xyz  = self.data_collector.latest_left_pos
-                    right_xyz = self.data_collector.latest_right_pos
-                    if left_xyz is None or right_xyz is None:
+                    lp = self.data_collector.latest_left_pos
+                    rp = self.data_collector.latest_right_pos
+                    lq = self.data_collector.latest_left_quat
+                    rq = self.data_collector.latest_right_quat
+                    if lp is None or rp is None:
                         time.sleep(0.05)
                         continue
-                    left_text  = f"[{left_xyz[0]:.3f},  {left_xyz[1]:.3f},  {left_xyz[2]:.3f}]"
-                    right_text = f"[{right_xyz[0]:.3f},  {right_xyz[1]:.3f},  {right_xyz[2]:.3f}]"
-                    sleep_s = 0.033  # ~30 Hz read cadence matches record loop
+                    left_pos_text  = f"[{lp[0]:.3f},  {lp[1]:.3f},  {lp[2]:.3f}]"
+                    right_pos_text = f"[{rp[0]:.3f},  {rp[1]:.3f},  {rp[2]:.3f}]"
+                    left_quat_text  = f"[{lq[0]:.3f},  {lq[1]:.3f},  {lq[2]:.3f},  {lq[3]:.3f}]" if lq is not None else "—"
+                    right_quat_text = f"[{rq[0]:.3f},  {rq[1]:.3f},  {rq[2]:.3f},  {rq[3]:.3f}]" if rq is not None else "—"
+                    sleep_s = 0.033
                 else:
                     status = self.robot_controller.get_motion_status()
                     frames = status['frames']
 
-                    def _fmt(link):
+                    def _fmt_pos(link):
                         pos = frames[link]['position']
                         return f"[{pos['x']:.3f},  {pos['y']:.3f},  {pos['z']:.3f}]"
 
-                    left_text  = _fmt('arm_left_link7')
-                    right_text = _fmt('arm_right_link7')
-                    sleep_s = 0.2  # 5 Hz is fine when idle
+                    def _fmt_quat(link):
+                        q = frames[link]['orientation']['quaternion']
+                        return f"[{q['x']:.3f},  {q['y']:.3f},  {q['z']:.3f},  {q['w']:.3f}]"
 
-                self.root.after(0, lambda l=left_text, r=right_text: (
-                    self._dc_left_pos_var.set(l),
-                    self._dc_right_pos_var.set(r),
+                    left_pos_text   = _fmt_pos('arm_left_link7')
+                    right_pos_text  = _fmt_pos('arm_right_link7')
+                    left_quat_text  = _fmt_quat('arm_left_link7')
+                    right_quat_text = _fmt_quat('arm_right_link7')
+                    sleep_s = 0.2
+
+                self.root.after(0, lambda lp=left_pos_text, rp=right_pos_text,
+                                         lq=left_quat_text, rq=right_quat_text: (
+                    self._dc_left_pos_var.set(lp),
+                    self._dc_left_quat_var.set(lq),
+                    self._dc_right_pos_var.set(rp),
+                    self._dc_right_quat_var.set(rq),
                 ))
             except Exception:
                 sleep_s = 0.2

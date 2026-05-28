@@ -215,7 +215,7 @@ class CameraMixin:
                                 self.camera_intrinsics[camera_name] = self.get_default_camera_intrinsics(camera_name)
                                 print(f"使用默认内参 for {camera_name}: {info_e}")
 
-                    time.sleep(0.1)  # 100ms更新一次
+                    time.sleep(0.033)  # ~30 Hz, matches recording rate
                 except Exception as e:
                     print(f"相机更新错误: {e}")
                     time.sleep(1)
