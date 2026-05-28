@@ -99,30 +99,40 @@ class RobotDataCollector:
         next_tick  = time.monotonic()
         start_time = datetime.now().isoformat()
 
+        _cam_ready = {name: False for name in CAMERA_NAMES}
+
         while self._is_recording:
             t = time.time()
+
+            # --- End-effector poses (always, keeps latest_*_pos/quat fresh) ---
             left_status, right_status = self._get_hand_statuses()
-            
-            # --- Camera frames — read from shared cache (no competing SDK call) ---
+
+            # --- Camera frames ---
             snapshot = {name: self._get_camera_frame(name) for name in CAMERA_NAMES}
 
-            # Skip this tick if any camera hasn't delivered its first frame yet.
-            # This keeps robot_states.npz row count in sync with video frame count.
-            if any(frame is None for frame in snapshot.values()):
-                time.sleep(0.001)
+            # Wait until every camera has produced at least one frame before
+            # writing anything, so row counts stay in sync.
+            for name, frame in snapshot.items():
+                if frame is not None:
+                    _cam_ready[name] = True
+            if not all(_cam_ready.values()):
+                missing = [n for n, r in _cam_ready.items() if not r]
+                print(f"  waiting for cameras: {missing}")
+                time.sleep(0.05)
                 continue
 
-            # --- End-effector poses (single SDK call for both arms) ---
-            left_list.append(left_status)    # (7,): x,y,z,qx,qy,qz,qw
-            right_list.append(right_status)  # (7,): x,y,z,qx,qy,qz,qw
-
-            # --- Joint and gripper states ---
-            arm_joints_list.append(self.robot.arm_joint_states()[0])  # 14 floats (rad)
-            gripper_list.append(self.robot.gripper_states()[0])        # 2 floats (0=open,1=closed)
-
+            # --- Record robot state ---
+            left_list.append(left_status)
+            right_list.append(right_status)
+            arm_joints_list.append(self.robot.arm_joint_states()[0])
+            gripper_list.append(self.robot.gripper_states()[0])
             timestamps.append(t)
 
-            for name, frame in snapshot.items():
+            # --- Write camera frames (use last known frame if this tick is None) ---
+            for name in CAMERA_NAMES:
+                frame = snapshot[name]
+                if frame is None:
+                    continue  # camera dropped this tick; video gets no frame but npz still records
                 if name not in writers:
                     h, w   = frame.shape[:2]
                     path   = str(cameras_dir / f'{name}.mp4')

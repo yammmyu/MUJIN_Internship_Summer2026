@@ -285,8 +285,12 @@ class DataCollectionMixin:
                         return f"[{pos['x']:.3f},  {pos['y']:.3f},  {pos['z']:.3f}]"
 
                     def _fmt_quat(link):
-                        q = frames[link]['orientation']['quaternion']
-                        return f"[{q['x']:.3f},  {q['y']:.3f},  {q['z']:.3f},  {q['w']:.3f}]"
+                        try:
+                            q = frames[link]['orientation']['quaternion']
+                            return f"[{q['x']:.3f},  {q['y']:.3f},  {q['z']:.3f},  {q['w']:.3f}]"
+                        except Exception as e:
+                            print(f"[hand pos] quat parse error for {link}: {e}")
+                            return "—"
 
                     left_pos_text   = _fmt_pos('arm_left_link7')
                     right_pos_text  = _fmt_pos('arm_right_link7')
@@ -301,7 +305,8 @@ class DataCollectionMixin:
                     self._dc_right_pos_var.set(rp),
                     self._dc_right_quat_var.set(rq),
                 ))
-            except Exception:
+            except Exception as e:
+                print(f"[hand pos loop] error: {e}")
                 sleep_s = 0.2
             time.sleep(sleep_s)
 
