@@ -406,6 +406,12 @@ def _BoxFaceGrasps(box, gripperOffset=0.0,
                         ax = np.array([-np.sin(a), np.cos(a), 0.0])
                         Rtilt = _AxisAngleMatrix(ax, t)
                         Rtool = RtoolZ.dot(Rtilt)
+                        # Reject candidates whose tool Y axis points downward in
+                        # world (i.e. the angle between tool Y and world +Z
+                        # exceeds 90°). For each (zRot, zRot+180) pair only one
+                        # side survives, eliminating the redundant wrist flip.
+                        if Rtool[2, 1] < 0:
+                            continue
                         quat = quatFromRotationMatrix(Rtool)
                         pose = P([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]),
                                   float(target[0]), float(target[1]), float(target[2])])
@@ -523,7 +529,8 @@ def Grab(env, robot, manipName, box, gripperOffset=0.0,
     DrawTarget(env, best["pose"], handles)
 
     boxWasEnabled = box.IsEnabled()
-    box.Enable(False)  # let the TCP reach the box surface during planning
+    # we must enable box for collision checking
+    box.Enable(True)
     try:
         startDof = robot.GetDOFValues(manip.GetArmIndices())
         traj = PlanTrajectory(env, robot, manip, startDof, best["pose"],
