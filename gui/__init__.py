@@ -13,7 +13,6 @@ from gui.pick_place import PickPlaceMixin
 from gui.inference import InferenceMixin
 from gui.manual_control import ManualControlMixin
 from gui.vr_control import VRMixin
-from gui.data_collection import DataCollectionMixin
 from gui.motion_planning import MotionPlanningMixin
 
 __all__ = [
@@ -25,6 +24,5 @@ __all__ = [
     "InferenceMixin",
     "ManualControlMixin",
     "VRMixin",
-    "DataCollectionMixin",
     "MotionPlanningMixin",
 ]
