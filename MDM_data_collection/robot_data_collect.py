@@ -14,23 +14,12 @@ RECORD_HZ    = 30
 
 
 class RobotDataCollector:
-    def __init__(self, output_dir="recordings", record_hz=RECORD_HZ,
-                 robot=None, camera=None, robot_controller=None,
-                 get_camera_frame=None):
-        self.robot            = robot            or Robot()
-        self.robot_controller = robot_controller or RobotController()
-
-        # get_camera_frame(name) -> ndarray | None
-        # When running standalone (no GUI), fall back to reading the SDK directly.
-        if get_camera_frame is not None:
-            self._get_camera_frame = get_camera_frame
-            self.camera = camera  # kept for shutdown(), may be None
-        else:
-            self.camera = camera or Camera(CAMERA_NAMES)
-            self._get_camera_frame = self._sdk_get_frame
-
-        if robot is None or (camera is None and get_camera_frame is None):
-            time.sleep(1.0)
+    def __init__(self, output_dir="recordings", record_hz=RECORD_HZ):
+        self.robot            = Robot()
+        self.robot_controller = RobotController()
+        self.camera           = Camera(CAMERA_NAMES)
+        self._get_camera_frame = self._sdk_get_frame
+        time.sleep(1.0)
 
         self.output_dir = pathlib.Path(output_dir)
         self.record_hz  = record_hz
@@ -78,6 +67,8 @@ class RobotDataCollector:
         self.latest_right_pos  = right[:3]
         self.latest_left_quat  = left[3:]
         self.latest_right_quat = right[3:]
+
+        print(f"left ee position: {self.latest_left_pos} | right ee position: {self.latest_right_pos}")
         return left, right
 
     # ------------------------------------------------------------------ #
@@ -214,6 +205,7 @@ class RobotDataCollector:
 
     def shutdown(self):
         self.stop()
+        self.camera.close()
         self.robot.shutdown()
 
 

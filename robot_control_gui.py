@@ -149,21 +149,8 @@ class RobotControlGUI(
         # 坐标转换处理器
         self.transformer = RobotCoordinateTransformer()
 
-        # 数据采集器（共享已有的 robot / camera 实例，不重复初始化硬件）
-        # get_camera_frame reads from camera_images — the single SDK reader is
-        # start_camera_thread(); the recorder must not compete with a second reader.
-        def _get_camera_frame(name):
-            img = self.camera_images.get(name)
-            if isinstance(img, list) and img:
-                return img[-1]
-            return None
-
-        self.data_collector = RobotDataCollector(
-            output_dir="recordings",
-            robot=self.robot,
-            robot_controller=self.robot_controller,
-            get_camera_frame=_get_camera_frame,
-        )
+        # 数据采集器：独立初始化自己的 SDK 实例，与 GUI 线程完全隔离。
+        self.data_collector = RobotDataCollector(output_dir="recordings")
 
         # 状态栏相关
         self.status_text = tk.StringVar()
@@ -255,6 +242,7 @@ class RobotControlGUI(
 
         for label, fn in [
             ("VR 串流服务器", self.dummy_server.stop),
+            ("数据采集器", self.data_collector.shutdown),
             ("相机", self.camera.close),
             ("机器人", self.robot.shutdown),
             ("ROS 节点", self.wheel_controller.destroy_node),
