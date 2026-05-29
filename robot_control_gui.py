@@ -13,6 +13,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+import argparse
 
 import rclpy
 
@@ -47,7 +48,7 @@ class RobotControlGUI(
     VRMixin,
     MotionPlanningMixin,
 ):
-    def __init__(self, root):
+    def __init__(self, root, camera_mode="all"):
         self.root = root
         self.root.title("智元G1机器人控制界面")
         self.root.geometry("1500x950")
@@ -56,8 +57,13 @@ class RobotControlGUI(
 
         # 初始化机器人和相机
         self.robot = Robot()
-        self.camera = Camera(["hand_left", "hand_right", "head", "head_depth"])
-        # self.camera = Camera(["head"])
+
+        # Disable cameras during data_collection mode
+        if camera_mode == "data":
+            self.camera = Camera(["hand_left", "hand_right", "head"])
+        else: 
+            self.camera = Camera(["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"])
+
         self.robot_controller = RobotController()
 
         # Slam
@@ -260,8 +266,15 @@ class RobotControlGUI(
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", action="store_true")
+
+    args = parser.parse_args()
+
+    camera_mode = "data" if args.data else "all"
+
     root = tk.Tk()
-    app = RobotControlGUI(root)  # 样式由 _setup_styles 统一配置
+    app = RobotControlGUI(root, camera_mode)  # 样式由 _setup_styles 统一配置
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
 
     # Ctrl+C：注册 SIGINT 处理器，转交主线程的 on_closing
@@ -280,4 +293,6 @@ def main():
 
 
 if __name__ == "__main__":
+
+
     main()
