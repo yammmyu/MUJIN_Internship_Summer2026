@@ -56,7 +56,8 @@ class RobotControlGUI(
 
         # 初始化机器人和相机
         self.robot = Robot()
-        self.camera = Camera(["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"])
+        self.camera = Camera(["hand_left", "hand_right", "head", "head_depth"])
+        # self.camera = Camera(["head"])
         self.robot_controller = RobotController()
 
         # Slam
@@ -70,10 +71,10 @@ class RobotControlGUI(
 
         # 相机图像缓存
         self.camera_images = {
-            "hand_left": None,  # cache latest two images for inference
-            "hand_right": None,  # cache latest two images for inference
+            # "hand_left": None,  # cache latest two images for inference
+            # "hand_right": None,  # cache latest two images for inference
             "head": None,
-            "head_depth": None,  # cache latest one image
+            # "head_depth": None,  # cache latest one image
             # "head_center_fisheye": None
         }
         self.last_two_left_arm_joint_values = []
@@ -84,10 +85,10 @@ class RobotControlGUI(
 
         # 相机内参缓存
         self.camera_intrinsics = {
-            "hand_left": None,
-            "hand_right": None,
+            # "hand_left": None,
+            # "hand_right": None,
             "head": None,
-            "head_depth": None,
+            # "head_depth": None,
             # "head_center_fisheye": None
         }
 
@@ -168,12 +169,13 @@ class RobotControlGUI(
                    '右臂关节2', '右臂关节3', '右臂关节4', '右臂关节5',
                    '右臂关节6', '右臂关节7'],
             'head': ['头部偏航', '头部俯仰'],
-            'waist': ['腰部升降', '腰部俯仰'],
+            'waist': ['腰部俯仰', '腰部升降'],
             'gripper': ['左夹爪', '右夹爪']
         }
 
         self.setup_ui()
-        self.start_inference_data_collection_thread()
+        # TODO: MONEY, disable inference data collection due to performance issue
+        # self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()

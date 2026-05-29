@@ -97,13 +97,27 @@ def Main() -> None:
     def process(rgbPath, depthPath, fx, fy, cx, cy,
                 depthScale=0.001,
                 cameraYawDeg=0.0, cameraPitchDeg=0.0, cameraRollDeg=0.0,
-                conf=0.5, clearPrevious=True):
+                conf=0.5, clearPrevious=True,
+                enablePointCloud=True,
+                pointCloudVoxelSize=0.02,
+                pointCloudMaskMargin=0.03,
+                pointCloudBoxHalfSize=0.005,
+                pointCloudMaxRange=3.0,
+                pointCloudMinRange=0.10,
+                pointCloudColor=(0.45, 0.45, 0.55)):
         return server.ProcessVision(
             rgbPath=rgbPath, depthPath=depthPath,
             fx=fx, fy=fy, cx=cx, cy=cy,
             depthScale=depthScale,
             cameraYawDeg=cameraYawDeg, cameraPitchDeg=cameraPitchDeg, cameraRollDeg=cameraRollDeg,
             minConfidenceThreshold=conf, clearPrevious=clearPrevious,
+            enablePointCloud=enablePointCloud,
+            pointCloudVoxelSize=pointCloudVoxelSize,
+            pointCloudMaskMargin=pointCloudMaskMargin,
+            pointCloudBoxHalfSize=pointCloudBoxHalfSize,
+            pointCloudMaxRange=pointCloudMaxRange,
+            pointCloudMinRange=pointCloudMinRange,
+            pointCloudColor=pointCloudColor,
         )
 
     def grab(name, manip=LEFT_MANIP, **kw):
@@ -121,6 +135,10 @@ def Main() -> None:
 
     def del_box(name="box0"):
         return server.DeleteBox(name)
+
+    def clear_cloud():
+        """Remove the scene point cloud KinBody."""
+        return server.ClearPointCloud()
 
     # ---- Motion planning TCP helpers (require connected GUI client) ----
     def trigger_detection(**kw):
@@ -150,7 +168,11 @@ def Main() -> None:
     print("  server                              # PlanningServer instance")
     print("  env, robot, handles                 # already bound")
     print("  process(rgbPath, depthPath, fx, fy, cx, cy, depthScale=0.001,")
-    print("          cameraYawDeg=0, cameraPitchDeg=0, cameraRollDeg=0)")
+    print("          cameraYawDeg=0, cameraPitchDeg=0, cameraRollDeg=0,")
+    print("          enablePointCloud=True, pointCloudVoxelSize=0.02,")
+    print("          pointCloudMaskMargin=0.03, pointCloudBoxHalfSize=0.005,")
+    print("          pointCloudMaxRange=3.0, pointCloudMinRange=0.10)")
+    print("  clear_cloud()                       # remove scene point cloud body")
     print("  add_box(name, halfExtents, pose)    # manual scene authoring")
     print("  del_box(name)")
     print("  gen_box_ik(name, manip=...)         # visualize grasp IK candidates")

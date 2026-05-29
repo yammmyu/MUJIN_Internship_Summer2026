@@ -28,6 +28,7 @@ import uuid
 from typing import Optional
 
 import numpy as np
+from openravepy import RaveCreateKinBody
 
 from a2d_reachability.__main__ import (
     AddBox,
@@ -125,6 +126,24 @@ class PlanningServer:
     HEAD_LINK_NAME = "link_pitch_head"
     HEAD_CAMERA_LOCAL_TRANSLATION = (-0.11, 0.04, 0.0)
 
+    # Fixed rotation that maps Detector OUTPUT-frame axes (+X depth,
+    # +Y image-left, +Z up) onto link_pitch_head's LOCAL axes. Chosen so the
+    # composition R_head_neutral @ HEAD_CAMERA_OUTPUT_IN_HEAD_LOCAL is the
+    # identity (at neutral head pose, output frame == world frame).
+    #
+    # Equivalently: cam +X (depth) ←→ head local -X  (= world +X at neutral)
+    #               cam +Y (left)  ←→ head local +Z  (= world +Y at neutral)
+    #               cam +Z (up)    ←→ head local +Y  (= world +Z at neutral)
+    HEAD_CAMERA_OUTPUT_IN_HEAD_LOCAL = np.array([
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ])
+
+    # KinBody name of the per-detection scene point cloud (one body, N small
+    # box geoms — one per sampled point). Replaced on every ProcessVision().
+    POINT_CLOUD_BODY_NAME = "scene_pointcloud"
+
     def __init__(
         self,
         robotFile: str = "A2D_Omnipicker/A2D.kinbody.xml",
@@ -178,11 +197,22 @@ class PlanningServer:
         R is the rotation mapping points expressed in the Detector's output
         frame (+X depth/forward, +Y image-left, +Z up) into the world frame.
 
-        Assumption: the camera looks along the robot's world +X axis with
-        image-up = world +Z, image-left = world +Y. This matches the Detector's
-        output-frame axes exactly, so R defaults to identity. Override
-        `cameraYaw/Pitch/RollDeg` in `ProcessVision` to compensate a tilted
-        head; the Detector itself handles the rotation before returning poses.
+        R is now derived from the head link's CURRENT world transform, so it
+        automatically tracks `joint_body_pitch` (and any other joint that
+        moves the head). Specifically:
+
+            R_world_camera = R_head_world @ HEAD_CAMERA_OUTPUT_IN_HEAD_LOCAL
+
+        At neutral pose this composes back to the identity (output frame ==
+        world frame). When the upper body pitches, R rotates with it, so a
+        detection observed below the camera's depth axis lands at the correct
+        lower world Z instead of mistakenly flying up. Before this fix R was
+        hard-wired to identity and pitched detections would drift higher in
+        world Z the more the head tilted.
+
+        `cameraYaw/Pitch/RollDeg` passed to `ProcessVision` remain available
+        as ADDITIONAL mounting compensation (camera tilted relative to head),
+        applied on top of the head pose; the standard case wants 0/0/0.
         """
         link = self.robot.GetLink(self.HEAD_LINK_NAME)
         if link is None:
@@ -191,9 +221,10 @@ class PlanningServer:
                 % self.HEAD_LINK_NAME
             )
         headT = np.array(link.GetTransform(), dtype=float)
+        R_head_world = headT[:3, :3]
         offset = np.array(self.HEAD_CAMERA_LOCAL_TRANSLATION, dtype=float)
-        cameraWorldPos = headT[:3, :3] @ offset + headT[:3, 3]
-        R_world_camera = np.eye(3)
+        cameraWorldPos = R_head_world @ offset + headT[:3, 3]
+        R_world_camera = R_head_world @ self.HEAD_CAMERA_OUTPUT_IN_HEAD_LOCAL
         return cameraWorldPos, R_world_camera
 
     # ------------------------------------------------------------------ #
@@ -215,6 +246,13 @@ class PlanningServer:
         namePrefix: str = "det",
         color: tuple = (0.85, 0.35, 0.10),
         clearPrevious: bool = True,
+        enablePointCloud: bool = True,
+        pointCloudVoxelSize: float = 0.02,
+        pointCloudMaskMargin: float = 0.03,
+        pointCloudBoxHalfSize: float = 0.005,
+        pointCloudMaxRange: Optional[float] = 3.0,
+        pointCloudMinRange: float = 0.10,
+        pointCloudColor: tuple = (0.45, 0.45, 0.55),
     ) -> list[dict]:
         """Detect objects from a single RGB+Depth file pair and spawn them in env.
 
@@ -254,6 +292,13 @@ class PlanningServer:
             cameraYawDeg=cameraYawDeg, cameraPitchDeg=cameraPitchDeg, cameraRollDeg=cameraRollDeg,
             minConfidenceThreshold=minConfidenceThreshold,
             namePrefix=namePrefix, color=color, clearPrevious=clearPrevious,
+            enablePointCloud=enablePointCloud,
+            pointCloudVoxelSize=pointCloudVoxelSize,
+            pointCloudMaskMargin=pointCloudMaskMargin,
+            pointCloudBoxHalfSize=pointCloudBoxHalfSize,
+            pointCloudMaxRange=pointCloudMaxRange,
+            pointCloudMinRange=pointCloudMinRange,
+            pointCloudColor=pointCloudColor,
         )
 
     def ProcessVisionFromArrays(
@@ -272,6 +317,13 @@ class PlanningServer:
         namePrefix: str = "det",
         color: tuple = (0.85, 0.35, 0.10),
         clearPrevious: bool = True,
+        enablePointCloud: bool = True,
+        pointCloudVoxelSize: float = 0.02,
+        pointCloudMaskMargin: float = 0.03,
+        pointCloudBoxHalfSize: float = 0.005,
+        pointCloudMaxRange: Optional[float] = 3.0,
+        pointCloudMinRange: float = 0.10,
+        pointCloudColor: tuple = (0.45, 0.45, 0.55),
     ) -> list[dict]:
         """Detection-and-spawn core used by both file-based ProcessVision and
         the TCP detection_trigger path."""
@@ -283,6 +335,7 @@ class PlanningServer:
             for name in list(self.objects.keys()):
                 DeleteBox(self.env, name)
             self.objects.clear()
+            self.ClearPointCloud()
 
         intrinsics = CameraIntrinsics(
             fx=fx, fy=fy, cx=cx, cy=cy,
@@ -341,6 +394,30 @@ class PlanningServer:
 
         if not added:
             log.warning("PlanningServer.ProcessVision: no 3D-locatable detections")
+
+        # Scene point cloud: spawn the surrounding clutter as small box geoms
+        # so the planner sees real obstacles. Detected objects are masked out
+        # (they're already represented by clean KinBody boxes above).
+        if enablePointCloud:
+            try:
+                self._GenerateAndSpawnPointCloud(
+                    depth=depth,
+                    intrinsics=intrinsics,
+                    detections=results,
+                    cameraWorldPos=cameraWorldPos,
+                    R_world_camera=R_world_camera,
+                    cameraYawDeg=cameraYawDeg,
+                    cameraPitchDeg=cameraPitchDeg,
+                    cameraRollDeg=cameraRollDeg,
+                    voxelSize=pointCloudVoxelSize,
+                    maskMargin=pointCloudMaskMargin,
+                    boxHalfSize=pointCloudBoxHalfSize,
+                    maxRange=pointCloudMaxRange,
+                    minRange=pointCloudMinRange,
+                    color=pointCloudColor,
+                )
+            except Exception as exc:
+                log.warning("PlanningServer: point cloud generation failed: %s", exc)
         return added
 
     @staticmethod
@@ -350,6 +427,96 @@ class PlanningServer:
         detectionDir = os.path.normpath(os.path.join(here, "..", "detection"))
         if os.path.isdir(detectionDir) and detectionDir not in sys.path:
             sys.path.insert(0, detectionDir)
+
+    # ------------------------------------------------------------------ #
+    # Scene point cloud (surrounding obstacles)
+    # ------------------------------------------------------------------ #
+    def ClearPointCloud(self) -> bool:
+        """Remove the scene point cloud KinBody, if present."""
+        body = self.env.GetKinBody(self.POINT_CLOUD_BODY_NAME)
+        if body is None:
+            return False
+        self.env.Remove(body)
+        return True
+
+    def _GenerateAndSpawnPointCloud(
+        self,
+        depth: np.ndarray,
+        intrinsics,
+        detections,
+        cameraWorldPos: np.ndarray,
+        R_world_camera: np.ndarray,
+        cameraYawDeg: float,
+        cameraPitchDeg: float,
+        cameraRollDeg: float,
+        voxelSize: float,
+        maskMargin: float,
+        boxHalfSize: float,
+        maxRange: Optional[float],
+        minRange: float,
+        color: tuple,
+    ) -> Optional[object]:
+        """Extracts the scene point cloud and spawns it as one KinBody.
+
+        Pipeline matches `point_cloud.ExtractSceneCloud`: depth -> compensated
+        camera frame -> voxel downsample -> mask out detected OBBs. The
+        surviving points are then mapped to the OpenRAVE world frame via
+        `(R_world_camera @ p) + cameraWorldPos` and rendered as N small cubes
+        of half-extent `boxHalfSize` collected under a single KinBody.
+        """
+        self._EnsureDetectionOnPath()
+        from point_cloud import ExtractSceneCloud  # type: ignore[import]
+
+        boxes = [d.orientedBox3D for d in detections if d.orientedBox3D is not None]
+        ptsCam = ExtractSceneCloud(
+            depth=depth,
+            intrinsics=intrinsics,
+            boxes=boxes,
+            voxelSize=voxelSize,
+            maskMargin=maskMargin,
+            cameraYawDeg=cameraYawDeg,
+            cameraPitchDeg=cameraPitchDeg,
+            cameraRollDeg=cameraRollDeg,
+            maxRangeMeters=maxRange,
+            minRangeMeters=minRange,
+        )
+        if len(ptsCam) == 0:
+            log.warning("PlanningServer: scene cloud empty after mask+downsample")
+            self.ClearPointCloud()
+            return None
+        # Camera (compensated) frame -> world. Row vectors: w = p @ R.T + c.
+        ptsWorld = ptsCam @ np.asarray(R_world_camera, dtype=float).T + np.asarray(cameraWorldPos, dtype=float)
+        body = self._SpawnPointCloud(ptsWorld, boxHalfSize=boxHalfSize, color=color)
+        log.warning(
+            "PlanningServer: scene cloud %d points (voxel=%.3fm, mask=%.3fm, %d boxes masked)",
+            len(ptsWorld), voxelSize, maskMargin, len(boxes),
+        )
+        return body
+
+    def _SpawnPointCloud(
+        self,
+        pointsWorld: np.ndarray,
+        boxHalfSize: float = 0.005,
+        color: tuple = (0.45, 0.45, 0.55),
+    ):
+        """Replace the previous cloud KinBody with one tiny box per point."""
+        self.ClearPointCloud()
+        pts = np.asarray(pointsWorld, dtype=float)
+        if len(pts) == 0:
+            return None
+        # InitFromBoxes takes (N, 6): [cx, cy, cz, hx, hy, hz]
+        h = float(boxHalfSize)
+        boxes = np.empty((len(pts), 6), dtype=float)
+        boxes[:, 0:3] = pts
+        boxes[:, 3:6] = h
+        body = RaveCreateKinBody(self.env, "")
+        body.InitFromBoxes(boxes, True)
+        body.SetName(self.POINT_CLOUD_BODY_NAME)
+        self.env.Add(body)
+        for link in body.GetLinks():
+            for geom in link.GetGeometries():
+                geom.SetDiffuseColor(np.array(color, dtype=float))
+        return body
 
     # ------------------------------------------------------------------ #
     # Grasp pipeline (thin wrappers; the heavy lifting lives in a2d_reachability)
@@ -486,7 +653,7 @@ class PlanningServer:
         if not head:
             return
         # GUI sends [yaw_rad, pitch_rad]
-        indices = self._JointIndicesByName(("joint-yaw_head", "joint-pitch_head"))
+        indices = self._JointIndicesByName(("joint_head_yaw", "joint_head_pitch"))
         if indices:
             n = min(len(indices), len(head))
             self.robot.SetDOFValues(head[:n], indices[:n])
@@ -495,13 +662,15 @@ class PlanningServer:
         if not waist:
             return
         # GUI sends [pitch_rad, height_cm]; convert height cm -> m for OpenRAVE prismatic
-        indices = self._JointIndicesByName(("joint-pitch", "joint-up-down"))
+        indices = self._JointIndicesByName(("joint_body_pitch", "joint_lift_body"))
         if not indices:
             return
-        values = [waist[0] if len(waist) >= 1 else 0.0,
-                  (waist[1] * 0.01) if len(waist) >= 2 else 0.0]
-        n = min(len(indices), len(values))
-        self.robot.SetDOFValues(values[:n], indices[:n])
+        # values = [waist[0] if len(waist) >= 1 else 0.0,
+        #           (waist[1] * 0.01) if len(waist) >= 2 else 0.0]
+        # n = min(len(indices), len(values))
+        # self.robot.SetDOFValues(values[:n], indices[:n])
+        n = min(len(indices), len(waist))
+        self.robot.SetDOFValues(waist[:n], indices[:n])
 
     def _JointIndicesByName(self, names) -> list:
         out = []
@@ -546,6 +715,13 @@ class PlanningServer:
         cameraRollDeg: float = 0.0,
         minConfidenceThreshold: float = 0.5,
         clearPrevious: bool = True,
+        enablePointCloud: bool = True,
+        pointCloudVoxelSize: float = 0.02,
+        pointCloudMaskMargin: float = 0.03,
+        pointCloudBoxHalfSize: float = 0.005,
+        pointCloudMaxRange: Optional[float] = 3.0,
+        pointCloudMinRange: float = 0.10,
+        pointCloudColor: tuple = (0.45, 0.45, 0.55),
     ) -> list[dict]:
         """Ask the GUI for the latest head RGB+Depth, then run detection.
 
@@ -608,6 +784,13 @@ class PlanningServer:
             cameraYawDeg=cameraYawDeg, cameraPitchDeg=cameraPitchDeg, cameraRollDeg=cameraRollDeg,
             minConfidenceThreshold=minConfidenceThreshold,
             clearPrevious=clearPrevious,
+            enablePointCloud=enablePointCloud,
+            pointCloudVoxelSize=pointCloudVoxelSize,
+            pointCloudMaskMargin=pointCloudMaskMargin,
+            pointCloudBoxHalfSize=pointCloudBoxHalfSize,
+            pointCloudMaxRange=pointCloudMaxRange,
+            pointCloudMinRange=pointCloudMinRange,
+            pointCloudColor=pointCloudColor,
         )
 
     # ------------------------------------------------------------------ #
