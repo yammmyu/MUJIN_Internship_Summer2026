@@ -97,17 +97,12 @@ class StatusMixin:
                                 self.root.after(0, lambda label=self.head_waist_status_labels[key], value=state:
                                               label.config(text=f"{value:.3f}"))
 
-                    # 获取夹爪状态（使用arm_joint_states的最后两个值）
-                    # try:
-                    #     # if arm_states and len(arm_states) >= 2:
-                    #     #     # 假设夹爪状态是手臂关节的最后两个值
-                    #     #     gripper_states = arm_states[-2:]
-                    #     for i, state in enumerate(gripper_states):
-                    #         if i < len(self.gripper_status_labels) and state is not None:
-                    #             self.root.after(0, lambda label=self.gripper_status_labels[i], value=state:
-                    #                           label.config(text=f"{value:.3f}"))
-                    # except Exception as e:
-                    #     print(f"夹爪状态更新错误: {e}")
+                    # 获取夹爪状态
+                    gripper_states, _ = self.robot.gripper_states()
+                    for i, state in enumerate(gripper_states):
+                        if i < len(self.gripper_status_labels) and state is not None:
+                            self.root.after(0, lambda label=self.gripper_status_labels[i], value=1 if state > 0.5 else 0:
+                                          label.config(text=f"{value:.3f}"))
 
                     time.sleep(0.1)  # 100ms更新一次
                 except Exception as e:
