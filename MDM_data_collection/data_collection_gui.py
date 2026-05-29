@@ -384,11 +384,16 @@ class DataCollectionGUI:
     # ── Background threads ────────────────────────────────────────────────────
 
     def _start_camera_thread(self) -> None:
+        """Display loop — renders the frames streamed by the collector at 30 Hz.
+
+        It does not touch the SDK itself; the collector's single stream loop is
+        the only place camera frames are pulled.
+        """
         def _loop():
             while True:
                 try:
                     for name in CAMERA_NAMES:
-                        frame, _ = self.collector.camera.get_latest_image(name)
+                        frame = self.collector.get_latest_frame(name)
                         if frame is not None and name in self.camera_labels:
                             self._push_camera_frame(name, frame)
                     time.sleep(0.033)
@@ -432,44 +437,27 @@ class DataCollectionGUI:
             print(f"[camera display] {name}: {e}")
 
     def _start_ee_pos_thread(self) -> None:
+        """Display loop — reads the EE poses the collector streams at 30 Hz.
+
+        It never calls get_motion_status itself; the collector's single stream
+        loop keeps latest_*_pos/quat fresh whether or not we are recording.
+        """
         def _loop():
             while True:
-                sleep_s = 0.2
                 try:
-                    if self._is_recording:
-                        lp = self.collector.latest_left_pos
-                        rp = self.collector.latest_right_pos
-                        lq = self.collector.latest_left_quat
-                        rq = self.collector.latest_right_quat
-                        if lp is None or rp is None:
-                            time.sleep(0.05)
-                            continue
-                        lp_t = f"[{lp[0]:.3f},  {lp[1]:.3f},  {lp[2]:.3f}]"
-                        rp_t = f"[{rp[0]:.3f},  {rp[1]:.3f},  {rp[2]:.3f}]"
-                        lq_t = (f"[{lq[0]:.3f},  {lq[1]:.3f},  {lq[2]:.3f},  {lq[3]:.3f}]"
-                                if lq is not None else "—")
-                        rq_t = (f"[{rq[0]:.3f},  {rq[1]:.3f},  {rq[2]:.3f},  {rq[3]:.3f}]"
-                                if rq is not None else "—")
-                        sleep_s = 0.033
-                    else:
-                        status = self.collector.robot_controller.get_motion_status()
-                        frames = status["frames"]
-
-                        def _pos(link):
-                            p = frames[link]["position"]
-                            return f"[{p['x']:.3f},  {p['y']:.3f},  {p['z']:.3f}]"
-
-                        def _quat(link):
-                            try:
-                                q = frames[link]["orientation"]["quaternion"]
-                                return f"[{q['x']:.3f},  {q['y']:.3f},  {q['z']:.3f},  {q['w']:.3f}]"
-                            except Exception:
-                                return "—"
-
-                        lp_t = _pos("arm_left_link7")
-                        rp_t = _pos("arm_right_link7")
-                        lq_t = _quat("arm_left_link7")
-                        rq_t = _quat("arm_right_link7")
+                    lp = self.collector.latest_left_pos
+                    rp = self.collector.latest_right_pos
+                    lq = self.collector.latest_left_quat
+                    rq = self.collector.latest_right_quat
+                    if lp is None or rp is None:
+                        time.sleep(0.05)
+                        continue
+                    lp_t = f"[{lp[0]:.3f},  {lp[1]:.3f},  {lp[2]:.3f}]"
+                    rp_t = f"[{rp[0]:.3f},  {rp[1]:.3f},  {rp[2]:.3f}]"
+                    lq_t = (f"[{lq[0]:.3f},  {lq[1]:.3f},  {lq[2]:.3f},  {lq[3]:.3f}]"
+                            if lq is not None else "—")
+                    rq_t = (f"[{rq[0]:.3f},  {rq[1]:.3f},  {rq[2]:.3f},  {rq[3]:.3f}]"
+                            if rq is not None else "—")
 
                     self.root.after(0, lambda a=lp_t, b=rp_t, c=lq_t, d=rq_t: (
                         self._left_pos_var.set(a),
@@ -479,7 +467,7 @@ class DataCollectionGUI:
                     ))
                 except Exception as e:
                     print(f"[ee pos loop] {e}")
-                time.sleep(sleep_s)
+                time.sleep(0.033)
 
         threading.Thread(target=_loop, daemon=True).start()
 
@@ -489,16 +477,25 @@ class DataCollectionGUI:
         if getattr(self, "_closing", False):
             return
         self._closing = True
-        try:
-            self.collector.shutdown()
-        except Exception as e:
-            print(f"关闭数据采集器出错: {e}")
+
+        # Destroy the window first so the UI is immediately gone.
         try:
             self.root.destroy()
         except Exception:
             pass
-        finally:
-            os._exit(0)
+
+        # Run shutdown in a daemon thread so the process force-exits via
+        # os._exit after 5 s even if an SDK call hangs.
+        def _do_shutdown():
+            try:
+                self.collector.shutdown()
+            except Exception as e:
+                print(f"关闭数据采集器出错: {e}")
+
+        t = threading.Thread(target=_do_shutdown, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        os._exit(0)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
