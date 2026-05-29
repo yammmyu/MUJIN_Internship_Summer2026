@@ -34,6 +34,7 @@ from gui import (
     ManualControlMixin,
     VRMixin,
     DataCollectionMixin,
+    MotionPlanningMixin,
 )
 
 
@@ -47,6 +48,7 @@ class RobotControlGUI(
     ManualControlMixin,
     VRMixin,
     DataCollectionMixin,
+    MotionPlanningMixin,
 ):
     def __init__(self, root):
         self.root = root
@@ -181,6 +183,7 @@ class RobotControlGUI(
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()
+        self.start_motion_planning_thread()
 
     def setup_ui(self):
         """设置用户界面：顶部标题栏 + 左右分栏 + 底部状态栏。"""
@@ -241,6 +244,7 @@ class RobotControlGUI(
         self._is_closing = True
 
         for label, fn in [
+            ("Motion Planning TCP", self.stop_motion_planning),
             ("VR 串流服务器", self.dummy_server.stop),
             ("数据采集器", self.data_collector.shutdown),
             ("相机", self.camera.close),
