@@ -1,12 +1,12 @@
 """
 Converts filtered robot recordings into a Zarr dataset compatible with
-diffusion_policy/config/task/lift_image_abs.yaml.
+diffusion_policy/config/task/left_arm_ee_image.yaml.
 
 Left arm only.
 
 Output Zarr schema:
-  data/agentview_image              (N, 84, 84, 3)  float32  — head camera (RGB)
-  data/robot0_eye_in_hand_image     (N, 84, 84, 3)  float32  — hand_left camera (RGB)
+  data/agentview_image              (N, 84, 84, 3)  uint8    — head camera (RGB)
+  data/robot0_eye_in_hand_image     (N, 84, 84, 3)  uint8    — hand_left camera (RGB)
   data/robot0_eef_pos               (N, 3)          float32  — EE position (metres)
   data/robot0_eef_quat              (N, 4)          float32  — EE quaternion [qx,qy,qz,qw]
   data/robot0_gripper_qpos          (N, 2)          float32  — left gripper (duplicated to match shape [2])
@@ -24,12 +24,14 @@ import cv2
 import numcodecs
 import numpy as np
 import zarr
+from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation as R
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-IMG_SIZE   = 84
-CHUNK_T    = 100
-COMPRESSOR = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
+IMG_SIZE      = 84
+CHUNK_T       = 100
+COMPRESSOR    = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
+SMOOTH_SIGMA  = 1.7   # Gaussian sigma in frames; set to 0 to disable smoothing
 
 
 # ─── Rotation conversion ─────────────────────────────────────────────────────
@@ -43,12 +45,36 @@ def quat_to_rot6d(quat: np.ndarray) -> np.ndarray:
     return np.concatenate([mat[..., 0], mat[..., 1]], axis=-1)   # (N, 6)
 
 
+def smooth_pos(pos: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smooth (N, 3) position along time axis."""
+    if sigma <= 0:
+        return pos
+    return gaussian_filter1d(pos, sigma=sigma, axis=0)
+
+
+def _sign_fix_and_smooth_quat(quat: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Return a Gaussian-smoothed (N, 4) quaternion for a single episode.
+    Sign-consistency fix runs before filtering so the kernel never blends
+    q with -q. Re-normalisation after filtering returns the result to S³.
+    Must be called per-episode — do NOT pass a concatenated multi-episode array.
+    """
+    q = quat.copy()
+    if sigma > 0:
+        for i in range(1, len(q)):
+            if np.dot(q[i], q[i - 1]) < 0:
+                q[i] *= -1
+        q = gaussian_filter1d(q, sigma=sigma, axis=0)
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+    return q
+
+
 # ─── Video loading ────────────────────────────────────────────────────────────
 
 def read_video(path: pathlib.Path, size: int = IMG_SIZE) -> np.ndarray:
-    """Returns (N, size, size, 3) float32 RGB, or empty array if file missing."""
+    """Returns (N, size, size, 3) uint8 RGB, or empty array if file missing."""
     if not path.exists():
-        return np.empty((0, size, size, 3), dtype=np.float32)
+        return np.empty((0, size, size, 3), dtype=np.uint8)
     cap    = cv2.VideoCapture(str(path))
     frames = []
     while True:
@@ -57,15 +83,15 @@ def read_video(path: pathlib.Path, size: int = IMG_SIZE) -> np.ndarray:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, (size, size))
-        frames.append(frame.astype(np.float32))
+        frames.append(frame.astype(np.uint8))
     cap.release()
-    return np.stack(frames) if frames else np.empty((0, size, size, 3), dtype=np.float32)
+    return np.stack(frames) if frames else np.empty((0, size, size, 3), dtype=np.uint8)
 
 
 # ─── Zarr helpers ─────────────────────────────────────────────────────────────
 
 def init_zarr(out_path: pathlib.Path) -> tuple[zarr.Group, dict]:
-    store = zarr.open_group(str(out_path), mode='w')
+    store = zarr.open_group(str(out_path), mode='w', zarr_format=2)
     store.require_group('data')
     store.require_group('meta')
 
@@ -73,16 +99,17 @@ def init_zarr(out_path: pathlib.Path) -> tuple[zarr.Group, dict]:
 
     def arr(name, *shape_rest, dtype='f4'):
         return store['data'].empty(
-            name,
-            shape  = (0, *shape_rest),
-            chunks = (CHUNK_T, *shape_rest),
-            dtype  = dtype,
+            name=name,
+            shape      = (0, *shape_rest),
+            chunks     = (CHUNK_T, *shape_rest),
+            dtype      = dtype,
+            zarr_format= 2,
             **kw,
         )
 
     arrays = {
-        'agentview_image':          arr('agentview_image',          IMG_SIZE, IMG_SIZE, 3),
-        'robot0_eye_in_hand_image': arr('robot0_eye_in_hand_image', IMG_SIZE, IMG_SIZE, 3),
+        'agentview_image':          arr('agentview_image',          IMG_SIZE, IMG_SIZE, 3, dtype='u1'),
+        'robot0_eye_in_hand_image': arr('robot0_eye_in_hand_image', IMG_SIZE, IMG_SIZE, 3, dtype='u1'),
         'robot0_eef_pos':           arr('robot0_eef_pos',           3),
         'robot0_eef_quat':          arr('robot0_eef_quat',          4),
         'robot0_gripper_qpos':      arr('robot0_gripper_qpos',      2),
@@ -94,14 +121,14 @@ def init_zarr(out_path: pathlib.Path) -> tuple[zarr.Group, dict]:
 def append_to(arr: zarr.Array, data: np.ndarray) -> None:
     n_old = arr.shape[0]
     n_new = data.shape[0]
-    arr.resize(n_old + n_new, *arr.shape[1:])
+    arr.resize((n_old + n_new, *arr.shape[1:]))
     arr[n_old:] = data
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
-    episodes = sorted(src_dir.glob('episode_*'))
+    episodes = sorted(src_dir.glob('recording*'))
     if not episodes:
         raise FileNotFoundError(f"No episodes found in {src_dir}")
     print(f"Found {len(episodes)} episodes in {src_dir}\n")
@@ -109,6 +136,10 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
     store, arrays = init_zarr(out_path)
     episode_ends  = []
     total         = 0
+
+    # accumulated for smoothing-comparison NPZ
+    raw_pos_all, raw_quat_all     = [], []
+    smooth_pos_all, smooth_quat_all = [], []
 
     for ep in episodes:
         print(f"Processing {ep.name}...")
@@ -135,8 +166,17 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         gripper   = states['gripper'][:n, :1] # (N, 1)  left gripper value
 
         # ── Action = [pos(3) + rot6d(6) + gripper(1)] ───────────────────────
-        rot6d  = quat_to_rot6d(left_quat)                           # (N, 6)
-        action = np.concatenate([left_pos, rot6d, gripper], axis=1) # (N, 10)
+        # Observations stay raw (must match camera ground truth).
+        # Actions use smoothed trajectories to reduce teleoperation jerk.
+        pos_smooth  = smooth_pos(left_pos, SMOOTH_SIGMA)
+        quat_smooth = _sign_fix_and_smooth_quat(left_quat, SMOOTH_SIGMA)
+        rot6d       = quat_to_rot6d(quat_smooth)                            # (N, 6)
+        action      = np.concatenate([pos_smooth, rot6d, gripper], axis=1)  # (N, 10)
+
+        raw_pos_all.append(left_pos)
+        raw_quat_all.append(left_quat)
+        smooth_pos_all.append(pos_smooth)
+        smooth_quat_all.append(quat_smooth)
 
         # gripper_qpos duplicated to satisfy config shape [2]
         gripper_qpos = np.repeat(gripper, 2, axis=1)                # (N, 2)
@@ -153,12 +193,29 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         episode_ends.append(total)
         print(f"  {n} frames  (total so far: {total})")
 
+    # ── Smoothing comparison NPZ ──────────────────────────────────────────────
+    npz_path = out_path.with_suffix('.smooth_debug.npz')
+    np.savez(
+        npz_path,
+        raw_pos          = np.concatenate(raw_pos_all,    axis=0),
+        raw_quat         = np.concatenate(raw_quat_all,   axis=0),
+        smooth_pos       = np.concatenate(smooth_pos_all, axis=0),
+        smooth_quat      = np.concatenate(smooth_quat_all, axis=0),
+        episode_ends     = np.array(episode_ends, dtype=np.int64),
+    )
+    print(f"  Smoothing debug data → {npz_path}")
+
     # ── Episode ends ──────────────────────────────────────────────────────────
-    store['meta'].array(
-        'episode_ends',
-        np.array(episode_ends, dtype=np.int64),
+    ep_ends = np.array(episode_ends, dtype=np.int64)
+    meta_arr = store['meta'].empty(
+        name='episode_ends',
+        shape=ep_ends.shape,
+        chunks=ep_ends.shape,
+        dtype=np.int64,
+        zarr_format=2,
         compressor=COMPRESSOR,
     )
+    meta_arr[:] = ep_ends
 
     print(f"\nDataset written to {out_path}")
     print(f"  Total frames : {total}")
@@ -172,7 +229,10 @@ if __name__ == '__main__':
                         help='Source dir (falls back to recordings/ if not found)')
     parser.add_argument('--out', default='robot_dataset.zarr',
                         help='Output Zarr store path')
+    parser.add_argument('--sigma', type=float, default=SMOOTH_SIGMA,
+                        help='Gaussian sigma (frames) for action smoothing; 0 = disabled')
     args = parser.parse_args()
+    SMOOTH_SIGMA = args.sigma
 
     src = pathlib.Path(args.src)
     if not src.exists():
