@@ -9,11 +9,52 @@ import cv2
 import numpy as np
 
 from constants import *
-from smoothing import ExponentialSmoother
 
 
+CAMERA_NAMES = ["hand_left", "hand_right", "head"]
+RECORD_HZ = 30
 PC4080_HOST = "10.12.11.144"
-PC4080_PORT = 9000
+PC4080_PORT = 9001
+
+# Camera roles for the left_arm_ee_image policy obs.
+AGENT_CAMERA = "head"        # -> agentview_image
+HAND_CAMERA = "hand_left"    # -> robot0_eye_in_hand_image
+INFERENCE_CAMERAS = [AGENT_CAMERA, HAND_CAMERA]
+
+
+def rot6d_to_quat(rot6d):
+    """6D rotation (first two rotation-matrix columns) -> quaternion [x, y, z, w].
+
+    Mirrors diffusion_policy/scripts/build_left_arm_ee_replay_buffer.py:_6d_rot_to_quat
+    for a single sample, so the live decode matches how the training data was built.
+    """
+    rot6d = np.asarray(rot6d, dtype=np.float64)
+    c1 = rot6d[:3]
+    c2 = rot6d[3:6]
+    # Gram-Schmidt orthonormalisation
+    c1 = c1 / (np.linalg.norm(c1) + 1e-8)
+    c2 = c2 - np.dot(c2, c1) * c1
+    c2 = c2 / (np.linalg.norm(c2) + 1e-8)
+    c3 = np.cross(c1, c2)
+    m = np.stack([c1, c2, c3], axis=-1)  # rotation matrix (columns = c1,c2,c3)
+    t = m[0, 0] + m[1, 1] + m[2, 2]
+    if t > 0:
+        s = 0.5 / np.sqrt(t + 1.0)
+        q = [(m[2, 1] - m[1, 2]) * s, (m[0, 2] - m[2, 0]) * s,
+             (m[1, 0] - m[0, 1]) * s, 0.25 / s]
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        q = [0.25 * s, (m[0, 1] + m[1, 0]) / s,
+             (m[0, 2] + m[2, 0]) / s, (m[2, 1] - m[1, 2]) / s]
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        q = [(m[0, 1] + m[1, 0]) / s, 0.25 * s,
+             (m[1, 2] + m[2, 1]) / s, (m[0, 2] - m[2, 0]) / s]
+    else:
+        s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        q = [(m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s,
+             0.25 * s, (m[0, 1] - m[1, 0]) / s]
+    return [float(v) for v in q]
 
 
 class InferenceMixin:
@@ -42,128 +83,63 @@ class InferenceMixin:
                     time.sleep(0.01)
 
         def _run_auto_execution():
-            exponential_smoother = ExponentialSmoother(alpha=0.2)
+            # Direct EE-pose execution: consume the latest predicted action chunk,
+            # command each absolute pose + gripper, paced at the action rate.
+            pos_alpha = 0.5            # position low-pass (1.0 = no smoothing)
+            dt = 1.0 / RECORD_HZ
             last_inference_timestamp: float = 0.0
-            smooth_step = 0.002
+            smoothed_pos = None
             self.actions = []
             while self.is_auto_inference:
-                # ignore traj execution time
-                now = time.time()
-                if self.actions:
-                    actions = self.actions[:2]
-                    gripper_action = actions[-1][-1]
-                    current_left_arm_joint_values = self.left_arm_joint_values
-                    exponential_smoother.prev_smoothed = np.array(current_left_arm_joint_values)
-                    actions = [current_left_arm_joint_values] + [exponential_smoother.smooth(a[:7]) for a in actions]
-                    # actions = [exponential_smoother.smooth(a[:7]) for a in actions]
-                    print(f"Executing actions: {actions}, all actions: {len(self.actions)}")
-                    # self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values] + actions, smooth_step=0.0002, validate=True, validate_step=0.3)[:7], "left", 0.0001, validate=True, validate_step=0.2)
-                    # moving_average or savgol
-                    filter_mode = "moving_average"
-                    # use_uniform_filter1d = not self.is_grabbing_target
-                    # if use_uniform_filter1d:
-                    #     smooth_step = 0.005 if self.is_grabbing_target else 0.005
-                    # else:
-                    # self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values] + actions, smooth_step=smooth_step, validate=True, validate_step=0.3)[:7], "left", 0.0001, validate=True, validate_step=0.2)
-                    self.run_trajectory(self.get_smooth_paths(actions, smooth_step=smooth_step, validate=True, validate_step=0.3, filter_mode=filter_mode)[:7], "left", 0.0001, validate=True, validate_step=0.2)
-                    # self.run_trajectory(actions, "left", 0.02, validate=True, validate_step=0.3)
-                    if gripper_action > 0.5:
-                        if not self.is_grabbing_target:
-                            self.robot.move_gripper([1, 0])
-                            self.is_grabbing_target = True
-                            self.actions = []
-                            time.sleep(1)
-                            for _ in range(20):
-                                self.move_arm_relative('left', [0, 0, 0.002], time_step=0.02)
-                            last_inference_timestamp = time.time() + 1
-                            continue
-                    self.actions = self.actions[2:]
+                # Refresh the action queue whenever a newer inference arrives.
+                if self.robot_info.inference_timestamp > last_inference_timestamp + 1e-3:
+                    last_inference_timestamp = self.robot_info.inference_timestamp
+                    with self.robot_info.lock:
+                        preds = self.robot_info.left_joint_predict_action_values
+                        self.actions = copy.deepcopy(preds) if preds else []
+
                 if not self.actions:
-                    x, y, z = self.left_hand_pos
-                    # stop and move to home
-                    if self.is_grabbing_target and x < 0.565 and z > 0.9:
-                        print("stop auto inference and move back to home position")
-                        self.is_auto_inference = False
-                        self.run_trajectory(self.get_smooth_paths([self.left_arm_joint_values, LEFT_HAND_HOME_JOINT_VALUES]), "left", 0.01)
-                        break
-                    # check robot postion when there's no action
-                    # TODO: test: robot is next to container
-                    if self.is_grabbing_target:
-                        if z < 0.9:
-                            alpha = 0.3
-                            smooth_step = 0.002
-                        # elif x > 0.6:
-                        #     alpha = 0.6
-                        #     smooth_step = 0.01
-                        else:
-                            alpha = 0.6
-                            smooth_step = 0.01
-                    else:
-                        if x > 0.64:
-                            alpha = 0.1
-                            smooth_step = 0.002
-                        elif x > 0.6:
-                            alpha = 0.2
-                            smooth_step = 0.0025
-                        elif x > 0.55:
-                            alpha = 0.4
-                            smooth_step = 0.005
-                        else:
-                            alpha = 0.3
-                            smooth_step = 0.01
-                    exponential_smoother.set_alpha(alpha)
+                    time.sleep(dt)
+                    continue
 
+                action = self.actions.pop(0)
+                pos, quat, grip = self._decode_ee_action(action)
 
-                # TODO: no need to lock
-                if self.robot_info.inference_timestamp <= last_inference_timestamp + 0.001:
-                    if not self.actions:
-                        time.sleep(0.01)
-                    continue
-                last_inference_timestamp = self.robot_info.inference_timestamp
-                if self.is_grabbing_target and any(v[-1] < 0.5 for v in self.robot_info.left_joint_predict_action_values):
-                    print(f"robot is grabbing target, skip the old inference which would release target")
-                    continue
-                diff = now - last_inference_timestamp
-                if diff > 0.7:
-                    print(f"inference diff={diff} > 0.7, not use at all")
-                    continue
-                if diff > 0.5:
-                    print(f"inference diff={diff} > 0.5, use the last 1 action")
-                    self.actions.append(self.robot_info.left_joint_predict_action_values[-1])
-                elif diff > 0.3:
-                    print(f"inference diff={diff} > 0.3, use last 2 actions")
-                    self.actions.extend(self.robot_info.left_joint_predict_action_values[-2:])
-                elif self.actions:
-                    if len(self.actions) <= 4:
-                        self.actions.extend(self.robot_info.left_joint_predict_action_values[-4:])
-                    else:
-                        self.actions = self.actions[-2:] + self.robot_info.left_joint_predict_action_values[-4:]
+                pos = np.asarray(pos, dtype=np.float64)
+                if smoothed_pos is None:
+                    smoothed_pos = pos
                 else:
-                    self.actions = self.robot_info.left_joint_predict_action_values
+                    smoothed_pos = pos_alpha * pos + (1.0 - pos_alpha) * smoothed_pos
+
+                self._command_left_ee(smoothed_pos, quat, grip)
+                time.sleep(dt)
 
         if self.inference_thread is None:
             self.inference_thread = threading.Thread(target=_run_auto_inference, daemon=True)
             print("Starting auto_inference thread...")
             self.inference_thread.start()
         if self.execution_thread is None:
-            gripper_states, _ = self.robot.gripper_states()
-            self.is_grabbing_target = gripper_states[0] > 0.5
             self.execution_thread = threading.Thread(target=_run_auto_execution, daemon=True)
             print("Starting execution_thread thread...")
             self.execution_thread.start()
 
 
     def inference_once(self, use_deep_copy: bool = False):
-        # TODO: left_hand only
+        # left_arm_ee_image policy: obs = head + hand_left images + left EE state.
         if self.robot_info.timestamp - self.robot_info.inference_timestamp < 0.0001:
             return False
         with self.robot_info.lock:
-            last_two_left_arm_joint_values = copy.deepcopy(self.last_two_left_arm_joint_values)
-            assert len(last_two_left_arm_joint_values) == 2
+            last_two_left_ee_states = copy.deepcopy(self.last_two_left_ee_states)
+            assert len(last_two_left_ee_states) == 2
             inference_timestamp = self.robot_info.timestamp
 
-        camera_images = copy.deepcopy(self.camera_images["hand_left"]) if use_deep_copy else self.camera_images["hand_left"]
-        assert camera_images is not None and len(camera_images) == 2
+        agent_frames = self.camera_images[AGENT_CAMERA]
+        hand_frames = self.camera_images[HAND_CAMERA]
+        if use_deep_copy:
+            agent_frames = copy.deepcopy(agent_frames)
+            hand_frames = copy.deepcopy(hand_frames)
+        assert agent_frames is not None and len(agent_frames) == 2
+        assert hand_frames is not None and len(hand_frames) == 2
 
         def _encode_image(rgb_image):
             rgb_image_cv2 = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
@@ -172,8 +148,9 @@ class InferenceMixin:
             return base64_string
 
         req = {
-            'left_imgs': [_encode_image(image) for image in camera_images],
-            'state': last_two_left_arm_joint_values,
+            'agent_imgs': [_encode_image(image) for image in agent_frames],
+            'hand_imgs': [_encode_image(image) for image in hand_frames],
+            'state': last_two_left_ee_states,
         }
 
         def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict:
@@ -207,15 +184,42 @@ class InferenceMixin:
             print(f'\nServer error: {resp["error"]}')
             return
 
+        # NOTE: left_joint_predict_* now carry EE-pose data, not joints:
+        #   *_start_values   = last_two_left_ee_states ([pos(3), quat(4), grip(1)])
+        #   *_action_values  = predicted action rows [eef_pos(3), 6D_rot(6), grip(1)]
         action = np.asarray(resp['action'], dtype=np.float32)
         with self.robot_info.lock:
-            self.robot_info.left_joint_predict_start_values = copy.deepcopy(last_two_left_arm_joint_values)
+            self.robot_info.left_joint_predict_start_values = copy.deepcopy(last_two_left_ee_states)
             self.robot_info.left_joint_predict_action_values = action.tolist()
             self.robot_info.inference_timestamp = inference_timestamp
-        # print("left_joint_predict_start_values=", self.robot_info.left_joint_predict_start_values)
-        # print("left_joint_predict_action_values=", self.robot_info.left_joint_predict_action_values)
         return True
 
+
+    def _command_left_ee(self, pos, quat, gripper, lifetime: float = 2.0):
+        """Command the left arm to an absolute EE pose + set the gripper.
+
+        pos:  (x, y, z) metres; quat: (qx, qy, qz, qw); gripper: scalar (>0.5 -> close).
+        Uses the same SDK path as gui/manual_control.py:move_arm_to_position.
+        """
+        pose_dict = {
+            'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2]),
+            'qx': float(quat[0]), 'qy': float(quat[1]),
+            'qz': float(quat[2]), 'qw': float(quat[3]),
+        }
+        self.robot_controller.set_end_effector_pose_control(
+            lifetime=lifetime,
+            control_group=["left_arm"],
+            left_pose=pose_dict,
+            right_pose=None,
+        )
+        self.move_gripper("left", 1.0 if gripper > 0.5 else 0.0)
+
+    def _decode_ee_action(self, action):
+        """action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip)."""
+        pos = action[:3]
+        quat = rot6d_to_quat(action[3:9])
+        grip = action[9]
+        return pos, quat, grip
 
     def execute_inference_result(self, once: bool = False):
         def safety_check():
@@ -227,59 +231,78 @@ class InferenceMixin:
                     self.robot_info.left_joint_predict_start_values = None
                     self.robot_info.left_joint_predict_action_values = None
                     break
-                # DANGEROUS!!!!
-                self.run_trajectory([action[:7]], "left", 0.2, validate=True, validate_step=0.4)
-                self.robot.move_gripper([1 if action[-1] > 0.5 else 0, 0])
+                # DANGEROUS!!!!  absolute EE-pose command
+                pos, quat, grip = self._decode_ee_action(action)
+                self._command_left_ee(pos, quat, grip)
+                time.sleep(1.0 / RECORD_HZ)
                 if once:
                     break
 
     def start_inference_data_collection_thread(self):
-        # 由本线程独占采集/缓存的相机，start_camera_thread 不再重复 cache，
-        # 以免覆盖与关节时间戳精确配对的帧
-        self.inference_managed_cameras.add("hand_left")
+        """采集线程：以固定频率 (RECORD_HZ) 同步采集 head/hand_left 相机帧与左臂末端
+        位姿，写入 self.camera_images / self.robot_info / self.last_two_left_ee_states
+        供 left_arm_ee_image 策略推理使用。
+
+        由本线程独占采集/缓存 INFERENCE_CAMERAS 中的相机，start_camera_thread 不再
+        重复 cache，以免覆盖供推理使用的帧。
+        """
+        if getattr(self, "_inference_collection_thread", None) is not None:
+            print("Inference data collection thread already running.")
+            return
+
+        self.inference_managed_cameras.update(INFERENCE_CAMERAS)
+        for name in INFERENCE_CAMERAS:
+            self.camera_images.setdefault(name, None)
+        if getattr(self, "last_two_left_ee_states", None) is None:
+            self.last_two_left_ee_states = []
+
+        self._inference_stop_event = threading.Event()
+        interval = 1.0 / RECORD_HZ
 
         def update_inference_data():
-            camera_name = "hand_left"
-            # fps = 30  # hz
-            fps = 31  # hz
-            joint_values_by_timestamp = []
-            next_update_camera_image_timestamp = 0.0
-            while True:
+            next_tick = time.monotonic()
+            while not self._inference_stop_event.is_set():
                 now = time.time()
-                # update joint values
-                arm_states, _ = self.robot.arm_joint_states()
+
+                # --- 左臂末端位姿 + 夹爪 -> state = [pos(3), quat xyzw(4), grip(1)] ---
+                frame = self.robot_controller.get_motion_status()['frames']['arm_left_link7']
+                pos = frame['position']
+                quat = frame['orientation']['quaternion']
                 gripper_states, _ = self.robot.gripper_states()
-                joint_values_by_timestamp.append((now, arm_states[:7] + [1 if gripper_states[0] > 0.5 else 0], arm_states[7:14] + [1 if gripper_states[1] > 0.5 else 0]))
-                if now < next_update_camera_image_timestamp:
-                    time.sleep(0.01)
-                    continue
-                # update camera images
-                image, timestamp = self.camera.get_latest_image(camera_name)
-                if image is not None:
-                    timestamp_s = timestamp * 1e-9
-                    wait_time_s = 0.001
-                    if len(joint_values_by_timestamp) >= 2 and timestamp_s > self.robot_info.timestamp + wait_time_s:
-                        next_update_camera_image_timestamp = timestamp_s + 1.0 / fps
-                        if self.camera_images[camera_name] is None:
-                            self.camera_images[camera_name] = [image, image]
-                        else:
-                            self.camera_images[camera_name] = [self.camera_images[camera_name][-1], image]
+                left_ee_state = [
+                    pos['x'], pos['y'], pos['z'],
+                    quat['x'], quat['y'], quat['z'], quat['w'],
+                    1.0 if gripper_states[0] > 0.5 else 0.0,
+                ]
 
-                        for i in range(len(joint_values_by_timestamp) - 1):
-                            if joint_values_by_timestamp[i][0] <= timestamp_s and joint_values_by_timestamp[i + 1][0] > timestamp_s:
-                                break
-                        with self.robot_info.lock:
-                            self.robot_info.timestamp = timestamp_s
-                            self.robot_info.left_joint_values = joint_values_by_timestamp[i][1]
-                            self.robot_info.right_joint_values = joint_values_by_timestamp[i][2]
+                # --- 相机帧：每个相机滚动保留最近两帧 ---
+                for name in INFERENCE_CAMERAS:
+                    image, _ = self.camera.get_latest_image(name)
+                    if image is None:
+                        continue
+                    prev = self.camera_images.get(name)
+                    self.camera_images[name] = [prev[-1], image] if prev else [image, image]
 
-                            left_arm_state = copy.deepcopy(joint_values_by_timestamp[i][1])
-                            if not self.last_two_left_arm_joint_values:
-                                self.last_two_left_arm_joint_values = [left_arm_state, left_arm_state]
-                            else:
-                                self.last_two_left_arm_joint_values = [self.last_two_left_arm_joint_values[-1], left_arm_state]
-                        joint_values_by_timestamp = joint_values_by_timestamp[-1000:]
-                time.sleep(0.01)  # 10ms
+                # --- 发布给推理：末端位姿与相机在同一 tick 共采样 ---
+                with self.robot_info.lock:
+                    self.robot_info.timestamp = now
+                    if self.last_two_left_ee_states:
+                        self.last_two_left_ee_states = [
+                            self.last_two_left_ee_states[-1], left_ee_state,
+                        ]
+                    else:
+                        self.last_two_left_ee_states = [left_ee_state, left_ee_state]
 
-        inference_data_collection_thread = threading.Thread(target=update_inference_data, daemon=True)
-        inference_data_collection_thread.start()
+                # --- 限速到 RECORD_HZ（stop_event 可立即唤醒）---
+                next_tick += interval
+                sleep_for = next_tick - time.monotonic()
+                if sleep_for > 0:
+                    self._inference_stop_event.wait(sleep_for)
+                else:
+                    next_tick = time.monotonic()
+
+        self._inference_collection_thread = threading.Thread(
+            target=update_inference_data, daemon=True,
+        )
+        print("Starting inference data collection thread...")
+        self._inference_collection_thread.start()

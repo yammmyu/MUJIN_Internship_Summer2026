@@ -84,6 +84,8 @@ class RobotControlGUI(
             # "head_center_fisheye": None
         }
         self.last_two_left_arm_joint_values = []
+        # 最近两帧左臂末端位姿 state ([pos(3), quat xyzw(4), grip(1)])，供 EE 策略推理
+        self.last_two_left_ee_states = []
         # 由推理数据采集线程独占缓存的相机（start_camera_thread 不再重复 cache）
         self.inference_managed_cameras = set()
         # 相机显示缩放尺寸（由 _rebuild_camera_display 根据排版动态更新）
@@ -180,8 +182,7 @@ class RobotControlGUI(
         }
 
         self.setup_ui()
-        # TODO: MONEY, disable inference data collection due to performance issue
-        # self.start_inference_data_collection_thread()
+        self.start_inference_data_collection_thread()
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()

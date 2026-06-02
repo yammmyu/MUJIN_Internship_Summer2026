@@ -13,6 +13,10 @@ class RobotInfo:
     timestamp: float = 0.0
     left_joint_values: list[float] = None  # 7 joint values + 1 gripper joint value
     right_joint_values: list[float] = None  # 7 joint values + 1 gripper joint value
+    # NOTE: for the left_arm_ee_image policy these left_*_predict_* fields now hold
+    # EE-pose data, not joints: *_start_values = last_two left EE states
+    # ([pos(3), quat(4), grip(1)]); *_action_values = action rows
+    # ([eef_pos(3), 6D_rot(6), grip(1)]).
     left_joint_predict_start_values: list[list[float]] = None
     right_joint_predict_start_values: list[list[float]] = None
     left_joint_predict_action_values: list[list[float]] = None
