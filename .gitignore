@@ -2,3 +2,7 @@
 *.idea
 *.pyc
 log
+*.zarr
+recordings/
+*.zip
+
