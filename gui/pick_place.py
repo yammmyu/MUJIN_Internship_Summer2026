@@ -386,15 +386,15 @@ class PickPlaceMixin:
                   style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(manual_row, text="推理一次",
                    style="Primary.TButton",
-                   command=lambda: self.inference_once()
+                   command=lambda: self.inference.inference_once()
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(manual_row, text="执行一次推理轨迹",
                    style="Primary.TButton",
-                   command=lambda: self.execute_inference_result(once=True)
+                   command=lambda: self.inference.execute_inference_result(once=True)
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(manual_row, text="执行剩余推理轨迹",
                    style="Primary.TButton",
-                   command=lambda: self.execute_inference_result()
+                   command=lambda: self.inference.execute_inference_result()
                    ).pack(side=tk.LEFT, padx=4)
 
         auto_row = ttk.Frame(sec_inf)
@@ -403,11 +403,11 @@ class PickPlaceMixin:
                   style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(auto_row, text="⚠ 开始自动运行",
                    style="Danger.TButton",
-                   command=lambda: self.auto_inference()
+                   command=lambda: self.inference.auto_inference()
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(auto_row, text="■ 停止自动运行",
                    style="Muted.TButton",
-                   command=lambda: self.auto_inference(stop=True)
+                   command=lambda: self.inference.auto_inference(stop=True)
                    ).pack(side=tk.LEFT, padx=4)
 
         # ===== 6. VR控制 =====

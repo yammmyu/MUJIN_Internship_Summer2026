@@ -335,10 +335,16 @@ class VRMixin:
             while True:
                 try:
                     frames = []
+                    # 当前：从兼容镜像 camera_images 读取（显示线程已镜像 env 抓取的帧）。
                     for name in sorted(self.camera_images.keys()):
                         rgb = _to_rgb_uint8(self.camera_images.get(name))
                         if rgb is not None:
                             frames.append(rgb)
+                    # 未来切换到 env 单一数据源（VR 作为共同请求者，与显示共享同一次抓取）：
+                    # for name in sorted(self._selected_display_cameras()):
+                    #     rgb = _to_rgb_uint8(self.env.get_frame(name))
+                    #     if rgb is not None:
+                    #         frames.append(rgb)
                     composite = _compose(frames)
                     if composite is not None:
                         self.dummy_server.set_image(composite, color_order="RGB")

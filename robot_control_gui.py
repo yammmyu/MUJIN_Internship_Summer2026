@@ -30,11 +30,12 @@ from gui import (
     StatusMixin,
     CoordinateMixin,
     PickPlaceMixin,
-    InferenceMixin,
     ManualControlMixin,
     VRMixin,
     MotionPlanningMixin,
 )
+from real_world import HumanoidEnv, InferenceController
+from real_world.humanoid_env import RECORD_HZ
 
 
 class RobotControlGUI(
@@ -43,7 +44,6 @@ class RobotControlGUI(
     StatusMixin,
     CoordinateMixin,
     PickPlaceMixin,
-    InferenceMixin,
     ManualControlMixin,
     VRMixin,
     MotionPlanningMixin,
@@ -55,16 +55,16 @@ class RobotControlGUI(
         self.root.minsize(1200, 800)
         self._setup_styles()
 
-        # 初始化机器人和相机
+        # 初始化机器人（相机由 HumanoidEnv 持有，见下方 self.env）
         self.robot = Robot()
+        self.robot_controller = RobotController()
 
         # Disable cameras during data_collection mode
         if camera_mode == "data":
-            self.camera = Camera(["hand_left", "hand_right", "head"])
-        else: 
-            self.camera = Camera(["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"])
-
-        self.robot_controller = RobotController()
+            camera_names = ["hand_left", "hand_right", "head"]
+        else:
+            camera_names = ["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"]
+        self.camera_mode = camera_mode
 
         # Slam
         rclpy.init(args=None)
@@ -75,7 +75,8 @@ class RobotControlGUI(
         # 等待初始化
         time.sleep(1.0)
 
-        # 相机图像缓存
+        # 相机图像缓存（兼容镜像）：唯一抓取者是 self.env；显示线程把 env 拉到的帧
+        # 镜像到此处，供尚未切换到 env 的消费者（VR/坐标/运动规划）继续读取。
         self.camera_images = {
             # "hand_left": None,  # cache latest two images for inference
             # "hand_right": None,  # cache latest two images for inference
@@ -86,8 +87,6 @@ class RobotControlGUI(
         self.last_two_left_arm_joint_values = []
         # 最近两帧左臂末端位姿 state ([pos(3), quat xyzw(4), grip(1)])，供 EE 策略推理
         self.last_two_left_ee_states = []
-        # 由推理数据采集线程独占缓存的相机（start_camera_thread 不再重复 cache）
-        self.inference_managed_cameras = set()
         # 相机显示缩放尺寸（由 _rebuild_camera_display 根据排版动态更新）
         self.camera_tile_size = (320, 240)
 
@@ -103,6 +102,21 @@ class RobotControlGUI(
         # update robot_info
         self.robot_info = RobotInfo()
         create_robot_info_http_server(self.robot_info)
+
+        # HumanoidEnv：相机的唯一持有者与抓取者（按需开关、RECORD_HZ 抓取、空闲自动关闭）。
+        # camera=None -> env 自行构造并持有 Camera(camera_names)；robot/controller 仍由 GUI 共享。
+        self.env = HumanoidEnv(
+            robot=self.robot,
+            robot_controller=self.robot_controller,
+            camera=None,
+            cameras=camera_names,
+            frequency=RECORD_HZ,
+        )
+        # 兼容别名：少数遗留代码仍引用 self.camera（实际由 env 持有/关闭）。
+        self.camera = self.env.camera
+
+        # left_arm_ee_image policy inference（使用注入的 env，不再自建）
+        self.inference = InferenceController(self.env, self.robot_info)
 
         # VR 串流：把 camera_images 合成的画面通过 DummyServer 推给客户端
         self.dummy_server = DummyServer(
@@ -122,12 +136,8 @@ class RobotControlGUI(
         self.vr_execution_thread = None
         self.is_vr_control: bool = False
 
-        # auto inference
-        self.actions = []
-        self.is_auto_inference: bool = False
+        # auto inference (thread/state now owned by self.inference)
         self.is_grabbing_target: bool = False
-        self.inference_thread = None
-        self.execution_thread = None
 
         # MONEY
         self.coordinates_3d = (0, 0, 0)
@@ -182,7 +192,8 @@ class RobotControlGUI(
         }
 
         self.setup_ui()
-        self.start_inference_data_collection_thread()
+        self.env.start()           # 启动相机采集 + 执行线程（GUI 持有 env 生命周期）
+        self.inference.start()
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()
@@ -249,7 +260,8 @@ class RobotControlGUI(
         for label, fn in [
             ("Motion Planning TCP", self.stop_motion_planning),
             ("VR 串流服务器", self.dummy_server.stop),
-            ("相机", self.camera.close),
+            ("推理控制器", self.inference.stop),
+            ("HumanoidEnv", self.env.stop),   # 先停采集/执行线程，再关其持有的相机
             ("机器人", self.robot.shutdown),
             ("ROS 节点", self.wheel_controller.destroy_node),
             ("rclpy", rclpy.shutdown),

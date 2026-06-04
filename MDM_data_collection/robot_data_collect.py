@@ -114,8 +114,7 @@ class RobotDataCollector:
             with self._rec_lock:
                 if self._is_recording and self._rec is not None and left_status is not None:
                     self._record_tick(t, left_status, right_status, snapshot)
-
-            # --- Pace to RECORD_HZ ---
+                    
             # Use Event.wait so shutdown() wakes us immediately.
             next_tick += self._interval
             sleep_for  = next_tick - time.monotonic()

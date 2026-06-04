@@ -9,7 +9,7 @@ class CoordinateMixin:
     def pixel_to_3d_coordinate(self, camera_name, pixel_x, pixel_y, depth_value):
         """将像素坐标和深度值转换为3D空间坐标"""
         try:
-            # 获取相机内参
+            # 获取相机内参（当前读兼容镜像；未来切到 env：intrinsics = self.env.get_intrinsics(camera_name)）
             intrinsics = self.camera_intrinsics.get(camera_name)
             if not intrinsics:
                 print(f"无法获取 {camera_name} 的相机内参")
@@ -159,6 +159,7 @@ class CoordinateMixin:
 
                     world_coords = self.transformer.pixel_to_world(
                         pixel_x, pixel_y, depth_value,
+                        # 未来切到 env：self.env.get_intrinsics(camera_name)
                         self.camera_intrinsics[camera_name],
                         joint_angles
                     )

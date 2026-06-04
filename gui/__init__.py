@@ -10,7 +10,6 @@ from gui.camera_panel import CameraMixin
 from gui.status_panel import StatusMixin
 from gui.coordinates import CoordinateMixin
 from gui.pick_place import PickPlaceMixin
-from gui.inference import InferenceMixin
 from gui.manual_control import ManualControlMixin
 from gui.vr_control import VRMixin
 from gui.motion_planning import MotionPlanningMixin
@@ -21,7 +20,6 @@ __all__ = [
     "StatusMixin",
     "CoordinateMixin",
     "PickPlaceMixin",
-    "InferenceMixin",
     "ManualControlMixin",
     "VRMixin",
     "MotionPlanningMixin",

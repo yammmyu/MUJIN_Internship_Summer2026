@@ -18,9 +18,12 @@ class CameraMixin:
         camera_frame = ttk.LabelFrame(parent, text="  📷  相机视图  ")
         camera_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 可显示的相机及其中文名（须为 Camera() 初始化时声明的相机）
+        # 可显示的相机及其中文名（须为 env 构造 Camera() 时声明的相机；
+        # data 模式下只有 3 路，深度/鱼眼不可用，故按 env.cameras 过滤）
         self.available_cameras = [
-            "head", "head_depth", "hand_left", "hand_right", "head_center_fisheye"]
+            name for name in
+            ["head", "head_depth", "hand_left", "hand_right", "head_center_fisheye"]
+            if name in self.env.cameras]
         self.camera_titles = {
             "head": "头部相机",
             "head_depth": "深度相机",
@@ -42,7 +45,8 @@ class CameraMixin:
         self.target_camera_var = tk.StringVar(value="head")
         camera_combo = ttk.Combobox(
             toolbar, textvariable=self.target_camera_var,
-            values=["head", "head_depth", "hand_left", "hand_right"],
+            values=[n for n in ["head", "head_depth", "hand_left", "hand_right"]
+                    if n in self.available_cameras],
             state="readonly", width=14)
         camera_combo.pack(side=tk.LEFT)
         camera_combo.bind('<<ComboboxSelected>>', self.on_camera_selection_change)
@@ -160,60 +164,38 @@ class CameraMixin:
         # 重新应用鼠标样式
         self.toggle_rgbd_mode()
 
+    def _selected_display_cameras(self):
+        """当前勾选要显示的相机（按 available_cameras 固定顺序）。"""
+        return [name for name in self.available_cameras
+                if self.camera_display_vars[name].get()]
+
     def start_camera_thread(self):
-        """启动相机图像更新线程"""
+        """启动相机显示线程：纯消费者。
+
+        唯一抓取者是 self.env（按需开关、统一 RECORD_HZ 抓取）。本线程对每个勾选
+        的相机调用 env.get_frame(name)（即「请求」该相机，使其保活并返回最新帧），
+        渲染到界面，并把帧/内参镜像回 self.camera_images / self.camera_intrinsics，
+        供尚未切换到 env 的消费者（VR/坐标/运动规划）继续读取。
+        """
         def update_camera_images():
             while True:
                 try:
-                    # 获取各个相机的最新图像和内参
-                    # 用快照遍历，避免显示区重建时（主线程改键）触发字典迭代错误
-                    for camera_name in list(self.camera_images.keys()):
-                        # 相机可能在遍历期间被取消勾选而移除
-                        if camera_name not in self.camera_images:
-                            continue
-                        image, timestamp = self.camera.get_latest_image(camera_name)
+                    for camera_name in self._selected_display_cameras():
+                        # 向 env 请求该相机（保活）并取最新帧；首帧或刚开机时可能为 None
+                        image = self.env.get_frame(camera_name)
                         if image is not None:
-                            # print(f"获取到 {camera_name} 相机图像，图像 shape: {image.shape}")
-                            if len(image.shape)== 3:
-                                height, width = image.shape[:2]
+                            # 镜像最近两帧（list 结构），供 VR / 保存图片 / 3D 点击消费
+                            prev = self.camera_images.get(camera_name)
+                            if isinstance(prev, list) and len(prev) == 2:
+                                self.camera_images[camera_name] = [prev[-1], image.copy()]
                             else:
-                                height, width = image.shape[0]
-                            # print(f"获取到 {camera_name} 相机图像，图像 height, width: {height} {width}")
-                            # 缓存最近两帧（与 hand_left 一致的 list 结构），
-                            # 供推理 / VR 串流 / 保存图片 / 3D 点击等统一消费。
-                            # 推理线程独占的相机（如 hand_left）不在此重复缓存，
-                            # 避免覆盖其与关节时间戳精确配对的帧。
-                            if (camera_name in self.camera_images
-                                    and camera_name not in self.inference_managed_cameras):
-                                prev = self.camera_images[camera_name]
-                                if isinstance(prev, list) and len(prev) == 2:
-                                    self.camera_images[camera_name] = [prev[-1], image.copy()]
-                                else:
-                                    self.camera_images[camera_name] = [image.copy(), image.copy()]
+                                self.camera_images[camera_name] = [image.copy(), image.copy()]
 
                             self.update_camera_display(camera_name, image)
 
-                        # 获取相机内参（只需获取一次）
+                        # 内参镜像（env 懒加载并缓存，这里取一次填入兼容字典）
                         if self.camera_intrinsics.get(camera_name) is None:
-                            try:
-                                # 尝试获取相机信息 - 根据SDK文档，CosineCamera可能有不同的接口
-                                camera_info = None
-                                if hasattr(self.camera, 'get_camera_info'):
-                                    camera_info = self.camera.get_camera_info(camera_name)
-                                elif hasattr(self.camera, 'get_intrinsics'):
-                                    camera_info = self.camera.get_intrinsics(camera_name)
-
-                                if camera_info:
-                                    self.camera_intrinsics[camera_name] = camera_info
-                                    print(f"获取到 {camera_name} 相机内参")
-                                else:
-                                    # 如果无法获取内参，使用默认参数
-                                    self.camera_intrinsics[camera_name] = self.get_default_camera_intrinsics(camera_name)
-                                    print(f"使用默认内参 for {camera_name}")
-                            except Exception as info_e:
-                                # 如果无法获取内参，使用默认参数
-                                self.camera_intrinsics[camera_name] = self.get_default_camera_intrinsics(camera_name)
-                                print(f"使用默认内参 for {camera_name}: {info_e}")
+                            self.camera_intrinsics[camera_name] = self.env.get_intrinsics(camera_name)
 
                     time.sleep(0.033)  # ~30 Hz, matches recording rate
                 except Exception as e:
@@ -404,6 +386,8 @@ class CameraMixin:
         camera_images 内所有相机统一为「最近两帧」的 list 结构，
         此处返回最新一帧（list[-1]）；兼容历史的单帧 ndarray。
         """
+        # 未来切换到 env 单一数据源（按需开关相机）时改为：
+        # return self.env.get_frame(camera_name)
         entry = self.camera_images.get(camera_name)
         if isinstance(entry, (list, tuple)):
             return entry[-1] if entry else None

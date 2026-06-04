@@ -232,9 +232,21 @@ class MotionPlanningMixin:
 
     def _mp_handle_detection_trigger(self, obj):
         req_id = obj.get("request_id")
+        # 当前：从兼容镜像读取（仅当 head/head_depth 正被显示时才有帧）。
         rgb = self._latest_camera_frame("head")
         depth = self._latest_camera_frame("head_depth")
         intr = self.camera_intrinsics.get("head") or {}
+        # 未来切到 env 的按需开关：detection 是 on-demand，相机可能已被空闲回收，
+        # 故需先 request 再轮询等待首帧就绪（约 1s 超时）：
+        # self.env.request("head"); self.env.request("head_depth")
+        # deadline = time.monotonic() + 1.0
+        # while time.monotonic() < deadline:
+        #     rgb = self.env.get_frame("head")
+        #     depth = self.env.get_frame("head_depth")
+        #     if rgb is not None and depth is not None:
+        #         break
+        #     time.sleep(0.02)
+        # intr = self.env.get_intrinsics("head") or {}
         rgb_intrinsics = None
         if intr:
             rgb_intrinsics = {
