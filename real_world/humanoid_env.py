@@ -166,14 +166,21 @@ class HumanoidEnv:
         Idempotent and cheap — consumers call this every loop tick to keep a
         camera alive. Names outside the SDK's constructed set are ignored.
         """
+        print(f"processing request for camera {name}")
+
         if name not in self.cameras:
             print(f"[HumanoidEnv] camera name not recognized: {name}")
             return
         with self._lock:
             self._last_requested[name] = time.monotonic()
             if name not in self._active:        # log only on the OFF->ON transition
-                print(f"[HumanoidEnv] camera requested ON: {name}")
-            self._active.add(name)
+                print(f"[HumanoidEnv] activated camera: {name}")
+                self._active.add(name)
+            else:
+                print(f"[HumanoidEnv] camera: {name} is already active")
+                print(f"current active cameras: {self.active_cameras}")
+
+
 
     def get_frames(self, name):
         """request(name) + return a copy of the rolling [prev, cur] pair, or None.
@@ -387,6 +394,7 @@ class HumanoidEnv:
             timestamp:  float (seconds)
         """
         # Keep the two policy cameras warm while inference polls get_obs().
+        print("requesting hand and head camera")
         self.request(AGENT_CAMERA)
         self.request(HAND_CAMERA)
         with self._lock:
