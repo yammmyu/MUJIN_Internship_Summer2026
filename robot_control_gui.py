@@ -63,7 +63,7 @@ class RobotControlGUI(
         if camera_mode == "data":
             camera_names = ["hand_left", "hand_right", "head"]
         else:
-            camera_names = ["hand_left", "hand_right", "head", "head_depth", "head_center_fisheye"]
+            camera_names = []
         self.camera_mode = camera_mode
 
         # Slam
@@ -103,17 +103,15 @@ class RobotControlGUI(
         self.robot_info = RobotInfo()
         create_robot_info_http_server(self.robot_info)
 
-        # HumanoidEnv：相机的唯一持有者与抓取者（按需开关、RECORD_HZ 抓取、空闲自动关闭）。
-        # camera=None -> env 自行构造并持有 Camera(camera_names)；robot/controller 仍由 GUI 共享。
+        # HumanoidEnv：相机的唯一持有者与抓取者。每路相机一个 CosineCamera，按需订阅、
+        # RECORD_HZ 抓取、空闲自动退订（关流）。cameras= 为「常开」相机（数据采集模式用），
+        # GUI 普通模式传 [] -> 启动时不订阅任何相机、无视频流带宽。robot/controller 仍共享。
         self.env = HumanoidEnv(
             robot=self.robot,
             robot_controller=self.robot_controller,
-            camera=None,
             cameras=camera_names,
             frequency=RECORD_HZ,
         )
-        # 兼容别名：少数遗留代码仍引用 self.camera（实际由 env 持有/关闭）。
-        self.camera = self.env.camera
 
         # left_arm_ee_image policy inference（使用注入的 env，不再自建）
         self.inference = InferenceController(self.env, self.robot_info)

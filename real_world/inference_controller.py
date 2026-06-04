@@ -156,7 +156,7 @@ class InferenceController:
         if env is None:
             return False
         deadline = time.monotonic() + 0.3
-        while not env.is_ready and time.monotonic() < deadline:
+        while not env.inf_ready and time.monotonic() < deadline:
             env.get_obs()           # requests head+hand_left, warming them
             time.sleep(0.02)
         return self._run_inference(submit=False)

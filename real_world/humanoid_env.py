@@ -34,6 +34,13 @@ AGENT_CAMERA = "head"        # -> agentview_image
 HAND_CAMERA = "hand_left"    # -> robot0_eye_in_hand_image
 INFERENCE_CAMERAS = [AGENT_CAMERA, HAND_CAMERA]
 
+# Every camera name the SDK knows about. A camera is only SUBSCRIBED (i.e. costs
+# DDS bandwidth) while we hold a live CosineCamera object for it — see the
+# per-camera dynamic subscription in HumanoidEnv. This list is just the set of
+# names a consumer is allowed to request.
+KNOWN_CAMERAS = ["head", "head_depth", "hand_left", "hand_right", "head_center_fisheye"] 
+# Tho more camera angles exist, limited to these for simplisity
+
 
 # Fallback intrinsics when the SDK can't supply them (ported from
 # gui/camera_panel.py:get_default_camera_intrinsics so the env owns intrinsics).
@@ -95,27 +102,29 @@ class HumanoidEnv:
     """Owns SDK resources + the collection/execution threads for live inference."""
 
     def __init__(self,
-                 robot=None, robot_controller=None, camera=None,
-                 cameras=INFERENCE_CAMERAS,
+                 robot=None, robot_controller=None,
+                 cameras=(),
+                 allowed_cameras=KNOWN_CAMERAS,
                  frequency=RECORD_HZ,
                  pos_alpha=0.5,
                  command_lifetime=2.0,
                  idle_timeout=CAMERA_IDLE_TIMEOUT):
-        # Reuse injected SDK handles if given (e.g. the GUI already holds them),
-        # otherwise create our own — same construction as RobotDataCollector.
-        # We only tear down resources we created; injected handles are the
-        # caller's to manage (the GUI shares them across panels).
+        # Robot/controller may be injected (the GUI shares them across panels);
+        # we only tear down what we created. Cameras are NOT injected — the env is
+        # the sole owner of camera subscriptions and manages one CosineCamera per
+        # camera dynamically (see _reconcile_cameras), so nothing streams until a
+        # consumer request()s it.
         self._owns_robot = robot is None
-        self._owns_camera = camera is None
         self.robot = robot if robot is not None else Robot()
         self.robot_controller = robot_controller if robot_controller is not None else RobotController()
-        self.camera = camera if camera is not None else Camera(list(cameras))
-        if self._owns_robot or self._owns_camera:
-            time.sleep(1.0)  # let freshly-created DDS / camera resources come up
+        if self._owns_robot:
+            time.sleep(1.0)  # let freshly-created DDS resources come up
 
-        # Superset of names the SDK Camera was built with (what can be fetched).
-        # NOT the active set — cameras are switched ON on demand (see request()).
-        self.cameras = list(cameras)
+        # Names a consumer is allowed to request (validation only — not subscribed).
+        self.cameras = list(allowed_cameras)
+        # "Pinned" cameras stay ON for the env's whole life (never idle-evicted),
+        # e.g. data-collection cameras. Empty for the GUI -> nothing on at launch.
+        self._pinned = set(cameras)
         self.dt = 1.0 / frequency
         self.pos_alpha = pos_alpha          # position low-pass (1.0 = no smoothing)
         self.command_lifetime = command_lifetime
@@ -123,10 +132,12 @@ class HumanoidEnv:
 
         # ---- shared state (replaces robot_info.lock + scattered GUI buffers) ----
         self._lock = threading.Lock()
-        # Per-camera on/off switch: a camera is fetched only while ACTIVE; it goes
-        # active when a consumer request()s it and is evicted after idle_timeout.
-        self._active = set()                                   # cameras currently ON
+        # Per-camera on/off switch: a camera is SUBSCRIBED (live CosineCamera object
+        # in self._cams -> costs bandwidth) only while ACTIVE. It goes active when a
+        # consumer request()s it, and is evicted (object closed) after idle_timeout.
+        self._active = set()                                   # cameras requested recently
         self._last_requested = {}                              # name -> time.monotonic()
+        self._cams = {}                                        # name -> CosineCamera([name]) (live subscription)
         self._frames = {}                                      # name -> rolling [prev, cur]
         self._intrinsics = {}                                  # name -> intrinsics dict (lazy)
         self._last_two_ee_states = None                        # [s_{t-1}, s_t]
@@ -141,7 +152,7 @@ class HumanoidEnv:
 
     # ===================== lifecycle (RealEnv.start/stop/__enter__) =====================
     @property
-    def is_ready(self):
+    def inf_ready(self):
         """Ready for inference once the two policy cameras + EE state are populated."""
         with self._lock:
             frames_ready = all(
@@ -156,9 +167,12 @@ class HumanoidEnv:
         camera alive. Names outside the SDK's constructed set are ignored.
         """
         if name not in self.cameras:
+            print(f"[HumanoidEnv] camera name not recognized: {name}")
             return
         with self._lock:
             self._last_requested[name] = time.monotonic()
+            if name not in self._active:        # log only on the OFF->ON transition
+                print(f"[HumanoidEnv] camera requested ON: {name}")
             self._active.add(name)
 
     def get_frames(self, name):
@@ -177,24 +191,40 @@ class HumanoidEnv:
         pair = self.get_frames(name)
         return pair[-1] if pair else None
 
+    def active_cameras(self):
+        """Names currently SUBSCRIBED (a live CosineCamera object exists -> streaming).
+
+        This is what the GUI's live indicator shows: every camera the humanoid env
+        is actually pulling from the robot right now (display ticks + inference + pinned).
+        """
+        with self._lock:
+            return sorted(self._cams.keys())
+
     def get_intrinsics(self, name):
-        """Camera intrinsics, fetched once from the SDK then cached (env-owned)."""
+        """Camera intrinsics, fetched once from the live SDK object then cached.
+
+        Falls back to defaults when the camera isn't currently subscribed (intrinsics
+        are static, so a sensible default is fine while the camera is OFF).
+        """
         with self._lock:
             cached = self._intrinsics.get(name)
+            cam = self._cams.get(name)
         if cached is not None:
             return cached
-        # SDK call done outside the lock (it may block).
         info = None
-        try:
-            if hasattr(self.camera, 'get_camera_info'):
-                info = self.camera.get_camera_info(name)
-            elif hasattr(self.camera, 'get_intrinsics'):
-                info = self.camera.get_intrinsics(name)
-        except Exception as e:
-            print(f"[HumanoidEnv.get_intrinsics] {name}: {e}")
-            info = None
+        if cam is not None:                     # only query a live subscription
+            try:
+                if hasattr(cam, 'get_camera_info'):
+                    info = cam.get_camera_info(name)
+                elif hasattr(cam, 'get_intrinsics'):
+                    info = cam.get_intrinsics(name)
+            except Exception as e:
+                print(f"[HumanoidEnv.get_intrinsics] {name}: {e}")
+                info = None
         if not info:
             info = _default_camera_intrinsics(name)
+            # don't cache the default — let a real value replace it once the camera is on
+            return info
         with self._lock:
             self._intrinsics[name] = info
         return info
@@ -220,17 +250,51 @@ class HumanoidEnv:
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
         self._collect_thread = self._exec_thread = None
-        # Only close resources we created; injected handles belong to the caller.
-        if self._owns_camera:
+        # Close every live camera subscription (env owns all of them).
+        for name, cam in list(self._cams.items()):
             try:
-                self.camera.close()
+                cam.close()
             except Exception as e:
-                print(f"[HumanoidEnv.stop] camera.close: {e}")
+                print(f"[HumanoidEnv.stop] camera.close({name}): {e}")
+        self._cams.clear()
         if self._owns_robot:
             try:
                 self.robot.shutdown()
             except Exception as e:
                 print(f"[HumanoidEnv.stop] robot.shutdown: {e}")
+
+    # ===================== per-camera dynamic subscription =====================
+    def _reconcile_cameras(self, desired):
+        """Make the set of live CosineCamera objects match `desired`.
+
+        Opens a dedicated CosineCamera([name]) for each newly-wanted camera (this
+        is the actual DDS subscription that costs bandwidth) and closes the object
+        for any camera no longer wanted (stopping its stream). Using one object per
+        camera means toggling one camera never disturbs the others' streams.
+
+        Runs only in the collect thread, so self._cams has a single mutator; reads
+        of self._cams elsewhere take self._lock.
+        """
+        current = set(self._cams.keys())
+        for name in current - desired:
+            cam = self._cams.pop(name)
+            try:
+                cam.close()
+            except Exception as e:
+                print(f"[HumanoidEnv] camera.close({name}) failed: {e}")
+            with self._lock:
+                self._frames.pop(name, None)        # no stale frame on re-activation
+                self._intrinsics.pop(name, None)
+            print(f"[HumanoidEnv] camera unsubscribed (OFF): {name}")
+        for name in desired - current:
+            try:
+                cam = Camera([name])                # <-- the per-camera DDS subscription
+            except Exception as e:
+                print(f"[HumanoidEnv] camera open({name}) failed: {e}")
+                continue
+            with self._lock:
+                self._cams[name] = cam
+            print(f"[HumanoidEnv] camera subscribed (ON): {name}")
 
     # ===================== producer: collection loop =====================
     # Pacing + SDK reads copied from RobotDataCollector._stream_loop.
@@ -239,17 +303,19 @@ class HumanoidEnv:
         while not self._stop_event.is_set():
             now = time.time()
 
-            # Evict cameras idle longer than the timeout, then snapshot the active
-            # set so each ON camera is fetched exactly once this tick.
+            # Evict cameras idle longer than the timeout (pinned never evict), then
+            # the desired subscription set = recently-requested + pinned.
             now_mono = time.monotonic()
             with self._lock:
                 stale = [n for n, t in self._last_requested.items()
-                         if now_mono - t > self.idle_timeout]
+                         if now_mono - t > self.idle_timeout and n not in self._pinned]
                 for n in stale:
                     self._active.discard(n)
                     self._last_requested.pop(n, None)
-                    self._frames.pop(n, None)   # clear so re-activation never serves a stale frame
-                active = set(self._active)
+                desired = set(self._active) | self._pinned
+
+            # Open/close CosineCamera objects to match desired (controls bandwidth).
+            self._reconcile_cameras(desired)
 
             try:
                 ee_state = self._read_left_ee_state()
@@ -257,7 +323,7 @@ class HumanoidEnv:
                 print(f"  [collect] get_motion_status failed: {e}")
                 ee_state = None
 
-            frames = self._read_frames(active)
+            frames = self._read_frames(desired)
 
             with self._lock:
                 self._obs_timestamp = now
@@ -292,14 +358,18 @@ class HumanoidEnv:
         ]
 
     def _read_frames(self, active):
-        """Latest frame per ACTIVE camera, kept as a rolling [prev, cur] pair.
+        """Latest frame per live camera, kept as a rolling [prev, cur] pair.
 
-        camera.get_latest_image returns (image, timestamp); the first frame is
-        None (SDK note 9.6), so we skip until a real frame arrives.
+        Each camera has its own CosineCamera object; get_latest_image returns
+        (image, timestamp) and the first frame is None (SDK note 9.6), so we skip
+        until a real frame arrives.
         """
         out = {}
         for name in active:
-            image, _ = self.camera.get_latest_image(name)
+            cam = self._cams.get(name)
+            if cam is None:                 # just requested; object opens next tick
+                continue
+            image, _ = cam.get_latest_image(name)
             if image is None:
                 continue
             prev = self._frames.get(name)

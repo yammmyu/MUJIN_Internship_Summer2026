@@ -57,12 +57,13 @@ class CameraMixin:
                    ).pack(side=tk.RIGHT)
 
         # ---- 相机勾选条：选择要显示的相机 ----
+        # 默认全部不勾选：启动时不请求任何相机，env 不订阅，无视频流带宽。
+        # 勾选某相机后，显示线程才会向 env 请求该相机（env 随即订阅/开流）。
         select_bar = ttk.Frame(camera_frame)
         select_bar.pack(fill=tk.X, padx=10, pady=(0, 6))
         ttk.Label(select_bar, text="显示相机:").pack(side=tk.LEFT, padx=(0, 4))
-        # 默认显示当前缓存中已有的相机（head / head_depth）
         self.camera_display_vars = {
-            name: tk.BooleanVar(value=name in self.camera_images)
+            name: tk.BooleanVar(value=False)
             for name in self.available_cameras
         }
         for name in self.available_cameras:
@@ -70,6 +71,19 @@ class CameraMixin:
                 select_bar, text=self.camera_titles[name],
                 variable=self.camera_display_vars[name],
                 command=self._rebuild_camera_display).pack(side=tk.LEFT, padx=4)
+
+        # ---- 实时「已激活相机」指示条：显示 env 当前正在订阅/抓取的所有相机 ----
+        # （含显示勾选、推理触发、常开相机），与上面的勾选框相互独立。
+        active_bar = ttk.Frame(camera_frame)
+        active_bar.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ttk.Label(active_bar, text="已激活相机:").pack(side=tk.LEFT, padx=(0, 4))
+        self.camera_active_labels = {}
+        for name in self.available_cameras:
+            lbl = tk.Label(active_bar, text=f"● {self.camera_titles[name]}",
+                           fg="#9aa0a6", font=("", 9))   # 灰色=关闭
+            lbl.pack(side=tk.LEFT, padx=4)
+            self.camera_active_labels[name] = lbl
+        self._refresh_active_camera_indicator()
 
         # ---- 相机显示区（动态网格） ----
         self.camera_labels = {}
@@ -168,6 +182,21 @@ class CameraMixin:
         """当前勾选要显示的相机（按 available_cameras 固定顺序）。"""
         return [name for name in self.available_cameras
                 if self.camera_display_vars[name].get()]
+
+    def _refresh_active_camera_indicator(self):
+        """周期性刷新「已激活相机」指示条：绿色=env 正在订阅/抓取，灰色=关闭。
+
+        反映 humanoid env 的真实订阅状态（显示勾选 + 推理触发 + 常开），每 0.5s 刷新。
+        """
+        try:
+            active = set(self.env.active_cameras())
+            for name, lbl in self.camera_active_labels.items():
+                on = name in active
+                lbl.config(fg="#16a34a" if on else "#9aa0a6")   # 绿 / 灰
+        except Exception:
+            pass
+        # 复用 Tk 主循环定时器，无需额外线程
+        self.root.after(500, self._refresh_active_camera_indicator)
 
     def start_camera_thread(self):
         """启动相机显示线程：纯消费者。
