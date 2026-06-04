@@ -41,7 +41,7 @@ def encode_image(rgb_image):
 
 def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict:
     """POST an obs dict to the policy server's /predict and return the JSON reply."""
-    print(f"inference request sent. Details:{req}")
+    print(f"inference request sent")
     body = json.dumps(req).encode('utf-8')
     print(f"POST http://{host}:{port}/predict ({len(body)} bytes, timeout={timeout}s)")
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -100,7 +100,7 @@ class InferenceController:
         """Prepare for inference. The injected env's threads are started by the
         caller (the GUI starts env before this), so we only reset our cursor."""
         self._last_inference_obs_ts = 0.0
-        print("InferenceController ready (env owned by caller).")
+        print("[InferenceController] InferenceController ready (env owned by caller).")
 
     def stop(self):
         """Stop auto inference. Does NOT tear down the env (caller owns it)."""
@@ -116,10 +116,10 @@ class InferenceController:
         Returns True if a fresh inference was produced.
         """
 
-        print(f"running inference sumbit={submit}")
+        print(f"[InferenceController] running inference sumbit={submit}")
         env = self.humanoid_env
         if env is None:
-            print("humanoid_env not accessible")
+            print("[InferenceController] humanoid_env not accessible")
             return False
 
         obs = env.get_obs()
@@ -129,7 +129,7 @@ class InferenceController:
         # wall-clock timestamp with every snapshot).
         ts = obs['timestamp']
         if ts - self._last_inference_obs_ts < 1e-4:
-            print("timestamp has not advanced")
+            print("[InferenceController] timestamp has not advanced")
             return False
 
         req = {
@@ -141,12 +141,12 @@ class InferenceController:
         resp = post_predict(self.host, self.port, req, timeout=10)
 
         if 'error' in resp:
-            print(f'\nServer error: {resp["error"]}')
+            print(f'[InferenceController] \nServer error: {resp["error"]}')
             return False
 
         # action rows: [eef_pos(3), 6D_rot(6), gripper(1)]
         action = np.asarray(resp['action'], dtype=np.float32)
-        print(f"response recieved! Details:{action}")
+        print(f"[InferenceController] response recieved! Details:{action}")
         self._last_inference_obs_ts = ts
 
         # Publish for robot_info_server / visualisation. left_*_predict_* carry
@@ -171,7 +171,7 @@ class InferenceController:
         """
         env = self.humanoid_env
         if env is None:
-            print("humanoid_env not accessible")
+            print("[InferenceController] humanoid_env not accessible")
             return False
         deadline = time.monotonic() + 0.3
         while not env.inf_ready and time.monotonic() < deadline:
@@ -203,7 +203,7 @@ class InferenceController:
         if stop:
             self.is_auto_inference = False
             if self.inference_thread is not None:
-                print("Stopping auto_inference thread...")
+                print("[InferenceController] Stopping auto_inference thread...")
                 self.inference_thread.join()
                 self.inference_thread = None
             # Stop feeding the robot: drop any queued actions in the env.
@@ -222,5 +222,5 @@ class InferenceController:
 
         if self.inference_thread is None:
             self.inference_thread = threading.Thread(target=_run_auto_inference, daemon=True)
-            print("Starting auto_inference thread...")
+            print("[InferenceController] Starting auto_inference thread...")
             self.inference_thread.start()

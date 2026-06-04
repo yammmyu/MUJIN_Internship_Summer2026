@@ -27,7 +27,7 @@ from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotContro
 RECORD_HZ = 30
 
 # A camera auto-switches OFF if no consumer has requested it within this window.
-CAMERA_IDLE_TIMEOUT = 2.0
+CAMERA_IDLE_TIMEOUT = 5.0
 
 # Camera roles for the left_arm_ee_image policy obs.
 AGENT_CAMERA = "head"        # -> agentview_image
@@ -181,7 +181,6 @@ class HumanoidEnv:
                 print(f"current active cameras: {self.active_cameras}")
 
 
-
     def get_frames(self, name):
         """request(name) + return a copy of the rolling [prev, cur] pair, or None.
 
@@ -226,7 +225,7 @@ class HumanoidEnv:
                 elif hasattr(cam, 'get_intrinsics'):
                     info = cam.get_intrinsics(name)
             except Exception as e:
-                print(f"[HumanoidEnv.get_intrinsics] {name}: {e}")
+                print(f"[HumanoidEnv] [HumanoidEnv.get_intrinsics] {name}: {e}")
                 info = None
         if not info:
             info = _default_camera_intrinsics(name)
@@ -249,7 +248,7 @@ class HumanoidEnv:
         self._exec_thread = threading.Thread(target=self._exec_loop, daemon=True)
         self._collect_thread.start()
         self._exec_thread.start()
-        print("HumanoidEnv: collection + execution threads started.")
+        print("[HumanoidEnv]: collection + execution threads started.")
 
     def stop(self):
         self._stop_event.set()
@@ -327,7 +326,7 @@ class HumanoidEnv:
             try:
                 ee_state = self._read_left_ee_state()
             except Exception as e:
-                print(f"  [collect] get_motion_status failed: {e}")
+                print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
                 ee_state = None
 
             frames = self._read_frames(desired)
@@ -394,13 +393,15 @@ class HumanoidEnv:
             timestamp:  float (seconds)
         """
         # Keep the two policy cameras warm while inference polls get_obs().
-        print("requesting hand and head camera")
+        print("[HumanoidEnv] requesting hand and head camera")
         self.request(AGENT_CAMERA)
         self.request(HAND_CAMERA)
         with self._lock:
             if self._last_two_ee_states is None:
+                print("[HumanoidEnv] Waiting for EE states")
                 return None
             if any(self._frames.get(n) is None for n in (AGENT_CAMERA, HAND_CAMERA)):
+                print("[HumanoidEnv] Wait for Camera")
                 return None
             return {
                 'agent_imgs': copy.deepcopy(self._frames[AGENT_CAMERA]),
@@ -425,8 +426,10 @@ class HumanoidEnv:
                 action = self._action_queue.pop(0) if self._action_queue else None
             if action is None:
                 self._stop_event.wait(self.dt)
-                continue
-
+                print("[HumanoidEnv] no new action received, skipping...")
+                continue #if no information: skip rest and restart loop
+            
+            print(f"[HumanoidEnv] new action recieved {action}")
             pos, quat, grip = self._decode_ee_action(action)
             pos = np.asarray(pos, dtype=np.float64)
             if self._smoothed_pos is None:
