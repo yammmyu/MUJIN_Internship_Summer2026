@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from MDM_data_collection.robot_data_collect import RobotDataCollector, CAMERA_NAMES
+from real_world.humanoid_env import HumanoidEnv, RECORD_CAMERAS as CAMERA_NAMES
 
 _CAMERA_TITLES = {
     "hand_left":  "左手相机",
@@ -88,7 +88,10 @@ class DataCollectionGUI:
 
         _apply_styles(root)
 
-        self.collector = RobotDataCollector(output_dir="recordings")
+        # HumanoidEnv is the single SDK owner; collect-only (no exec thread) for
+        # data collection. Pin the record cameras so previews + recording stay live.
+        self.collector = HumanoidEnv(cameras=CAMERA_NAMES, output_dir="recordings")
+        self.collector.start(run_exec=False)
 
         # Recording state
         self._is_recording = False
@@ -330,7 +333,7 @@ class DataCollectionGUI:
         self._btn_start.config(state=tk.DISABLED)
         self._btn_stop.config(state=tk.NORMAL)
         self._post_stop_frame.pack_forget()
-        self.collector.start(episode_name=name)
+        self.collector.start_recording(episode_name=name)
         self._show_status(f"开始录制: {name}")
 
     def recording_stop(self) -> None:
@@ -344,7 +347,7 @@ class DataCollectionGUI:
         threading.Thread(target=self._flush_and_prompt, daemon=True).start()
 
     def _flush_and_prompt(self) -> None:
-        self.collector.stop()
+        self.collector.stop_recording()
         self.root.after(0, self._show_post_stop)
 
     def _show_post_stop(self) -> None:
@@ -393,7 +396,7 @@ class DataCollectionGUI:
             while True:
                 try:
                     for name in CAMERA_NAMES:
-                        frame = self.collector.get_latest_frame(name)
+                        frame = self.collector.get_frame(name)
                         if frame is not None and name in self.camera_labels:
                             self._push_camera_frame(name, frame)
                     time.sleep(0.033)
@@ -488,7 +491,7 @@ class DataCollectionGUI:
         # os._exit after 5 s even if an SDK call hangs.
         def _do_shutdown():
             try:
-                self.collector.shutdown()
+                self.collector.stop()
             except Exception as e:
                 print(f"关闭数据采集器出错: {e}")
 

@@ -60,6 +60,29 @@ def se3_to_pos_quat_xyzw(M: pin.SE3):
     return pos, np.asarray(quat.coeffs(), dtype=np.float64)   # coeffs() is (x, y, z, w)
 
 
+def rot6d_to_quat(rot6d):
+    """6D rotation (first two rotation-matrix columns) -> quaternion [x, y, z, w].
+
+    Identical math to build_left_arm_ee_replay_buffer / humanoid_env.rot6d_to_quat, kept
+    here so the sim runner can decode policy actions without importing the SDK-coupled
+    humanoid_env module.
+    """
+    rot6d = np.asarray(rot6d, dtype=np.float64)
+    c1, c2 = rot6d[:3], rot6d[3:6]
+    c1 = c1 / (np.linalg.norm(c1) + 1e-8)
+    c2 = c2 - np.dot(c2, c1) * c1
+    c2 = c2 / (np.linalg.norm(c2) + 1e-8)
+    c3 = np.cross(c1, c2)
+    m = np.stack([c1, c2, c3], axis=-1)
+    return np.asarray(se3_to_pos_quat_xyzw(pin.SE3(m, np.zeros(3)))[1], dtype=np.float64)
+
+
+def decode_action_row(row):
+    """Policy action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat_xyzw(4), grip)."""
+    row = np.asarray(row, dtype=np.float64)
+    return row[:3], rot6d_to_quat(row[3:9]), float(row[9])
+
+
 # --------------------------------------------------------------------------- #
 #  IK interface                                                               #
 # --------------------------------------------------------------------------- #
@@ -153,6 +176,8 @@ class PinocchioDLSIKSolver(IKSolver):
                  max_iters: int = 100,
                  tol: float = 1e-4,
                  step_scale: float = 1.0,
+                 max_step: float = 0.2,
+                 reach_pos_tol: float = 0.02,
                  single_step: bool = False,
                  clamp_to_limits: bool = True):
         self.m = model
@@ -160,8 +185,22 @@ class PinocchioDLSIKSolver(IKSolver):
         self.max_iters = max_iters
         self.tol = tol
         self.step_scale = step_scale
+        # Cap on the per-iteration joint step (rad, L2 over the 7 joints). Near a
+        # singular/ill-conditioned Jacobian the raw DLS step can be several radians,
+        # which overshoots, throws the config across joint space, and makes the loop
+        # diverge (we saw EE solutions land >1 m / ~360deg off target). Clamping the
+        # step turns Gauss-Newton into a safe damped descent. <=0 disables the cap.
+        self.max_step = max_step
+        # Position residual (m) above which the returned config is deemed to NOT reach
+        # the target (target outside the workspace / a local minimum). Callers should
+        # gate on `last_reachable` and skip such targets rather than command them.
+        self.reach_pos_tol = reach_pos_tol
         self.single_step = single_step
         self.clamp_to_limits = clamp_to_limits
+
+        # Diagnostics for the most recent solve() (set on every call):
+        self.last_pos_err = float("inf")   # position error (m) of the returned config
+        self.last_reachable = False        # last_pos_err <= reach_pos_tol
 
     def solve(self, q: IKQuery) -> np.ndarray:
         m = self.m
@@ -174,21 +213,40 @@ class PinocchioDLSIKSolver(IKSolver):
         damp2 = self.damping ** 2
         n_iters = 1 if self.single_step else self.max_iters
 
+        # Track the lowest-error config seen: the iterate can wobble near the optimum
+        # or, for an unreachable target, settle on the workspace boundary, so the last
+        # iterate is not necessarily the best one to return.
+        best_q = qj.copy()
+        best_err = np.inf
+
         for _ in range(n_iters):
             cfg = m._to_model_q(qj)
             pin.framesForwardKinematics(m.model, m.data, cfg)
             Mf = m.data.oMf[m.ee_fid]
             iMd = Mf.actInv(oMdes)
             err = pin.log6(iMd).vector
-            if np.linalg.norm(err) < self.tol:
+            err_norm = np.linalg.norm(err)
+            if err_norm < best_err:
+                best_err, best_q = err_norm, qj.copy()
+            if err_norm < self.tol:
                 break
             J = pin.computeFrameJacobian(m.model, m.data, cfg, m.ee_fid)  # LOCAL, 6x7
             J = -pin.Jlog6(iMd.inverse()) @ J
-            dq = -J.T @ np.linalg.solve(J @ J.T + damp2 * I6, err)
-            qj = pin.integrate(m.model, cfg, self.step_scale * dq)[m._qpos_index]
+            dq = self.step_scale * (-J.T @ np.linalg.solve(J @ J.T + damp2 * I6, err))
+            dq_norm = np.linalg.norm(dq)
+            if self.max_step > 0 and dq_norm > self.max_step:
+                dq *= self.max_step / dq_norm
+            qj = pin.integrate(m.model, cfg, dq)[m._qpos_index]
             if self.clamp_to_limits:
                 qj = np.clip(qj, m.lower, m.upper)
-        return qj
+        # single_step is delta/velocity control: return the one stepped config. The
+        # iterative solver returns the best config found (robust to wobble/divergence).
+        result = qj if self.single_step else best_q
+        # Report reachability so callers can skip out-of-workspace / unconverged targets.
+        self.last_pos_err = float(np.linalg.norm(
+            m.fk(result)[0] - np.asarray(q.target_pos, dtype=np.float64)))
+        self.last_reachable = self.last_pos_err <= self.reach_pos_tol
+        return result
 
 
 # --------------------------------------------------------------------------- #

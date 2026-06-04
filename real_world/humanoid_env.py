@@ -18,13 +18,22 @@ MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
 """
 
 import copy
+import json
+import pathlib
 import threading
 import time
+from datetime import datetime
 
+import cv2
 import numpy as np
 from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
 
 RECORD_HZ = 30
+
+# Cameras captured to disk during data collection (mirrors the old
+# RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
+# hand_left; hand_right is recorded for future use.
+RECORD_CAMERAS = ["hand_left", "hand_right", "head"]
 
 # A camera auto-switches OFF if no consumer has requested it within this window.
 CAMERA_IDLE_TIMEOUT = 5.0
@@ -108,7 +117,8 @@ class HumanoidEnv:
                  frequency=RECORD_HZ,
                  pos_alpha=0.5,
                  command_lifetime=2.0,
-                 idle_timeout=CAMERA_IDLE_TIMEOUT):
+                 idle_timeout=CAMERA_IDLE_TIMEOUT,
+                 output_dir="recordings"):
         # Robot/controller may be injected (the GUI shares them across panels);
         # we only tear down what we created. Cameras are NOT injected — the env is
         # the sole owner of camera subscriptions and manages one CosineCamera per
@@ -125,6 +135,8 @@ class HumanoidEnv:
         # "Pinned" cameras stay ON for the env's whole life (never idle-evicted),
         # e.g. data-collection cameras. Empty for the GUI -> nothing on at launch.
         self._pinned = set(cameras)
+        self.output_dir = pathlib.Path(output_dir)
+        self.record_hz = frequency
         self.dt = 1.0 / frequency
         self.pos_alpha = pos_alpha          # position low-pass (1.0 = no smoothing)
         self.command_lifetime = command_lifetime
@@ -143,12 +155,25 @@ class HumanoidEnv:
         self._last_two_ee_states = None                        # [s_{t-1}, s_t]
         self._obs_timestamp = 0.0
 
+        # Latest both-arm EE poses, refreshed every collect tick (for GUI display).
+        self._latest_left_pos = None       # (x, y, z)
+        self._latest_left_quat = None      # (qx, qy, qz, qw)
+        self._latest_right_pos = None
+        self._latest_right_quat = None
+
+        # Recording state — guarded by _rec_lock. _rec holds the in-progress
+        # recording session (None when not recording). Ported from RobotDataCollector.
+        self._rec_lock = threading.Lock()
+        self._rec = None
+        self._is_recording = False
+
         self._action_queue = []            # most recent predicted chunk, FIFO drained
         self._smoothed_pos = None
 
         self._stop_event = threading.Event()
         self._collect_thread = None
         self._exec_thread = None
+        self._run_exec = True
 
     # ===================== lifecycle (RealEnv.start/stop/__enter__) =====================
     @property
@@ -158,6 +183,24 @@ class HumanoidEnv:
             frames_ready = all(
                 self._frames.get(n) is not None for n in (AGENT_CAMERA, HAND_CAMERA))
             return frames_ready and self._last_two_ee_states is not None
+
+    # Latest both-arm EE poses for the data-collection GUI display. None until the
+    # collect loop has read at least one motion status.
+    @property
+    def latest_left_pos(self):
+        return self._latest_left_pos
+
+    @property
+    def latest_left_quat(self):
+        return self._latest_left_quat
+
+    @property
+    def latest_right_pos(self):
+        return self._latest_right_pos
+
+    @property
+    def latest_right_quat(self):
+        return self._latest_right_quat
 
     # ===================== consumer-facing camera switch =====================
     def request(self, name):
@@ -242,20 +285,42 @@ class HumanoidEnv:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
 
-    def start(self):
+    def start(self, run_exec=True):
+        """Start the collect thread (always) and the exec thread (if run_exec).
+
+        Data collection passes run_exec=False — it only needs the producer loop,
+        and the consumer loop would otherwise spam "no new action" every tick.
+        """
+        self._run_exec = run_exec
         self._stop_event.clear()
         self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self._exec_thread = threading.Thread(target=self._exec_loop, daemon=True)
         self._collect_thread.start()
-        self._exec_thread.start()
-        print("[HumanoidEnv]: collection + execution threads started.")
+        if run_exec:
+            self._exec_thread = threading.Thread(target=self._exec_loop, daemon=True)
+            self._exec_thread.start()
+        print(f"[HumanoidEnv]: collection thread started (exec={'on' if run_exec else 'off'}).")
 
     def stop(self):
         self._stop_event.set()
+
+        # Grab any in-progress recording before the collect thread can touch it
+        # for one more tick, so we can finalize it after the thread exits.
+        rec = None
+        with self._rec_lock:
+            if self._is_recording:
+                self._is_recording = False
+                rec = self._rec
+                self._rec = None
+
         for t in (self._collect_thread, self._exec_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
         self._collect_thread = self._exec_thread = None
+
+        # Finalize the grabbed recording now that the collect thread is gone.
+        if rec is not None:
+            self._finalize(rec)
+
         # Close every live camera subscription (env owns all of them).
         for name, cam in list(self._cams.items()):
             try:
@@ -323,11 +388,16 @@ class HumanoidEnv:
             # Open/close CosineCamera objects to match desired (controls bandwidth).
             self._reconcile_cameras(desired)
 
+            # One get_motion_status + one gripper read per tick; both the
+            # inference EE state and the recording rows are derived from them.
             try:
-                ee_state = self._read_left_ee_state()
+                status = self.robot_controller.get_motion_status()
+                grip = self.robot.gripper_states()[0]
+                ee_state = self._left_ee_from(status, grip)
+                self._update_latest_poses(status)
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
-                ee_state = None
+                status = grip = ee_state = None
 
             frames = self._read_frames(desired)
 
@@ -341,6 +411,11 @@ class HumanoidEnv:
                     else:
                         self._last_two_ee_states = [ee_state, ee_state]
 
+            # Append a recording row while a session is active.
+            with self._rec_lock:
+                if self._is_recording and self._rec is not None and status is not None:
+                    self._record_tick(now, status, grip, frames)
+
             next_tick += self.dt
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -348,20 +423,40 @@ class HumanoidEnv:
             else:
                 next_tick = time.monotonic()
 
-    def _read_left_ee_state(self):
-        """Left EE pose + gripper -> [pos(3), quat xyzw(4), grip(1)].
+    @staticmethod
+    def _extract_pose(frame):
+        """One motion-status link frame -> (x, y, z, qx, qy, qz, qw).
 
-        Same extraction as RobotDataCollector._get_hand_statuses (left arm only).
+        Same extraction as RobotDataCollector._get_hand_statuses._extract.
         """
-        frame = self.robot_controller.get_motion_status()['frames']['arm_left_link7']
         pos = frame['position']
         quat = frame['orientation']['quaternion']
-        gripper_states, _ = self.robot.gripper_states()
-        return [
+        return (
             pos['x'], pos['y'], pos['z'],
             quat['x'], quat['y'], quat['z'], quat['w'],
-            1.0 if gripper_states[0] > 0.5 else 0.0,
+        )
+
+    def _left_ee_from(self, status, grip):
+        """Left EE pose + gripper -> [pos(3), quat xyzw(4), grip(1)] for inference.
+
+        Derived from an already-fetched get_motion_status() result and gripper
+        reading so the collect loop does only one SDK read of each per tick.
+        """
+        pose = self._extract_pose(status['frames']['arm_left_link7'])
+        return [
+            *pose,
+            1.0 if grip[0] > 0.5 else 0.0,
         ]
+
+    def _update_latest_poses(self, status):
+        """Refresh the cached both-arm EE poses shown by the data-collection GUI."""
+        frames = status['frames']
+        left = self._extract_pose(frames['arm_left_link7'])
+        right = self._extract_pose(frames['arm_right_link7'])
+        self._latest_left_pos = left[:3]
+        self._latest_left_quat = left[3:]
+        self._latest_right_pos = right[:3]
+        self._latest_right_quat = right[3:]
 
     def _read_frames(self, active):
         """Latest frame per live camera, kept as a rolling [prev, cur] pair.
@@ -469,3 +564,142 @@ class HumanoidEnv:
         except Exception:
             right_cmd = 0.0
         self.robot.move_gripper([left_cmd, right_cmd])
+
+    # ===================== data-collection recording (ported from RobotDataCollector) =====================
+    def start_recording(self, episode_name=None):
+        """Begin a recording session that writes mp4 per RECORD_CAMERA + an npz.
+
+        Pins the record cameras so a tick never misses one to idle-eviction.
+        """
+        with self._rec_lock:
+            if self._is_recording:
+                print("[HumanoidEnv] Already recording.")
+                return
+
+            if episode_name is None:
+                episode_name = f'episode_{sum(1 for _ in self.output_dir.glob("episode_*")):03d}'
+
+            episode_dir = self.output_dir / episode_name
+            cameras_dir = episode_dir / 'cameras'
+            cameras_dir.mkdir(parents=True, exist_ok=True)
+
+            self._rec = {
+                'episode_dir':   episode_dir,
+                'cameras_dir':   cameras_dir,
+                'writers':       {},
+                'needs_bgr':     {},
+                'timestamps':    [],
+                'left':          [],
+                'right':         [],
+                'arm_joints':    [],
+                'arm_joints_ts': [],
+                'gripper':       [],
+                'cam_ready':     {name: False for name in RECORD_CAMERAS},
+                'start_time':    datetime.now().isoformat(),
+            }
+            self._is_recording = True
+
+        self._pinned |= set(RECORD_CAMERAS)
+        print(f"[HumanoidEnv] Recording started -> {episode_dir}")
+
+    def stop_recording(self):
+        """End the active session and flush video/npz/metadata to disk."""
+        with self._rec_lock:
+            if not self._is_recording:
+                return
+            print("[HumanoidEnv] Stopping recording...")
+            self._is_recording = False
+            rec = self._rec
+            self._rec = None
+
+        self._pinned -= set(RECORD_CAMERAS)
+        # Finalize outside the lock — the collect loop sees _rec is None and won't
+        # touch this session, so writing files can't block streaming.
+        self._finalize(rec)
+        print("[HumanoidEnv] Recording stopped.")
+
+    def _record_tick(self, t, status, grip, frames):
+        """Append one row to the active session. Caller holds _rec_lock.
+
+        `frames` is the collect loop's per-camera rolling [prev, cur] pairs; the
+        current frame is frames[name][-1] (absent for a camera that dropped this tick).
+        """
+        rec = self._rec
+
+        # Wait until every record camera has produced at least one frame before
+        # writing anything, so row counts stay in sync.
+        for name in RECORD_CAMERAS:
+            if name in frames:
+                rec['cam_ready'][name] = True
+        if not all(rec['cam_ready'].values()):
+            missing = [n for n, r in rec['cam_ready'].items() if not r]
+            print(f"[HumanoidEnv]   waiting for cameras: {missing}")
+            return
+
+        # --- Record robot state ---
+        rec['left'].append(self._extract_pose(status['frames']['arm_left_link7']))
+        rec['right'].append(self._extract_pose(status['frames']['arm_right_link7']))
+        # arm_joints sourced from arm_joint_states() (status quo). NOTE: this freezes
+        # under concurrent VR teleop — arm_joints_ts records its sample timestamp so a
+        # freeze is detectable (a constant ts across the episode == stale joints).
+        arm_vals, arm_ts = self.robot.arm_joint_states()
+        rec['arm_joints'].append(arm_vals)
+        rec['arm_joints_ts'].append(arm_ts)
+        rec['gripper'].append(grip)
+        rec['timestamps'].append(t)
+
+        # --- Write camera frames (skip cameras that dropped this tick) ---
+        for name in RECORD_CAMERAS:
+            pair = frames.get(name)
+            if pair is None:
+                continue
+            frame = pair[-1]
+            if name not in rec['writers']:
+                h, w   = frame.shape[:2]
+                path   = str(rec['cameras_dir'] / f'{name}.mp4')
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                rec['writers'][name]   = cv2.VideoWriter(path, fourcc, self.record_hz, (w, h))
+                rec['needs_bgr'][name] = frame.ndim == 3
+                print(f"[HumanoidEnv]   opened cameras/{name}.mp4  ({w}x{h})")
+
+            rec['writers'][name].write(
+                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if rec['needs_bgr'][name] else frame
+            )
+
+    def _finalize(self, rec):
+        """Flush video files and write npz/metadata for a finished session."""
+        for w in rec['writers'].values():
+            w.release()
+
+        timestamps = rec['timestamps']
+        n = len(timestamps)
+        if n == 0:
+            print(f"[HumanoidEnv]   no frames recorded -> {rec['episode_dir']}")
+            return
+
+        left_a  = np.array(rec['left'],  dtype=np.float32)   # (N, 7)
+        right_a = np.array(rec['right'], dtype=np.float32)   # (N, 7)
+
+        # robot_states.npz — one array per signal (build_dataset.py reads
+        # timestamps/left_pos/left_quat/gripper). arm_joints_ts is additive.
+        np.savez(
+            rec['episode_dir'] / 'robot_states.npz',
+            timestamps    = np.array(timestamps,            dtype=np.float64),  # (N,)    seconds
+            left_pos      = left_a[:, :3],                                      # (N, 3)  metres
+            left_quat     = left_a[:, 3:],                                      # (N, 4)  [qx,qy,qz,qw]
+            right_pos     = right_a[:, :3],                                     # (N, 3)
+            right_quat    = right_a[:, 3:],                                     # (N, 4)
+            arm_joints    = np.array(rec['arm_joints'],    dtype=np.float32),   # (N, 14) radians
+            arm_joints_ts = np.array(rec['arm_joints_ts'], dtype=np.float64),   # (N,)    freeze diagnostic
+            gripper       = np.array(rec['gripper'],       dtype=np.float32),   # (N, 2)  0=open 1=closed
+        )
+
+        with open(rec['episode_dir'] / 'metadata.json', 'w') as f:
+            json.dump({
+                'fps':          self.record_hz,
+                'n_frames':     n,
+                'start_time':   rec['start_time'],
+                'camera_names': RECORD_CAMERAS,
+            }, f, indent=2)
+
+        print(f"[HumanoidEnv]   saved {n} frames -> {rec['episode_dir']}")
