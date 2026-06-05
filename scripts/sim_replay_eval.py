@@ -37,209 +37,28 @@ import os
 import queue
 import socket
 import sys
-import tempfile
 import threading
 import time
 
-import numpy as np
-import pybullet as p
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from real_world.ik import (  # noqa: E402
-    PinocchioArmModel, PinocchioDLSIKSolver, IKQuery,
-    quat_xyzw_to_se3, LEFT_ARM_JOINTS, DEFAULT_URDF, DEFAULT_CALIBRATION,
-    load_calibration,
-)
+from real_world.ik import DEFAULT_URDF, DEFAULT_CALIBRATION  # noqa: E402
+from real_world.sim_backend import SimEnv  # noqa: E402
 
 HUMANOID = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_RECORDINGS = os.path.join(HUMANOID, "MDM_data_collection", "recordings")
-LEFT_GRIPPER_JOINTS = ([f"left_narrow{i}_joint" for i in (1, 2, 3, 4)] +
-                       [f"left_wide{i}_joint" for i in (1, 2, 3, 4)])
-GRIPPER_CLOSE_RAD = 0.6   # rough scalar grip[0,1] -> joint angle (uncalibrated)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8753
 
 
-def patched_urdf(urdf_path):
-    """PyBullet can't resolve package://; rewrite to relative and load from the URDF dir."""
-    with open(urdf_path) as f:
-        text = f.read().replace("package://", "")
-    d = os.path.dirname(urdf_path)
-    fd, tmp = tempfile.mkstemp(suffix=".urdf", dir=d)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    return tmp, d
-
-
-def load_trajectory(recordings_dir, recording, max_frames):
-    """Read a recording's left-EE poses, grip, and live arm joints from robot_states.npz."""
-    path = os.path.join(recordings_dir, recording, "robot_states.npz")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"no recording at {path}")
-    npz = np.load(path)
-    ee_pos = npz["left_pos"].astype(np.float64)
-    ee_quat = npz["left_quat"].astype(np.float64)
-    grip = npz["gripper"].astype(np.float64)[:, 0]
-    arm_joints = npz["arm_joints"].astype(np.float64)   # (T, 14)
-    n = len(ee_pos) if not max_frames else min(len(ee_pos), max_frames)
-    return ee_pos, ee_quat, grip, arm_joints, n
-
-
-# --------------------------------------------------------------------------- #
-#  The persistent PyBullet sim environment                                    #
-# --------------------------------------------------------------------------- #
-class SimEnv:
-    """Holds the PyBullet world + IK model/solver. Launched once; replays many recordings.
-
-    All PyBullet calls happen on the thread that built this object (the main thread).
-    """
-
-    def __init__(self, args):
-        self.direct = args.direct
-        self.anchor_first = args.anchor_first
-        self.fixed_rate = args.fixed_rate
-
-        # --- IK model + solver (calibrated, constant base_offset) ---
-        self.cal = load_calibration(args.calibration)
-        ee_frame = args.ee_frame or self.cal.ee_frame
-        self.model = PinocchioArmModel(urdf_path=args.urdf, ee_frame=ee_frame)
-        self.left_slice = slice(0, 7) if self.cal.arm_joint_slice == "left_first" else slice(7, 14)
-        if not self.anchor_first:
-            self.model.base_offset = self.cal.base_offset_se3()
-        self.solver = PinocchioDLSIKSolver(self.model, damping=1e-2, max_iters=100, tol=1e-4)
-
-        # --- PyBullet ---
-        p.connect(p.DIRECT if self.direct else p.GUI)
-        tmp_urdf, search_dir = patched_urdf(args.urdf)
-        p.setAdditionalSearchPath(search_dir)
-        p.setGravity(0, 0, 0)                          # kinematic view: arm holds commanded pose
-        try:
-            self.body = p.loadURDF(tmp_urdf, useFixedBase=True)
-        finally:
-            os.remove(tmp_urdf)
-        jmap = {p.getJointInfo(self.body, i)[1].decode(): i
-                for i in range(p.getNumJoints(self.body))}
-        self.arm_idx = [jmap[j] for j in LEFT_ARM_JOINTS]
-        self.grip_idx = [jmap[j] for j in LEFT_GRIPPER_JOINTS if j in jmap]
-
-        # --- stepping / settling ---
-        self.sim_dt = 1.0 / args.sim_hz
-        p.setTimeStep(self.sim_dt)
-        self.settle_tol = np.radians(args.settle_tol_deg)
-        self.settle_tol_deg = args.settle_tol_deg
-        self.settle_max_steps = max(1, int(args.settle_timeout_s * args.sim_hz))
-        self.fixed_steps = max(1, int(args.sim_hz / args.playback_hz))
-
-    def connected(self):
-        return p.isConnected()
-
-    def idle_step(self):
-        """Keep the GUI responsive while waiting for the next recording."""
-        if self.direct:
-            time.sleep(0.02)
-        else:
-            p.stepSimulation()
-            time.sleep(self.sim_dt)
-
-    def _cur_arm_q(self):
-        return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
-
-    def replay(self, recording, recordings_dir, max_frames, emit):
-        """Replay one recording. `emit(str)` receives each log line (stdout + client)."""
-        ee_pos, ee_quat, grip, arm_joints, n = load_trajectory(
-            recordings_dir, recording, max_frames)
-        emit(f"Recording {recording}: {n} EE poses")
-
-        # Seed from the recording's first live left-arm joints, clamped to URDF limits.
-        q_seed = np.clip(arm_joints[0, self.left_slice], self.model.lower, self.model.upper)
-        if self.anchor_first:
-            # Re-anchor base_offset so the EE starts exactly at the seed's FK.
-            E0 = self.model.fk_local(q_seed)
-            S0 = quat_xyzw_to_se3(ee_pos[0], ee_quat[0])
-            self.model.base_offset = S0 * E0.inverse()
-            emit("base_offset: anchored to this recording's first EE pose (--anchor-first)")
-        else:
-            self.model.base_offset = self.cal.base_offset_se3()
-            emit(f"base_offset: calibrated; residual "
-                 f"{self.cal.pos_residual_m * 1000:.1f} mm / {self.cal.rot_residual_deg:.2f} deg")
-
-        # Reset the arm to the seed so each recording starts clean.
-        for k, qi in zip(self.arm_idx, q_seed):
-            p.resetJointState(self.body, k, float(qi))
-
-        idx = np.linspace(0, n - 1, n).astype(int)
-        q = q_seed.copy()
-        ik_err, steps, n_timeout, n_skipped = [], [], 0, 0
-        mode = "fixed-rate" if self.fixed_rate else f"settle(tol={self.settle_tol_deg}deg)"
-        emit(f"mode: {mode}")
-        emit(f"{'frame':>6} | {'IK pos err(mm)':>14} {'|dq| step(deg)':>14} "
-             f"{'settle steps':>12} {'near-lim':>8}")
-
-        for i in idx:
-            # warm-start: last config is current
-            q_des = self.solver.solve(IKQuery(target_pos=ee_pos[i], target_quat=ee_quat[i],
-                                              current_joints=q))
-
-            # Unreachable target: skip it entirely. Don't command the arm and DON'T advance
-            # the seed — the next target is planned from the last reachable config, so a skip
-            # can't poison the warm-start.
-            if not self.solver.last_reachable:
-                n_skipped += 1
-                emit(f"{i:>6} | {self.solver.last_pos_err * 1000:>14.2f} "
-                     f"{'SKIP (unreachable)':>14} {'-':>12} {'-':>8}")
-                continue
-
-            p.setJointMotorControlArray(self.body, self.arm_idx, p.POSITION_CONTROL,
-                                        targetPositions=q_des.tolist(),
-                                        forces=[200.0] * len(self.arm_idx))
-            if self.grip_idx:
-                g = float(np.clip(grip[i], 0, 1)) * GRIPPER_CLOSE_RAD
-                p.setJointMotorControlArray(self.body, self.grip_idx, p.POSITION_CONTROL,
-                                            targetPositions=[g] * len(self.grip_idx),
-                                            forces=[20.0] * len(self.grip_idx))
-
-            # Default: step until the arm settles at q_des (or times out). --fixed-rate: just
-            # give a fixed budget per pose.
-            n_steps = 0
-            timed_out = False
-            while True:
-                p.stepSimulation()
-                if not self.direct:
-                    time.sleep(self.sim_dt)
-                n_steps += 1
-                if self.fixed_rate:
-                    if n_steps >= self.fixed_steps:
-                        break
-                else:
-                    if np.max(np.abs(self._cur_arm_q() - q_des)) < self.settle_tol:
-                        break
-                    if n_steps >= self.settle_max_steps:
-                        timed_out = True
-                        break
-
-            res = np.linalg.norm(self.model.fk(q_des)[0] - ee_pos[i])    # IK's own reach error
-            step = np.degrees(np.max(np.abs(q_des - q)))
-            near = bool(np.any((q_des - self.model.lower < 0.05) |
-                               (self.model.upper - q_des < 0.05)))
-            ik_err.append(res)
-            steps.append(step)
-            if timed_out:
-                n_timeout += 1
-            emit(f"{i:>6} | {res * 1000:>14.2f} {step:>14.2f} {n_steps:>12}"
-                 f"{' TO' if timed_out else '':>0} {str(near):>8}")
-            q = q_des                       # the last solution becomes the current seed
-
-        ik_err, steps = np.array(ik_err), np.array(steps)
-        if len(ik_err):
-            emit(f"\nSummary: IK pos-err median {np.median(ik_err) * 1000:.1f} mm "
-                 f"(max {ik_err.max() * 1000:.1f}) | step median {np.median(steps):.1f} deg "
-                 f"(max {steps.max():.1f}) | reached {len(ik_err)}/{len(idx)} | "
-                 f"skipped(unreachable) {n_skipped}/{len(idx)} | "
-                 f"settle-timeouts {n_timeout}/{len(idx)}")
-        else:
-            emit(f"\nSummary: every target was unreachable — skipped {n_skipped}/{len(idx)} "
-                 f"(check base_offset anchoring / workspace).")
+def _sim_from_args(args):
+    """Build a SimEnv from the shared CLI args (serve/replay)."""
+    return SimEnv(
+        urdf=args.urdf, ee_frame=args.ee_frame, calibration=args.calibration,
+        sim_hz=args.sim_hz, direct=args.direct, anchor_first=args.anchor_first,
+        fixed_rate=args.fixed_rate, settle_tol_deg=args.settle_tol_deg,
+        settle_timeout_s=args.settle_timeout_s, playback_hz=args.playback_hz,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -268,7 +87,7 @@ def _accept_loop(srv, jobs):
 
 
 def serve(args):
-    env = SimEnv(args)
+    env = _sim_from_args(args)
     jobs = queue.Queue()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -318,8 +137,7 @@ def serve(args):
         print("\nShutting down.")
     finally:
         srv.close()
-        if env.connected():
-            p.disconnect()
+        env.disconnect()
 
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +163,7 @@ def send(args):
 #  replay: one-shot (launch, replay once, exit)                                 #
 # --------------------------------------------------------------------------- #
 def replay_once(args):
-    env = SimEnv(args)
+    env = _sim_from_args(args)
     try:
         env.replay(args.recording, args.recordings, args.max_frames, print)
     finally:
@@ -353,8 +171,7 @@ def replay_once(args):
             print("\nClose the PyBullet window to exit.")
             while env.connected():
                 time.sleep(0.1)
-        if env.connected():
-            p.disconnect()
+        env.disconnect()
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,16 @@
+# Dependencies for the sim-only inference runner (scripts/sim_infer_eval.py) and the
+# sim/IK tools (scripts/sim_replay_eval.py, scripts/fk_consistency_check.py).
+#
+# This is the SDK-FREE set: it does NOT include a2d_sdk (the robot SDK is only needed on the
+# robot machine; the sim runner injects a _NoRobot stand-in and never touches it). Everything
+# below is pip-installable on Linux x86_64.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements_sim.txt
+#
+# Versions are pinned to what's verified working; relax to >= if you need newer.
+
+numpy==2.4.6
+pin==4.0.0            # Pinocchio rigid-body kinematics (imported as `pinocchio`) — used by ik.py
+pybullet==3.2.7       # the sim viewer/physics
+opencv-python==4.13.0.92   # decode recording videos (use opencv-python-headless if no display)

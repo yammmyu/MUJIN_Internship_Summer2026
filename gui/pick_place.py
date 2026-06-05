@@ -410,6 +410,24 @@ class PickPlaceMixin:
                    command=lambda: self.inference.auto_inference(stop=True)
                    ).pack(side=tk.LEFT, padx=4)
 
+        # ===== 仿真预览 + 真机释放（先在仿真里预览，确认后再解锁真机执行）=====
+        sim_row = ttk.Frame(sec_inf)
+        sim_row.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Label(sim_row, text="真机:",
+                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(sim_row, text="🟦 启动仿真预览",
+                   style="Primary.TButton",
+                   command=lambda: self.launch_sim()
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(sim_row, text="🔓 解锁真机执行",
+                   style="Danger.TButton",
+                   command=lambda: self.env.arm_real()
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(sim_row, text="🔒 锁定真机",
+                   style="Muted.TButton",
+                   command=lambda: self.env.disarm_real()
+                   ).pack(side=tk.LEFT, padx=4)
+
         # ===== 6. VR控制 =====
         sec_vr = ttk.LabelFrame(body, text="  ●  VR控制  ")
         sec_vr.pack(fill=tk.X, padx=10, pady=6)

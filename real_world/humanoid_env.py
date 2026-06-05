@@ -26,7 +26,16 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
+
+from real_world.ik import IKQuery, build_solver
+
+# a2d_sdk only exists on the robot machine. A sim-only machine (pybullet but no SDK) still
+# needs to import this module for the IK/exec path, so guard the import. The sim runner never
+# constructs these (it injects a _NoRobot stand-in); only the GUI / live robot path does.
+try:
+    from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
+except ImportError:
+    Robot = Camera = RobotController = None
 
 RECORD_HZ = 30
 
@@ -118,7 +127,11 @@ class HumanoidEnv:
                  pos_alpha=0.5,
                  command_lifetime=2.0,
                  idle_timeout=CAMERA_IDLE_TIMEOUT,
-                 output_dir="recordings"):
+                 output_dir="recordings",
+                 sim=None,
+                 solver=None,
+                 real=False,
+                 seed_q=None):
         # Robot/controller may be injected (the GUI shares them across panels);
         # we only tear down what we created. Cameras are NOT injected — the env is
         # the sole owner of camera subscriptions and manages one CosineCamera per
@@ -129,6 +142,19 @@ class HumanoidEnv:
         self.robot_controller = robot_controller if robot_controller is not None else RobotController()
         if self._owns_robot:
             time.sleep(1.0)  # let freshly-created DDS resources come up
+
+        # --- IK-based execution: sim backend (always driven) + real-robot gate ---
+        # `real` is the single switch the user asked for: real=False sends actions to the
+        # sim only; real=True also mirrors them to the SDK/robot, but only once `arm_real()`
+        # is called (the GUI "release" button). The sim is the preview watched before release.
+        self.sim = sim                               # object with .command(q7, grip), or None
+        self.solver = solver if solver is not None else build_solver()
+        self._real = real
+        self._armed = threading.Event()              # cleared => never command the real robot
+        # IK warm-start seed (7,). Seeded from the recording's first arm joints when given,
+        # else the limit-clipped zero config.
+        self._last_q = (np.asarray(seed_q, dtype=np.float64).copy()
+                        if seed_q is not None else self.solver.m.clip(np.zeros(7)))
 
         # Names a consumer is allowed to request (validation only — not subscribed).
         self.cameras = list(allowed_cameras)
@@ -285,20 +311,23 @@ class HumanoidEnv:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
 
-    def start(self, run_exec=True):
-        """Start the collect thread (always) and the exec thread (if run_exec).
+    def start(self, run_collect=True, run_exec=True):
+        """Start the collect thread (producer) and/or the exec thread (consumer).
 
-        Data collection passes run_exec=False — it only needs the producer loop,
-        and the consumer loop would otherwise spam "no new action" every tick.
+        Data collection passes run_exec=False (it only needs the producer loop). The
+        sim-only runner passes run_collect=False: obs comes from a recorded source, so the
+        SDK camera/collect loop isn't needed.
         """
         self._run_exec = run_exec
         self._stop_event.clear()
-        self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self._collect_thread.start()
+        if run_collect:
+            self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
+            self._collect_thread.start()
         if run_exec:
             self._exec_thread = threading.Thread(target=self._exec_loop, daemon=True)
             self._exec_thread.start()
-        print(f"[HumanoidEnv]: collection thread started (exec={'on' if run_exec else 'off'}).")
+        print(f"[HumanoidEnv]: started (collect={'on' if run_collect else 'off'}, "
+              f"exec={'on' if run_exec else 'off'}).")
 
     def stop(self):
         self._stop_event.set()
@@ -514,17 +543,40 @@ class HumanoidEnv:
         with self._lock:
             self._action_queue = copy.deepcopy(list(action_chunk)) if action_chunk else []
 
+    def queue_empty(self):
+        """True when no actions are pending (used by runners to detect drain)."""
+        with self._lock:
+            return not self._action_queue
+
+    # ===================== real-robot mirror gate ("click & release") =====================
+    def arm_real(self):
+        """Allow exec to mirror sim-validated actions to the real robot (GUI release button)."""
+        self._armed.set()
+
+    def disarm_real(self):
+        """Stop mirroring to the real robot (sim keeps running)."""
+        self._armed.clear()
+
+    @property
+    def real_armed(self):
+        return self._armed.is_set()
+
+    def set_seed(self, q7):
+        """Set the IK warm-start seed (e.g. to the robot's current left-arm joints)."""
+        self._last_q = np.asarray(q7, dtype=np.float64).copy()
+
     # ===================== consumer: execution loop (RealEnv.exec_actions) =====================
     def _exec_loop(self):
+        """Drain predicted EE poses -> our IK -> joints; drive the sim always, and the real
+        robot only when real=True AND armed. The sim is the safety preview the user watches
+        before releasing an action to hardware."""
         while not self._stop_event.is_set():
             with self._lock:
                 action = self._action_queue.pop(0) if self._action_queue else None
             if action is None:
                 self._stop_event.wait(self.dt)
-                print("[HumanoidEnv] no new action received, skipping...")
-                continue #if no information: skip rest and restart loop
-            
-            print(f"[HumanoidEnv] new action recieved {action}")
+                continue                       # nothing pending; check again next tick
+
             pos, quat, grip = self._decode_ee_action(action)
             pos = np.asarray(pos, dtype=np.float64)
             if self._smoothed_pos is None:
@@ -532,31 +584,50 @@ class HumanoidEnv:
             else:
                 self._smoothed_pos = self.pos_alpha * pos + (1.0 - self.pos_alpha) * self._smoothed_pos
 
-            self._command_left_ee(self._smoothed_pos, quat, grip)
+            q7 = self._solve_ik(self._smoothed_pos, quat)
+            if q7 is None:                     # unreachable target -> skip (seed not advanced)
+                self._stop_event.wait(self.dt)
+                continue
+
+            # Always drive the sim (the preview). Mirror to the robot only when armed.
+            if self.sim is not None:
+                self.sim.command(q7, grip)
+            if self._real and self._armed.is_set():
+                self._command_left_joints(q7, grip)
             self._stop_event.wait(self.dt)
 
     def _decode_ee_action(self, action):
         """action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip)."""
         return action[:3], rot6d_to_quat(action[3:9]), action[9]
 
-    def _command_left_ee(self, pos, quat, gripper):
-        """Command the left arm to an absolute EE pose + set the left gripper.
+    def _solve_ik(self, pos, quat):
+        """Target EE pose -> 7 left-arm joint angles via our URDF IK (warm-started from the
+        last solution). Returns None when the target is unreachable, leaving the seed intact
+        so the next target plans from the last good config."""
+        q7 = self.solver.solve(IKQuery(
+            target_pos=np.asarray(pos, dtype=np.float64),
+            target_quat=np.asarray(quat, dtype=np.float64),
+            current_joints=self._last_q))
+        if not self.solver.last_reachable:
+            print(f"[HumanoidEnv] IK unreachable (pos err "
+                  f"{self.solver.last_pos_err * 1000:.1f} mm); skipping action")
+            return None
+        self._last_q = q7
+        return q7
 
-        pos: (x, y, z) m; quat: (qx, qy, qz, qw); gripper: scalar (>0.5 -> close).
-        Uses set_end_effector_pose_control (SDK 8.1) for the arm and move_gripper
-        (SDK 7.2) for the gripper. move_gripper sets BOTH grippers, so we read the
-        current right value and leave it untouched.
-        """
-        self.robot_controller.set_end_effector_pose_control(
-            lifetime=self.command_lifetime,
-            control_group=["left_arm"],
-            left_pose={
-                'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2]),
-                'qx': float(quat[0]), 'qy': float(quat[1]),
-                'qz': float(quat[2]), 'qw': float(quat[3]),
-            },
-            right_pose=None,
-        )
+    def _command_left_joints(self, q7, gripper):
+        """Command the REAL left arm to 7 joint angles via move_arm (SDK 7.2.1), holding the
+        right arm. move_arm takes 14 joint angles (both arms): left from IK, right read back
+        so it stays put. Only reached on the real+armed branch."""
+        positions = np.zeros(14, dtype=np.float64)
+        positions[:7] = q7
+        try:
+            cur, _ = self.robot.arm_joint_states()       # 14 values, both arms
+            positions[7:] = np.asarray(cur, dtype=np.float64)[7:]
+        except Exception as e:
+            print(f"[HumanoidEnv] arm_joint_states (right-arm hold) failed: {e}")
+        self.robot.move_arm(positions.tolist())
+        # move_gripper sets BOTH grippers, so read the current right value and leave it.
         left_cmd = 1.0 if gripper > 0.5 else 0.0
         try:
             cur, _ = self.robot.gripper_states()

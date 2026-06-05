@@ -79,11 +79,15 @@ def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict
 class InferenceController:
     """Drives the left_arm_ee_image policy: server round-trip + env hand-off."""
 
-    def __init__(self, env, robot_info,
+    def __init__(self, env, robot_info=None,
                  host=PC4080_HOST, port=PC4080_PORT,
-                 record_hz=RECORD_HZ, inference_hz=INFERENCE_HZ):
+                 record_hz=RECORD_HZ, inference_hz=INFERENCE_HZ,
+                 obs_source=None):
         self.humanoid_env = env                 # owned/started/stopped by the caller (GUI)
-        self.robot_info = robot_info            # shared with robot_info_server
+        self.robot_info = robot_info            # shared with robot_info_server (None = headless)
+        # Where observations come from: the live env by default, or an injected source (e.g.
+        # a RecordedObsSource) for the offline sim runner. Actions are always submitted to env.
+        self.obs_source = obs_source if obs_source is not None else env
         self.host = host
         self.port = port
         self.record_hz = record_hz
@@ -122,7 +126,7 @@ class InferenceController:
             print("[InferenceController] humanoid_env not accessible")
             return False
 
-        obs = env.get_obs()
+        obs = self.obs_source.get_obs()
         if obs is None:
             return False
         # Skip if we've already inferred on this observation (env publishes a
@@ -153,10 +157,12 @@ class InferenceController:
         # EE-pose data here (see robot_info_server.RobotInfo notes):
         #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
         #   *_action_values = predicted action rows
-        with self.robot_info.lock:
-            self.robot_info.left_joint_predict_start_values = copy.deepcopy(obs['state'])
-            self.robot_info.left_joint_predict_action_values = action.tolist()
-            self.robot_info.inference_timestamp = ts
+        # Skipped when robot_info is None (headless sim runner has no GUI to publish to).
+        if self.robot_info is not None:
+            with self.robot_info.lock:
+                self.robot_info.left_joint_predict_start_values = copy.deepcopy(obs['state'])
+                self.robot_info.left_joint_predict_action_values = action.tolist()
+                self.robot_info.inference_timestamp = ts
 
         if submit:
             env.submit_actions(action.tolist())
@@ -174,8 +180,8 @@ class InferenceController:
             print("[InferenceController] humanoid_env not accessible")
             return False
         deadline = time.monotonic() + 0.3
-        while not env.inf_ready and time.monotonic() < deadline:
-            env.get_obs()           # requests head + hand_left, warming them
+        while not self.obs_source.inf_ready and time.monotonic() < deadline:
+            self.obs_source.get_obs()   # requests head + hand_left, warming them (no-op for recorded)
             time.sleep(0.02)
         return self._run_inference(submit=False)
 
@@ -188,7 +194,7 @@ class InferenceController:
         once=True submits only the first action row.
         """
         env = self.humanoid_env
-        if env is None:
+        if env is None or self.robot_info is None:
             return
         with self.robot_info.lock:
             actions = copy.deepcopy(self.robot_info.left_joint_predict_action_values) or []

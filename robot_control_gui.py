@@ -36,6 +36,7 @@ from gui import (
 )
 from real_world import HumanoidEnv, InferenceController
 from real_world.humanoid_env import RECORD_HZ
+from real_world.sim_backend import SimEnv
 
 
 class RobotControlGUI(
@@ -106,12 +107,21 @@ class RobotControlGUI(
         # HumanoidEnv：相机的唯一持有者与抓取者。每路相机一个 CosineCamera，按需订阅、
         # RECORD_HZ 抓取、空闲自动退订（关流）。cameras= 为「常开」相机（数据采集模式用），
         # GUI 普通模式传 [] -> 启动时不订阅任何相机、无视频流带宽。robot/controller 仍共享。
+        # real=True: the exec loop MAY mirror actions to the robot, but only after the user
+        # presses "解锁真机" (arm_real). Until then every action drives the sim preview only.
         self.env = HumanoidEnv(
             robot=self.robot,
             robot_controller=self.robot_controller,
             cameras=camera_names,
             frequency=RECORD_HZ,
+            real=True,
         )
+
+        # In-process PyBullet preview. Built lazily on its own thread (it owns all p.* calls)
+        # when the user presses "启动仿真预览"; attached to self.env.sim so the exec loop
+        # drives it. None until launched.
+        self._sim_thread = None
+        self._sim_stop = threading.Event()
 
         # left_arm_ee_image policy inference（使用注入的 env，不再自建）
         self.inference = InferenceController(self.env, self.robot_info)
@@ -244,6 +254,45 @@ class RobotControlGUI(
         self.setup_pick_and_place_panel(right_notebook)
         self.setup_control_panel(right_notebook)
 
+    # ===================== sim preview (in-process PyBullet) =====================
+    def launch_sim(self):
+        """Start the PyBullet preview on its own thread (idempotent)."""
+        if self._sim_thread is not None and self._sim_thread.is_alive():
+            self.status_text.set("仿真预览已在运行")
+            return
+        self._sim_stop.clear()
+        self._sim_thread = threading.Thread(target=self._sim_loop, daemon=True)
+        self._sim_thread.start()
+        self.status_text.set("仿真预览已启动")
+
+    def _sim_loop(self):
+        """Owns the PyBullet connection: build it here, seed to the robot's current pose,
+        attach to env, then step until stopped. All p.* calls stay on this thread; the exec
+        thread only calls sim.command() (no p.*)."""
+        try:
+            sim = SimEnv(direct=False)
+        except Exception as e:
+            print(f"[GUI] sim launch failed: {e}")
+            return
+        try:
+            q = self.robot.arm_joint_states()[0][:7]
+            sim.reset_arm(q)
+            self.env.set_seed(q)        # IK warm-starts from where the real arm is
+        except Exception as e:
+            print(f"[GUI] sim seed failed: {e}")
+        self.env.sim = sim              # exec loop now drives the preview
+        try:
+            while not self._sim_stop.is_set() and sim.connected():
+                sim.step()
+        finally:
+            self.env.sim = None
+            sim.disconnect()
+
+    def _stop_sim(self):
+        self._sim_stop.set()
+        if self._sim_thread is not None:
+            self._sim_thread.join(timeout=3.0)
+
     def on_closing(self):
         """窗口关闭时的处理：依次释放各资源，最后强制退出进程。
 
@@ -259,6 +308,7 @@ class RobotControlGUI(
             ("Motion Planning TCP", self.stop_motion_planning),
             ("VR 串流服务器", self.dummy_server.stop),
             ("推理控制器", self.inference.stop),
+            ("仿真预览", self._stop_sim),     # 先停仿真步进线程，再关 env
             ("HumanoidEnv", self.env.stop),   # 先停采集/执行线程，再关其持有的相机
             ("机器人", self.robot.shutdown),
             ("ROS 节点", self.wheel_controller.destroy_node),
