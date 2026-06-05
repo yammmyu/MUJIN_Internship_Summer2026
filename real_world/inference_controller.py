@@ -120,7 +120,7 @@ class InferenceController:
         Returns True if a fresh inference was produced.
         """
 
-        print(f"[InferenceController] running inference sumbit={submit}")
+        print(f"[InferenceController] running inference...")
         env = self.humanoid_env
         if env is None:
             print("[InferenceController] humanoid_env not accessible")
@@ -200,7 +200,9 @@ class InferenceController:
             actions = copy.deepcopy(self.robot_info.left_joint_predict_action_values) or []
         if not actions:
             return
-        env.submit_actions(actions[:1] if once else actions)
+        # Manual execute is releasable: it runs in the sim AND becomes the trajectory the user
+        # can then release to the robot (auto-run uses the default releasable=False -> sim only).
+        env.submit_actions(actions[:1] if once else actions, releasable=True)
 
     # ------------------------------------------------------------------ #
     #  Auto loop: predict + submit continuously                            #

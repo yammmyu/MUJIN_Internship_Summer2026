@@ -403,11 +403,11 @@ class PickPlaceMixin:
                   style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(auto_row, text="⚠ 开始自动运行",
                    style="Danger.TButton",
-                   command=lambda: self.inference.auto_inference()
+                   command=print("Hello World") #lambda: self.inference.auto_inference() #temporarily disabled
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(auto_row, text="■ 停止自动运行",
                    style="Muted.TButton",
-                   command=lambda: self.inference.auto_inference(stop=True)
+                   command=print("No Hello World") #lambda: self.inference.auto_inference(stop=True) #temporarily disabled
                    ).pack(side=tk.LEFT, padx=4)
 
         # ===== 仿真预览 + 真机释放（先在仿真里预览，确认后再解锁真机执行）=====
@@ -419,13 +419,15 @@ class PickPlaceMixin:
                    style="Primary.TButton",
                    command=lambda: self.launch_sim()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(sim_row, text="🔓 解锁真机执行",
+        # Release the LAST sim-executed trajectory to the robot (only path to hardware).
+        ttk.Button(sim_row, text="🚀 释放到真机",
                    style="Danger.TButton",
-                   command=lambda: self.env.arm_real()
+                   command=lambda: self.env.release_to_robot()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(sim_row, text="🔒 锁定真机",
+        # Hard stop: drop everything pending on the robot.
+        ttk.Button(sim_row, text="⛔ 急停真机",
                    style="Muted.TButton",
-                   command=lambda: self.env.disarm_real()
+                   command=lambda: self.env.lock_robot()
                    ).pack(side=tk.LEFT, padx=4)
 
         # ===== 6. VR控制 =====

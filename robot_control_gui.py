@@ -107,8 +107,8 @@ class RobotControlGUI(
         # HumanoidEnv：相机的唯一持有者与抓取者。每路相机一个 CosineCamera，按需订阅、
         # RECORD_HZ 抓取、空闲自动退订（关流）。cameras= 为「常开」相机（数据采集模式用），
         # GUI 普通模式传 [] -> 启动时不订阅任何相机、无视频流带宽。robot/controller 仍共享。
-        # real=True: the exec loop MAY mirror actions to the robot, but only after the user
-        # presses "解锁真机" (arm_real). Until then every action drives the sim preview only.
+        # real=True: enables the release pipeline. Actions always run in the sim preview first;
+        # only "释放到真机" (release_to_robot) replays a sim-executed trajectory on the robot.
         self.env = HumanoidEnv(
             robot=self.robot,
             robot_controller=self.robot_controller,
@@ -275,9 +275,13 @@ class RobotControlGUI(
             print(f"[GUI] sim launch failed: {e}")
             return
         try:
-            q = self.robot.arm_joint_states()[0][:7]
-            sim.reset_arm(q)
-            self.env.set_seed(q)        # IK warm-starts from where the real arm is
+            arm14 = self.robot.arm_joint_states()[0]            # both arms (rad)
+            grip = self.robot.gripper_states()[0]               # [left, right] in [0,1]
+            body_pitch = self.robot.waist_joint_states()[0][0]  # waist pitch (rad)
+            # Match the sim to the physical robot on load: both arms, both grippers, torso
+            # pitch. (URDF has no head/waist-lift joints, so those aren't mirrored.)
+            sim.reset_full(arm14=arm14, body_pitch=body_pitch, gripper_lr=grip)
+            self.env.set_seed(arm14[:7])    # IK warm-starts from where the real left arm is
         except Exception as e:
             print(f"[GUI] sim seed failed: {e}")
         self.env.sim = sim              # exec loop now drives the preview

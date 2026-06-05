@@ -22,6 +22,7 @@ import json
 import pathlib
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import cv2
@@ -143,18 +144,29 @@ class HumanoidEnv:
         if self._owns_robot:
             time.sleep(1.0)  # let freshly-created DDS resources come up
 
-        # --- IK-based execution: sim backend (always driven) + real-robot gate ---
-        # `real` is the single switch the user asked for: real=False sends actions to the
-        # sim only; real=True also mirrors them to the SDK/robot, but only once `arm_real()`
-        # is called (the GUI "release" button). The sim is the preview watched before release.
+        # --- IK-based execution: sim backend + a sim-BEFORE-robot release pipeline ---
+        # Non-negotiable invariant: an action can reach the real robot ONLY after it has been
+        # executed in the sim. This is enforced structurally, not by discipline:
+        #   * _exec_loop runs every action through IK -> sim (the only sim driver).
+        #   * A "releasable" chunk (the manual 执行 button) is recorded as it executes; when it
+        #     finishes in sim it becomes self._last_sim_traj.
+        #   * release_to_robot() is the ONLY thing that enqueues onto self._robot_q, and it can
+        #     only copy from self._last_sim_traj — i.e. a trajectory the sim already ran.
+        #   * _release_loop is the ONLY caller of _command_left_joints, draining _robot_q.
+        # Auto-run submits non-releasable chunks, so it drives the sim only and never the robot.
         self.sim = sim                               # object with .command(q7, grip), or None
         self.solver = solver if solver is not None else build_solver()
         self._real = real
-        self._armed = threading.Event()              # cleared => never command the real robot
         # IK warm-start seed (7,). Seeded from the recording's first arm joints when given,
         # else the limit-clipped zero config.
         self._last_q = (np.asarray(seed_q, dtype=np.float64).copy()
                         if seed_q is not None else self.solver.m.clip(np.zeros(7)))
+        # Release pipeline state (guarded by self._lock):
+        self._queue_releasable = False               # is the current action queue releasable?
+        self._sim_traj_rec = None                    # accumulator while a releasable chunk runs
+        self._last_sim_traj = []                     # last chunk fully executed in sim (releasable)
+        self._robot_q = deque()                      # sim-validated cmds released, pending on robot
+        self._release_thread = None
 
         # Names a consumer is allowed to request (validation only — not subscribed).
         self.cameras = list(allowed_cameras)
@@ -326,8 +338,12 @@ class HumanoidEnv:
         if run_exec:
             self._exec_thread = threading.Thread(target=self._exec_loop, daemon=True)
             self._exec_thread.start()
+        # The release thread (the ONLY robot-motion driver) runs only when real=True.
+        if run_exec and self._real:
+            self._release_thread = threading.Thread(target=self._release_loop, daemon=True)
+            self._release_thread.start()
         print(f"[HumanoidEnv]: started (collect={'on' if run_collect else 'off'}, "
-              f"exec={'on' if run_exec else 'off'}).")
+              f"exec={'on' if run_exec else 'off'}, real={'on' if self._real else 'off'}).")
 
     def stop(self):
         self._stop_event.set()
@@ -341,10 +357,10 @@ class HumanoidEnv:
                 rec = self._rec
                 self._rec = None
 
-        for t in (self._collect_thread, self._exec_thread):
+        for t in (self._collect_thread, self._exec_thread, self._release_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
-        self._collect_thread = self._exec_thread = None
+        self._collect_thread = self._exec_thread = self._release_thread = None
 
         # Finalize the grabbed recording now that the collect thread is gone.
         if rec is not None:
@@ -535,31 +551,61 @@ class HumanoidEnv:
             }
 
     # ===================== caller -> env: hand off a prediction =====================
-    def submit_actions(self, action_chunk):
+    def submit_actions(self, action_chunk, releasable=False):
         """Replace the pending action queue with the newest predicted chunk.
 
         action_chunk: list of rows [eef_pos(3), 6D_rot(6), gripper(1)].
+        releasable: True for the manual "执行" path — the chunk is recorded as it runs in sim
+            and, once finished, becomes self._last_sim_traj (eligible for release_to_robot).
+            False for auto-run — sim only, never releasable, so auto never reaches the robot.
         """
         with self._lock:
             self._action_queue = copy.deepcopy(list(action_chunk)) if action_chunk else []
+            self._queue_releasable = bool(releasable and action_chunk)
+            # Start a fresh recording for a releasable chunk; a non-releasable (auto) chunk
+            # invalidates any stale releasable trajectory so it can't be released later.
+            self._sim_traj_rec = [] if self._queue_releasable else None
+            if not self._queue_releasable:
+                self._last_sim_traj = []
 
     def queue_empty(self):
         """True when no actions are pending (used by runners to detect drain)."""
         with self._lock:
             return not self._action_queue
 
-    # ===================== real-robot mirror gate ("click & release") =====================
-    def arm_real(self):
-        """Allow exec to mirror sim-validated actions to the real robot (GUI release button)."""
-        self._armed.set()
+    # ===================== real-robot release ("run in sim, then release") =====================
+    def release_to_robot(self):
+        """Replay the last sim-executed trajectory on the REAL robot.
 
-    def disarm_real(self):
-        """Stop mirroring to the real robot (sim keeps running)."""
-        self._armed.clear()
+        This is the ONLY way actions reach the robot, and it can only copy self._last_sim_traj
+        — a trajectory that has already finished executing in the sim — onto the robot queue.
+        So it is impossible to command the robot with an action the sim hasn't run.
+        Returns the number of points queued (0 if nothing has been validated in sim yet)."""
+        if not self._real:
+            print("[HumanoidEnv] release_to_robot ignored: env built with real=False.")
+            return 0
+        with self._lock:
+            traj = list(self._last_sim_traj)
+            if not traj:
+                print("[HumanoidEnv] release_to_robot: no sim-validated trajectory yet "
+                      "(run 执行 in the sim first).")
+                return 0
+            self._robot_q.extend(traj)
+        print(f"[HumanoidEnv] released {len(traj)} sim-validated points to the robot.")
+        return len(traj)
+
+    def lock_robot(self):
+        """Hard stop: drop every pending robot command so no further hardware motion happens."""
+        with self._lock:
+            dropped = len(self._robot_q)
+            self._robot_q.clear()
+        if dropped:
+            print(f"[HumanoidEnv] lock_robot: dropped {dropped} pending robot commands.")
 
     @property
-    def real_armed(self):
-        return self._armed.is_set()
+    def robot_pending(self):
+        with self._lock:
+            return len(self._robot_q)
 
     def set_seed(self, q7):
         """Set the IK warm-start seed (e.g. to the robot's current left-arm joints)."""
@@ -567,12 +613,22 @@ class HumanoidEnv:
 
     # ===================== consumer: execution loop (RealEnv.exec_actions) =====================
     def _exec_loop(self):
-        """Drain predicted EE poses -> our IK -> joints; drive the sim always, and the real
-        robot only when real=True AND armed. The sim is the safety preview the user watches
-        before releasing an action to hardware."""
+        """Drain predicted EE poses -> our IK -> joints and drive the SIM only. The robot is
+        never touched here (see _release_loop); a releasable chunk is recorded as it executes
+        and, once drained, promoted to self._last_sim_traj for release_to_robot()."""
         while not self._stop_event.is_set():
             with self._lock:
                 action = self._action_queue.pop(0) if self._action_queue else None
+                releasable = self._queue_releasable
+                # Releasable chunk just finished draining -> publish it as the sim-validated
+                # trajectory eligible for release, then close the recording.
+                if action is None and releasable and self._sim_traj_rec is not None:
+                    if self._sim_traj_rec:
+                        self._last_sim_traj = self._sim_traj_rec
+                        print(f"[HumanoidEnv] sim-validated trajectory ready: "
+                              f"{len(self._last_sim_traj)} points (press 释放到真机 to run on robot).")
+                    self._sim_traj_rec = None
+                    self._queue_releasable = False
             if action is None:
                 self._stop_event.wait(self.dt)
                 continue                       # nothing pending; check again next tick
@@ -589,11 +645,29 @@ class HumanoidEnv:
                 self._stop_event.wait(self.dt)
                 continue
 
-            # Always drive the sim (the preview). Mirror to the robot only when armed.
+            # Drive the sim (the preview). Record into the releasable trajectory if this chunk
+            # is releasable -> only sim-executed points can ever be released to the robot.
             if self.sim is not None:
                 self.sim.command(q7, grip)
-            if self._real and self._armed.is_set():
-                self._command_left_joints(q7, grip)
+            if releasable:
+                with self._lock:
+                    if self._sim_traj_rec is not None:
+                        self._sim_traj_rec.append((np.asarray(q7, dtype=np.float64).copy(),
+                                                   float(grip)))
+            self._stop_event.wait(self.dt)
+
+    def _release_loop(self):
+        """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by
+        release_to_robot, which can only copy a sim-executed trajectory) and commands the arm,
+        paced at dt. Hard-stop (lock_robot) just clears the queue so this drains nothing."""
+        while not self._stop_event.is_set():
+            with self._lock:
+                cmd = self._robot_q.popleft() if self._robot_q else None
+            if cmd is None:
+                self._stop_event.wait(self.dt)
+                continue
+            q7, grip = cmd
+            self._command_left_joints(q7, grip)
             self._stop_event.wait(self.dt)
 
     def _decode_ee_action(self, action):

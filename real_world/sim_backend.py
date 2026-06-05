@@ -32,8 +32,12 @@ from real_world.ik import (
     load_calibration,
 )
 
+RIGHT_ARM_JOINTS = [f"Joint{i}_r" for i in range(1, 8)]
 LEFT_GRIPPER_JOINTS = ([f"left_narrow{i}_joint" for i in (1, 2, 3, 4)] +
                        [f"left_wide{i}_joint" for i in (1, 2, 3, 4)])
+RIGHT_GRIPPER_JOINTS = ([f"right_narrow{i}_joint" for i in (1, 2, 3, 4)] +
+                        [f"right_wide{i}_joint" for i in (1, 2, 3, 4)])
+WAIST_PITCH_JOINT = "joint_body_pitch"   # the URDF's only torso DOF (no head/lift joints)
 GRIPPER_CLOSE_RAD = 0.6   # rough scalar grip[0,1] -> joint angle (uncalibrated)
 
 
@@ -99,10 +103,15 @@ class SimEnv:
             self.body = p.loadURDF(tmp_urdf, useFixedBase=True)
         finally:
             os.remove(tmp_urdf)
-        jmap = {p.getJointInfo(self.body, i)[1].decode(): i
-                for i in range(p.getNumJoints(self.body))}
-        self.arm_idx = [jmap[j] for j in LEFT_ARM_JOINTS]
-        self.grip_idx = [jmap[j] for j in LEFT_GRIPPER_JOINTS if j in jmap]
+        self.jmap = {}
+        self.jlim = {}
+        for i in range(p.getNumJoints(self.body)):
+            ji = p.getJointInfo(self.body, i)
+            name = ji[1].decode()
+            self.jmap[name] = i
+            self.jlim[name] = (ji[8], ji[9])     # (lower, upper); lower>upper => no limit
+        self.arm_idx = [self.jmap[j] for j in LEFT_ARM_JOINTS]
+        self.grip_idx = [self.jmap[j] for j in LEFT_GRIPPER_JOINTS if j in self.jmap]
 
         # --- stepping / settling ---
         self.sim_hz = sim_hz
@@ -135,10 +144,49 @@ class SimEnv:
             self._target = (q, float(gripper))
 
     def reset_arm(self, q7):
-        """Snap the arm to a seed config (owning thread; start of a run)."""
+        """Snap the left arm to a seed config (owning thread; start of a run)."""
         q = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
         for k, qi in zip(self.arm_idx, q):
             p.resetJointState(self.body, k, float(qi))
+
+    def _set_joints(self, name_to_pos):
+        """resetJointState a set of named joints, clamped to URDF limits. Owning thread."""
+        for name, pos in name_to_pos.items():
+            idx = self.jmap.get(name)
+            if idx is None:
+                continue
+            lo, hi = self.jlim.get(name, (1.0, -1.0))
+            if lo < hi:
+                pos = min(max(float(pos), lo), hi)
+            p.resetJointState(self.body, idx, float(pos))
+
+    def reset_full(self, arm14=None, body_pitch=None, gripper_lr=None):
+        """Snap the WHOLE model to a physical-robot reading so the sim starts matched.
+
+        arm14:       14 joint angles (rad), [left 0..6, right 0..6] (SDK arm_joint_states).
+        body_pitch:  waist pitch (rad) -> joint_body_pitch (the only torso DOF in the URDF;
+                     the model has no head or waist-lift joints, so those can't be mirrored).
+        gripper_lr:  [left, right] normalized [0,1] -> each side's 8 finger joints.
+        Owning thread only. Leaves the live-drive target untouched, so step() holds this pose
+        until the exec loop commands the left arm.
+        """
+        cmds = {}
+        if arm14 is not None:
+            arm14 = np.asarray(arm14, dtype=np.float64)
+            for i, n in enumerate(LEFT_ARM_JOINTS):
+                cmds[n] = arm14[i]
+            for i, n in enumerate(RIGHT_ARM_JOINTS):
+                cmds[n] = arm14[7 + i]
+        if body_pitch is not None:
+            cmds[WAIST_PITCH_JOINT] = float(body_pitch)
+        if gripper_lr is not None:
+            gl = float(np.clip(gripper_lr[0], 0, 1)) * GRIPPER_CLOSE_RAD
+            gr = float(np.clip(gripper_lr[1], 0, 1)) * GRIPPER_CLOSE_RAD
+            for n in LEFT_GRIPPER_JOINTS:
+                cmds[n] = gl
+            for n in RIGHT_GRIPPER_JOINTS:
+                cmds[n] = gr
+        self._set_joints(cmds)
 
     def step(self):
         """Apply the latest commanded target (if any) and advance one sim step.

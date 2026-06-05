@@ -7,8 +7,9 @@ PyBullet sim. No socket — IK is a method call and the sim is in-process; the o
 hop is the (remote) policy server.
 
 `HumanoidEnv` owns the execution path: its `_exec_loop` runs the IK and, with `real=False`,
-hands joints to the sim only. `real=True` would also mirror to the robot once `arm_real()` is
-called (the GUI "release" button) — left off here so nothing reaches hardware.
+hands joints to the sim only. (On the robot, real=True adds a release pipeline where a
+sim-executed trajectory is replayed to hardware via the GUI "释放到真机" button — never reached
+here: real=False plus an injected _NoRobot mean nothing can touch the robot.)
 
 Threading: the main thread steps the sim; HumanoidEnv's exec thread runs IK and feeds it;
 (policy mode) InferenceController's thread fetches recorded obs and calls the policy.
@@ -16,7 +17,7 @@ Threading: the main thread steps the sim; HumanoidEnv's exec thread runs IK and 
 Usage:
     # Validate IK + exec + sim WITHOUT the policy server (feeds recorded EE poses directly):
     .venv/bin/python scripts/sim_infer_eval.py --source replay \
-        --recording recording001 --recordings /home/chenyanyu/Downloads/recordings
+        --recording recording001 --recordings /home/chenyanyu/Documents/Humanoid/humanoid/MDM_data_collection/recordings
 
     # Full inference path (needs the policy server reachable):
     .venv/bin/python scripts/sim_infer_eval.py --source policy \
