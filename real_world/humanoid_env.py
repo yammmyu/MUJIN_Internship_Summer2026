@@ -172,10 +172,13 @@ class HumanoidEnv:
         # Non-negotiable invariant: an action can reach the real robot ONLY after the sim has
         # stepped through it, self-collision-checked it, and read back the achieved joints.
         # Enforced structurally, not by discipline:
-        #   * SimEnv.validate (on the sim thread) is the ONLY producer of self._last_sim_traj;
-        #     it cannot run without a live sim, so "no sim" => nothing is ever releasable.
-        #   * release_to_robot() is the ONLY thing that enqueues onto self._robot_q, copying a
-        #     freshly-validated trajectory (one-shot, latch-guarded, E-stop-guarded).
+        #   * SimEnv.validate (on the sim thread) is the ONLY producer of self._last_sim_traj and
+        #     self._staged_release; it cannot run without a live sim, so "no sim" => nothing is
+        #     ever releasable.
+        #   * Only the release entry points enqueue onto self._robot_q, and only by copying
+        #     freshly sim-validated substeps (E-stop-guarded, C4/C5-guarded): release_to_robot()
+        #     (one-shot, whole trajectory) and release_next_substep / release_remaining_substeps
+        #     (drain the accumulating self._staged_release buffer).
         #   * _release_loop is the ONLY caller of _command_left_joints, draining _robot_q.
         #   * _exec_loop drives the sim only (auto/replay preview); it never touches the robot.
         self.sim = sim                               # SimEnv (command/validate), or None
@@ -191,6 +194,10 @@ class HumanoidEnv:
         self._validation_id = 0                      # bumped on each successful validation
         self._released_id = -1                       # validation_id already released (one-shot, H1)
         self._robot_q = deque()                      # released, sim-validated cmds pending on robot
+        # Substep-by-substep release buffer: each successful validate_and_stage APPENDS its
+        # sim-achieved substeps here ("ready to release"). release_next_substep / release_remaining_substeps
+        # move substeps from here onto _robot_q (which _release_loop drains at the 33ms tick).
+        self._staged_release = deque()               # [(q7_achieved, grip)] validated, awaiting release
         self._release_thread = None
         self._estop = threading.Event()              # latched stop for the release path (C3)
         self._last_good_arm14 = None                 # last finite 14-joint read (right-arm hold, C4)
@@ -696,18 +703,62 @@ class HumanoidEnv:
         if not action_chunk:
             return False, "empty action chunk"
 
+        # Re-anchor the IK seed AND the sim to the robot's LIVE pose before validating, so the
+        # self-collision check replicates the arm's ACTUAL geometry rather than the last planned
+        # config. Only when the release pipeline is idle (nothing staged/streaming) — while
+        # staging ahead we keep planning continuously from the prior segment's end (see below).
+        self._resync_to_robot_if_idle()
+
         traj, ok, reason = self.sim.validate(action_chunk, self._make_solve_fn(),
                                              self._last_q, MAX_JOINT_STEP)
         with self._lock:
             if ok and traj:
                 self._last_sim_traj = traj
                 self._validation_id += 1
+                # Advance the IK warm-start seed to the joints achieved at the end of this
+                # validated segment, so a subsequent step-through call (单步/整条) plans
+                # continuously from here instead of restarting from the original seed.
+                self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
+                # APPEND these substeps to the ready-to-release buffer (单步/整条 both accumulate
+                # here). release_next_substep / release_remaining_substeps drain it to the robot.
+                self._staged_release.extend(traj)
                 print(f"[HumanoidEnv] sim-validated {len(traj)} points (id {self._validation_id}); "
-                      f"press 释放到真机 to run on the robot.")
+                      f"{len(self._staged_release)} substep(s) staged for release.")
             else:
                 self._last_sim_traj = []
                 print(f"[HumanoidEnv] sim validation FAILED: {reason}")
         return ok, (reason or "")
+
+    def _resync_to_robot_if_idle(self):
+        """Re-anchor the IK seed (_last_q) and the sim to a FRESH live robot reading so the next
+        validation replicates the arm's REAL pose (both arms + torso + grippers), the same sync
+        SimEnv gets at preview launch. No-op when:
+          * there's no sim, or
+          * substeps are already staged or streaming (self._staged_release / self._robot_q
+            non-empty) — then we're staging AHEAD of execution and must keep planning continuously
+            from the prior segment's end (traj[-1][0]) instead of snapping back to live, or
+          * the live arm read fails (leave the seed intact).
+        reset_full is owning-thread-only, so it's marshalled via submit_job like validate."""
+        if self.sim is None:
+            return
+        with self._lock:
+            if self._staged_release or self._robot_q:
+                return
+        arm14 = self._read_arm14()                       # both arms (rad); None if never readable
+        if arm14 is None:
+            return
+        body_pitch = grip = None                          # best-effort; reset_full takes None fine
+        try:
+            body_pitch = float(self.robot.waist_joint_states()[0][0])
+        except Exception:
+            pass
+        try:
+            grip = self.robot.gripper_states()[0]
+        except Exception:
+            pass
+        self.sim.submit_job(lambda: self.sim.reset_full(
+            arm14=arm14, body_pitch=body_pitch, gripper_lr=grip))
+        self.set_seed(arm14[:7])                          # IK seed -> real left-arm joints
 
     # ===================== real-robot release ("validate in sim, then release") =====================
     def release_to_robot(self):
@@ -745,15 +796,91 @@ class HumanoidEnv:
         print(f"[HumanoidEnv] released {len(traj)} validated pts (+{len(ramp)} ramp-in) to robot.")
         return len(full)
 
+    # ===================== substep-by-substep release (accumulating buffer) =====================
+    @property
+    def staged_substeps(self):
+        """How many validated substeps are staged and not yet released to the robot."""
+        with self._lock:
+            return len(self._staged_release)
+
+    def staged_preview(self, n=10):
+        """The next up-to-n staged substeps as 7-joint arrays (copies), in release order.
+        For the live substep monitor; cheap snapshot under the lock."""
+        with self._lock:
+            items = list(self._staged_release)[:n]
+        return [np.asarray(q, dtype=np.float64).copy() for (q, _grip) in items]
+
+    def release_next_substep(self):
+        """Release exactly ONE staged substep to the robot (one 33ms tick of motion). Pops the
+        next substep from the ready-to-release buffer onto _robot_q. Refused while E-stopped;
+        the shared _enqueue_for_release preserves the C4 right-arm hold and C5 ramp-in. Returns
+        the number of commands queued (1 in the synced case; more if a ramp-in was needed)."""
+        if not self._real:
+            print("[HumanoidEnv] release ignored: env built with real=False.")
+            return 0
+        if self._estop.is_set():
+            print("[HumanoidEnv] release refused: E-stop latched (press 重置急停 to reset).")
+            return 0
+        with self._lock:
+            if not self._staged_release:
+                print("[HumanoidEnv] release refused: no staged substeps (run 仿真验证 first).")
+                return 0
+            sub = self._staged_release.popleft()
+        return self._enqueue_for_release([sub])
+
+    def release_remaining_substeps(self):
+        """Release ALL staged substeps to the robot; _release_loop drains them at the 33ms tick.
+        Refused while E-stopped; same C4/C5 guards as release_next_substep. Returns the number of
+        commands queued."""
+        if not self._real:
+            print("[HumanoidEnv] release ignored: env built with real=False.")
+            return 0
+        if self._estop.is_set():
+            print("[HumanoidEnv] release refused: E-stop latched (press 重置急停 to reset).")
+            return 0
+        with self._lock:
+            if not self._staged_release:
+                print("[HumanoidEnv] release refused: no staged substeps (run 仿真验证 first).")
+                return 0
+            subs = list(self._staged_release)
+            self._staged_release.clear()
+        return self._enqueue_for_release(subs)
+
+    def _enqueue_for_release(self, subs):
+        """Append validated substeps [(q7, grip)] onto _robot_q with the same hardware guards as
+        release_to_robot: a fresh right-arm hold (C4 — refuse rather than zero the right arm) and,
+        when the robot queue is idle, a ramp-in from the current measured pose to the first
+        substep (C5; collapses to a single command when already in sync). Returns commands queued."""
+        if not subs:
+            return 0
+        arm14 = self._read_arm14()                       # C4: need a real right-arm hold
+        if arm14 is None:
+            print("[HumanoidEnv] release refused: cannot read arm_joint_states (right-arm hold).")
+            with self._lock:                             # don't lose the popped substeps
+                self._staged_release.extendleft(reversed(subs))
+            return 0
+        with self._lock:
+            if self._robot_q:                            # already streaming -> just append; the
+                full = list(subs)                        # _release_loop per-tick clamp guards it
+            else:                                        # idle -> C5 ramp from the measured pose
+                ramp = self._ramp(arm14[:7], subs[0][0], MAX_JOINT_STEP, subs[0][1])
+                full = ramp + list(subs)[1:]             # ramp's last point IS subs[0]
+            self._release_right_hold = arm14[7:].copy()
+            self._robot_q.extend(full)
+            staged_left = len(self._staged_release)
+        print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_left} substep(s) still staged).")
+        return len(full)
+
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
         current measured pose — the SDK has no brake, so re-commanding 'here' is the stop.
         Stays latched until reset_estop(). (The physical E-stop remains the primary safety.)"""
         self._estop.set()
         with self._lock:
-            dropped = len(self._robot_q)
+            dropped = len(self._robot_q) + len(self._staged_release)
             self._robot_q.clear()
-        print(f"[HumanoidEnv] E-STOP: latched; dropped {dropped} pending cmds; holding pose.")
+            self._staged_release.clear()             # drop un-released substeps too (re-validate after reset)
+        print(f"[HumanoidEnv] E-STOP: latched; dropped {dropped} pending/staged cmds; holding pose.")
         if self._real:
             arm14 = self._read_arm14()
             if arm14 is None:
@@ -847,8 +974,8 @@ class HumanoidEnv:
             self._stop_event.wait(self.dt)
 
     def _release_loop(self):
-        """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by
-        release_to_robot, which can only copy a sim-validated trajectory), clamps each step to
+        """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by the
+        release entry points, which can only copy sim-validated substeps), clamps each step to
         MAX_JOINT_STEP as a final guard (C5), and stops dead while E-stopped (C3)."""
         last_cmd = None
         while not self._stop_event.is_set():

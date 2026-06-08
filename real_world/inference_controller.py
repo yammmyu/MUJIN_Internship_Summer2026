@@ -96,6 +96,11 @@ class InferenceController:
         self.inference_thread = None
         self.is_auto_inference = False
         self._last_inference_obs_ts = 0.0
+        # Manual step-through cursor: index of the NEXT unexecuted action row in the
+        # current chunk. Reset to 0 on every fresh inference; advanced by
+        # execute_inference_result. cursor >= chunk length => the chunk is fully consumed
+        # and the manual validate buttons become no-ops (see steps_remaining).
+        self._exec_cursor = 0
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: the env is owned by the caller; we only reset our state #
@@ -160,6 +165,8 @@ class InferenceController:
         action = np.asarray(resp['action'], dtype=np.float32)
         print(f"[InferenceController] response recieved! Details:{action}")
         self._last_inference_obs_ts = ts
+        # A fresh chunk restarts the manual step-through from the first row.
+        self._exec_cursor = 0
 
         # Publish for robot_info_server / visualisation. left_*_predict_* carry
         # EE-pose data here (see robot_info_server.RobotInfo notes):
@@ -196,21 +203,47 @@ class InferenceController:
     # ------------------------------------------------------------------ #
     #  Manual: validate the last prediction IN THE SIM, then stage it      #
     # ------------------------------------------------------------------ #
-    def execute_inference_result(self, once: bool = False):
-        """Run the last published action chunk through the SIM (step + self-collision +
-        readback) and stage the sim-validated trajectory for release. This is the manual
-        "执行" path; it never touches the robot — that needs a subsequent release_to_robot().
+    def _current_actions(self):
+        """The last published action chunk (rows), or [] if none / no robot_info."""
+        if self.robot_info is None:
+            return []
+        with self.robot_info.lock:
+            return copy.deepcopy(self.robot_info.left_joint_predict_action_values) or []
 
-        once=True validates only the first action row. Returns (ok, reason).
+    def steps_remaining(self):
+        """How many action rows of the current chunk are still unexecuted (manual mode).
+
+        0 means the chunk is exhausted (or there's none): the manual validate buttons
+        should be no-ops until the next 推理一次.
+        """
+        return max(0, len(self._current_actions()) - self._exec_cursor)
+
+    def execute_inference_result(self, once: bool = False):
+        """Step through the last published chunk in the SIM (step + self-collision + readback)
+        and stage the sim-validated trajectory for release. Manual "执行" path; never touches
+        the robot — that needs a subsequent release_to_robot().
+
+        A cursor tracks the next unexecuted row of the current chunk:
+          * once=True  -> validate+stage just the NEXT row, advance the cursor by one.
+          * once=False -> validate+stage all REMAINING rows, advance the cursor to the end.
+        Once the cursor reaches the end the chunk is consumed and both modes are no-ops
+        until a fresh 推理一次. Returns (ok, reason). The cursor only advances on success.
         """
         env = self.humanoid_env
         if env is None or self.robot_info is None:
             return False, "no env / robot_info"
-        with self.robot_info.lock:
-            actions = copy.deepcopy(self.robot_info.left_joint_predict_action_values) or []
+        actions = self._current_actions()
         if not actions:
             return False, "no prediction yet (run 推理一次 first)"
-        return env.validate_and_stage(actions[:1] if once else actions)
+        cursor = self._exec_cursor
+        n = len(actions)
+        if cursor >= n:                     # chunk already fully executed
+            return False, "本次推理已全部执行，请先 推理一次"
+        end = cursor + 1 if once else n
+        ok, reason = env.validate_and_stage(actions[cursor:end])
+        if ok:
+            self._exec_cursor = end
+        return ok, reason
 
     # ------------------------------------------------------------------ #
     #  Auto loop: predict + submit continuously                            #

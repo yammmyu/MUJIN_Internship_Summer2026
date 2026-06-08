@@ -17,15 +17,122 @@ class PickPlaceMixin:
     """抓取任务：手/目标坐标、轨迹规划与执行、抓取动作、抓取任务面板。"""
 
     def _run_validation(self, once=False):
-        """Validate the last prediction in the sim off the Tk thread (it can take a few seconds
-        while the sim plays the trajectory) and report the result to the status bar."""
+        """Step the last prediction through the sim off the Tk thread (it can take a few seconds
+        while the sim plays the trajectory) and report the result to the status bar.
+
+        once=True validates+stages the NEXT unexecuted action row; once=False the REMAINING
+        rows. Both become no-ops once the chunk is fully consumed (see _refresh_validation_buttons).
+        """
         def worker():
             ok, reason = self.inference.execute_inference_result(once=once)
-            msg = ("✅ 仿真验证通过，可释放到真机" if ok
+            remaining = self.inference.steps_remaining()
+            msg = (f"✅ 仿真验证通过（剩余 {remaining} 步），可释放到真机" if ok
                    else f"❌ 仿真验证失败：{reason}")
-            self.root.after(0, lambda: self.status_text.set(msg))
+            def done():
+                self.status_text.set(msg)
+                self._refresh_validation_buttons()
+                self._refresh_release_buttons()    # a successful validate stages new substeps
+            self.root.after(0, done)
         self.status_text.set("仿真验证中…")
         threading.Thread(target=worker, daemon=True).start()
+
+    def _run_inference_once(self):
+        """推理一次, off the Tk thread (the server round-trip can block for seconds). On
+        completion a fresh chunk exists, so re-enable the step-through buttons."""
+        def worker():
+            ok = self.inference.inference_once()
+            remaining = self.inference.steps_remaining()
+            msg = (f"✅ 推理完成，共 {remaining} 步" if ok else "❌ 推理失败")
+            def done():
+                self.status_text.set(msg)
+                self._refresh_validation_buttons()
+            self.root.after(0, done)
+        self.status_text.set("推理中…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_release_substeps(self, remaining=False):
+        """释放 staged substeps to the real robot. remaining=False sends the next single substep
+        (one 33ms tick); remaining=True streams all staged substeps at the 33ms tick. No-op (with
+        a status note) when nothing is staged."""
+        if remaining:
+            n = self.env.release_remaining_substeps()
+        else:
+            n = self.env.release_next_substep()
+        staged = self.env.staged_substeps
+        if n > 0:
+            self.status_text.set(f"🚀 已下发 {n} 条指令到真机（剩余待释放 {staged} 子步）")
+        else:
+            self.status_text.set("⚠ 没有待释放的子步（先在仿真中验证）")
+        self._refresh_release_buttons()            # staged buffer shrank (maybe now empty)
+
+    def _refresh_validation_buttons(self):
+        """Enable the 单步/整条 buttons only while the current chunk has unexecuted steps; grey
+        them out (and they no-op anyway) once it's consumed or there's no prediction."""
+        try:
+            remaining = self.inference.steps_remaining()
+        except Exception:
+            remaining = 0
+        flag = "!disabled" if remaining > 0 else "disabled"
+        for name in ("_btn_validate_step", "_btn_validate_rest"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.state([flag])
+
+    def _update_substep_monitor(self):
+        """Refresh the live joints readout + the rolling next-10 staged-substep table (each cell
+        shows the joint value and its delta vs the previous row / the live pose). Reschedules
+        itself ~5 Hz; the staged buffer draining in real time produces the rolling effect."""
+        try:
+            # --- live actual left-arm joints (delta reference for substep #0) ---
+            try:
+                actual = list(self.left_arm_joint_values)
+            except Exception:
+                actual = None
+            if actual is not None and len(actual) >= 7:
+                self._monitor_actual_var.set(
+                    "   ".join(f"J{k+1}:{actual[k]:+.3f}" for k in range(7)))
+                prev = np.asarray(actual[:7], dtype=np.float64)
+            else:
+                self._monitor_actual_var.set("（无法读取关节）")
+                prev = None
+
+            # --- next up-to-10 staged substeps, with per-joint delta vs the previous row ---
+            try:
+                subs = self.env.staged_preview(self._monitor_rows)
+            except Exception:
+                subs = []
+            for i in range(self._monitor_rows):
+                iid = f"subrow{i}"
+                if i < len(subs):
+                    q = np.asarray(subs[i], dtype=np.float64)
+                    if prev is not None and len(prev) >= 7:
+                        d = q - prev
+                        vals = [f"{q[k]:+.3f} (Δ{d[k]:+.3f})" for k in range(7)]
+                    else:
+                        vals = [f"{q[k]:+.3f}" for k in range(7)]
+                    self._monitor_tree.item(iid, values=(i, *vals))
+                    prev = q
+                else:
+                    self._monitor_tree.item(iid, values=(i, *[""] * 7))
+        except tk.TclError:
+            self._monitor_after_id = None       # widget destroyed (window closed) -> stop
+            return
+        finally:
+            if getattr(self, "_monitor_after_id", None) is not None:
+                self._monitor_after_id = self.root.after(200, self._update_substep_monitor)
+
+    def _refresh_release_buttons(self):
+        """Enable the 释放(单步)/释放(剩余) buttons only while substeps are staged for release;
+        grey them out (and they no-op anyway) once the staged buffer is empty."""
+        try:
+            staged = self.env.staged_substeps
+        except Exception:
+            staged = 0
+        flag = "!disabled" if staged > 0 else "disabled"
+        for name in ("_btn_release_step", "_btn_release_rest"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.state([flag])
 
     @property
     def wheel_angle_deg(self):
@@ -398,19 +505,22 @@ class PickPlaceMixin:
                   style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(manual_row, text="推理一次",
                    style="Primary.TButton",
-                   command=lambda: self.inference.inference_once()
+                   command=lambda: self._run_inference_once()
                    ).pack(side=tk.LEFT, padx=4)
         # "执行" now means VALIDATE-IN-SIM (step + self-collision + readback); it stages the
         # sim-validated trajectory but does NOT touch the robot. Run off the Tk thread so the
-        # GUI doesn't freeze while the sim plays the trajectory.
-        ttk.Button(manual_row, text="仿真验证(单步)",
+        # GUI doesn't freeze while the sim plays the trajectory. 单步 steps to the NEXT predicted
+        # target; 整条 runs the REMAINING targets; both disable once the chunk is consumed.
+        self._btn_validate_step = ttk.Button(manual_row, text="仿真验证(单步)",
                    style="Primary.TButton",
-                   command=lambda: self._run_validation(once=True)
-                   ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(manual_row, text="仿真验证(整条)",
+                   command=lambda: self._run_validation(once=True))
+        self._btn_validate_step.pack(side=tk.LEFT, padx=4)
+        self._btn_validate_rest = ttk.Button(manual_row, text="仿真验证(整条)",
                    style="Primary.TButton",
-                   command=lambda: self._run_validation(once=False)
-                   ).pack(side=tk.LEFT, padx=4)
+                   command=lambda: self._run_validation(once=False))
+        self._btn_validate_rest.pack(side=tk.LEFT, padx=4)
+        # No prediction yet -> start disabled; 推理一次 re-enables them.
+        self._refresh_validation_buttons()
 
         auto_row = ttk.Frame(sec_inf)
         auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
@@ -434,21 +544,67 @@ class PickPlaceMixin:
                    style="Primary.TButton",
                    command=lambda: self.launch_sim()
                    ).pack(side=tk.LEFT, padx=4)
-        # Release the LAST sim-VALIDATED trajectory to the robot (only path to hardware).
-        ttk.Button(sim_row, text="🚀 释放到真机",
+        # Release staged sim-validated substeps to the robot (only path to hardware). 仿真验证
+        # accumulates substeps; 释放(单步) sends the next one (one 33ms tick), 释放(剩余) streams
+        # the rest at the 33ms tick.
+        self._btn_release_step = ttk.Button(sim_row, text="🚀 释放子步(单步)",
                    style="Danger.TButton",
-                   command=lambda: self.env.release_to_robot()
-                   ).pack(side=tk.LEFT, padx=4)
+                   command=lambda: self._run_release_substeps(remaining=False))
+        self._btn_release_step.pack(side=tk.LEFT, padx=4)
+        self._btn_release_rest = ttk.Button(sim_row, text="🚀 释放子步(剩余)",
+                   style="Danger.TButton",
+                   command=lambda: self._run_release_substeps(remaining=True))
+        self._btn_release_rest.pack(side=tk.LEFT, padx=4)
+        # Nothing staged yet -> start disabled; 仿真验证 enables them.
+        self._refresh_release_buttons()
         # E-STOP: latched; drops pending + actively holds. Physical E-stop remains primary.
+        # It also clears the staged buffer, so grey out the release buttons.
         ttk.Button(sim_row, text="⛔ 急停",
                    style="Danger.TButton",
-                   command=lambda: self.env.lock_robot()
+                   command=lambda: (self.env.lock_robot(), self._refresh_release_buttons())
                    ).pack(side=tk.LEFT, padx=4)
         # Clear the latched E-stop (only after the operator confirms the arm is safe).
-        ttk.Button(sim_row, text="复位急停",
+        ttk.Button(sim_row, text="重置急停",
                    style="Muted.TButton",
                    command=lambda: self.env.reset_estop()
                    ).pack(side=tk.LEFT, padx=4)
+
+        # ===== 子步监视：实时左臂7关节 + 待释放子步滚动表（含每关节增量） =====
+        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（左臂 7 关节，单位 rad）  ")
+        sec_monitor.pack(fill=tk.X, padx=10, pady=6)
+
+        # Live actual left-arm joints (pulled from the robot each refresh tick).
+        live_row = ttk.Frame(sec_monitor)
+        live_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(live_row, text="实时关节:",
+                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self._monitor_actual_var = tk.StringVar(value="（等待数据）")
+        ttk.Label(live_row, textvariable=self._monitor_actual_var,
+                  style="Value.TLabel").pack(side=tk.LEFT)
+
+        ttk.Label(sec_monitor,
+                  text="待释放子步（# 0 = 下一个释放；括号内为相对上一行/实时关节的增量 Δ）",
+                  anchor=tk.W).pack(fill=tk.X, padx=8, pady=(2, 2))
+
+        # Rolling table: one row per upcoming substep, value "q (Δ)" per joint. Rows are
+        # pre-created and rewritten in place each tick so substeps appear to scroll up as
+        # they are released.
+        cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7")
+        tree = ttk.Treeview(sec_monitor, columns=cols, show="headings", height=10)
+        tree.heading("idx", text="#")
+        tree.column("idx", width=32, anchor="center", stretch=False)
+        for k, c in enumerate(cols[1:], start=1):
+            tree.heading(c, text=f"J{k}")
+            tree.column(c, width=120, anchor="center", stretch=True)
+        tree.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._monitor_tree = tree
+        self._monitor_rows = 10
+        for i in range(self._monitor_rows):
+            tree.insert("", "end", iid=f"subrow{i}", values=(i, *[""] * 7))
+
+        # Start the periodic refresh (idempotent — only schedules once).
+        if getattr(self, "_monitor_after_id", None) is None:
+            self._monitor_after_id = self.root.after(200, self._update_substep_monitor)
 
         # ===== 6. VR控制 =====
         sec_vr = ttk.LabelFrame(body, text="  ●  VR控制  ")

@@ -183,7 +183,8 @@ class RobotControlGUI(
         # RECORD_HZ 抓取、空闲自动退订（关流）。cameras= 为「常开」相机（数据采集模式用），
         # GUI 普通模式传 [] -> 启动时不订阅任何相机、无视频流带宽。robot/controller 仍共享。
         # real=True: enables the release pipeline. Actions always run in the sim preview first;
-        # only "释放到真机" (release_to_robot) replays a sim-executed trajectory on the robot.
+        # 仿真验证 accumulates sim-validated substeps, and only 释放(单步)/释放(剩余)
+        # (release_next_substep / release_remaining_substeps) drive them onto the robot.
         self.env = HumanoidEnv(
             robot=self.robot,
             robot_controller=self.robot_controller,
