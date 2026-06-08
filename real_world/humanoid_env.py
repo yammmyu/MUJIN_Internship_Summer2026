@@ -28,7 +28,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from real_world.ik import IKQuery, build_solver
+from real_world.ik import IKQuery, build_solver, rot6d_to_quat as _ik_rot6d_to_quat
 
 # a2d_sdk only exists on the robot machine. A sim-only machine (pybullet but no SDK) still
 # needs to import this module for the IK/exec path, so guard the import. The sim runner never
@@ -39,6 +39,23 @@ except ImportError:
     Robot = Camera = RobotController = None
 
 RECORD_HZ = 30
+
+# ----------------------------------------------------------------------------- #
+#  Safety limits for the real-robot release path (see the safety-review fixes).  #
+#  Conservative defaults for first hardware bring-up; tune up only after runs.   #
+# ----------------------------------------------------------------------------- #
+# Max per-tick change of any single arm joint on the hardware path (rad). The
+# validation pass subdivides to respect this and the release loop clamps to it,
+# so a step-change target becomes a bounded ramp instead of a snap. (C5)
+MAX_JOINT_STEP = 0.05            # ~2.9 deg per tick @ RECORD_HZ -> ~86 deg/s ceiling
+# Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
+QUAT_ALPHA = 0.5
+# Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
+# target outside is rejected (never sent to IK/robot). Generous box; tighten per workspace. (H4)
+WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y..),(z..)
+# A live observation older than this (no real change in EE pose / camera) is "stale": the
+# auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
+STALE_TIMEOUT = 0.5             # seconds
 
 # Cameras captured to disk during data collection (mirrors the old
 # RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
@@ -85,36 +102,43 @@ def _default_camera_intrinsics(name):
 def rot6d_to_quat(rot6d):
     """6D rotation (first two rotation-matrix columns) -> quaternion [x, y, z, w].
 
-    Mirrors diffusion_policy/scripts/build_left_arm_ee_replay_buffer.py:_6d_rot_to_quat
-    for a single sample, so the live decode matches how the training data was built.
+    Delegates to the pinocchio-based converter in real_world.ik (Gram-Schmidt to a proper
+    rotation matrix, then an exact matrix->quaternion). The previous hand-written
+    matrix->quaternion here was numerically wrong for many rotations (round-trip rotation error
+    up to ~2.4 vs ~1e-8 for the correct one), which corrupted decoded EE orientations and made
+    ~20% of recorded targets spuriously IK-unreachable.
     """
-    rot6d = np.asarray(rot6d, dtype=np.float64)
-    c1 = rot6d[:3]
-    c2 = rot6d[3:6]
-    # Gram-Schmidt orthonormalisation
-    c1 = c1 / (np.linalg.norm(c1) + 1e-8)
-    c2 = c2 - np.dot(c2, c1) * c1
-    c2 = c2 / (np.linalg.norm(c2) + 1e-8)
-    c3 = np.cross(c1, c2)
-    m = np.stack([c1, c2, c3], axis=-1)  # rotation matrix (columns = c1,c2,c3)
-    t = m[0, 0] + m[1, 1] + m[2, 2]
-    if t > 0:
-        s = 0.5 / np.sqrt(t + 1.0)
-        q = [(m[2, 1] - m[1, 2]) * s, (m[0, 2] - m[2, 0]) * s,
-             (m[1, 0] - m[0, 1]) * s, 0.25 / s]
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
-        q = [0.25 * s, (m[0, 1] + m[1, 0]) / s,
-             (m[0, 2] + m[2, 0]) / s, (m[2, 1] - m[1, 2]) / s]
-    elif m[1, 1] > m[2, 2]:
-        s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
-        q = [(m[0, 1] + m[1, 0]) / s, 0.25 * s,
-             (m[1, 2] + m[2, 1]) / s, (m[0, 2] - m[2, 0]) / s]
-    else:
-        s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
-        q = [(m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s,
-             0.25 * s, (m[0, 1] - m[1, 0]) / s]
-    return [float(v) for v in q]
+    return np.asarray(_ik_rot6d_to_quat(rot6d), dtype=np.float64)
+
+
+def _slerp(q0, q1, t):
+    """Spherical-linear interpolation between two quaternions (any consistent layout; we use
+    xyzw). t in [0,1]; t=0 -> q0, t=1 -> q1. Takes the shorter arc."""
+    q0 = np.asarray(q0, dtype=np.float64)
+    q1 = np.asarray(q1, dtype=np.float64)
+    q0 = q0 / (np.linalg.norm(q0) + 1e-12)
+    q1 = q1 / (np.linalg.norm(q1) + 1e-12)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:                      # shorter arc
+        q1 = -q1
+        d = -d
+    if d > 0.9995:                   # nearly aligned -> linear + renormalize
+        out = q0 + t * (q1 - q0)
+        return out / (np.linalg.norm(out) + 1e-12)
+    th0 = np.arccos(d)
+    s0 = np.sin((1.0 - t) * th0) / np.sin(th0)
+    s1 = np.sin(t * th0) / np.sin(th0)
+    return s0 * q0 + s1 * q1
+
+
+def _smooth_quat_step(prev, quat, alpha):
+    """One step of orientation smoothing (H3): SLERP the previous target toward the new quat
+    by `alpha` (1.0 = no smoothing). `prev` None -> pass the new quat through unchanged."""
+    q = np.asarray(quat, dtype=np.float64)
+    q = q / (np.linalg.norm(q) + 1e-12)
+    if prev is None:
+        return q
+    return _slerp(prev, q, alpha)
 
 
 class HumanoidEnv:
@@ -145,28 +169,40 @@ class HumanoidEnv:
             time.sleep(1.0)  # let freshly-created DDS resources come up
 
         # --- IK-based execution: sim backend + a sim-BEFORE-robot release pipeline ---
-        # Non-negotiable invariant: an action can reach the real robot ONLY after it has been
-        # executed in the sim. This is enforced structurally, not by discipline:
-        #   * _exec_loop runs every action through IK -> sim (the only sim driver).
-        #   * A "releasable" chunk (the manual 执行 button) is recorded as it executes; when it
-        #     finishes in sim it becomes self._last_sim_traj.
-        #   * release_to_robot() is the ONLY thing that enqueues onto self._robot_q, and it can
-        #     only copy from self._last_sim_traj — i.e. a trajectory the sim already ran.
+        # Non-negotiable invariant: an action can reach the real robot ONLY after the sim has
+        # stepped through it, self-collision-checked it, and read back the achieved joints.
+        # Enforced structurally, not by discipline:
+        #   * SimEnv.validate (on the sim thread) is the ONLY producer of self._last_sim_traj;
+        #     it cannot run without a live sim, so "no sim" => nothing is ever releasable.
+        #   * release_to_robot() is the ONLY thing that enqueues onto self._robot_q, copying a
+        #     freshly-validated trajectory (one-shot, latch-guarded, E-stop-guarded).
         #   * _release_loop is the ONLY caller of _command_left_joints, draining _robot_q.
-        # Auto-run submits non-releasable chunks, so it drives the sim only and never the robot.
-        self.sim = sim                               # object with .command(q7, grip), or None
+        #   * _exec_loop drives the sim only (auto/replay preview); it never touches the robot.
+        self.sim = sim                               # SimEnv (command/validate), or None
         self.solver = solver if solver is not None else build_solver()
         self._real = real
         # IK warm-start seed (7,). Seeded from the recording's first arm joints when given,
         # else the limit-clipped zero config.
         self._last_q = (np.asarray(seed_q, dtype=np.float64).copy()
                         if seed_q is not None else self.solver.m.clip(np.zeros(7)))
+        self._quat_prev = None                       # previous target quat for SLERP smoothing (H3)
         # Release pipeline state (guarded by self._lock):
-        self._queue_releasable = False               # is the current action queue releasable?
-        self._sim_traj_rec = None                    # accumulator while a releasable chunk runs
-        self._last_sim_traj = []                     # last chunk fully executed in sim (releasable)
-        self._robot_q = deque()                      # sim-validated cmds released, pending on robot
+        self._last_sim_traj = []                     # [(q7_achieved, grip)] last validated traj
+        self._validation_id = 0                      # bumped on each successful validation
+        self._released_id = -1                       # validation_id already released (one-shot, H1)
+        self._robot_q = deque()                      # released, sim-validated cmds pending on robot
         self._release_thread = None
+        self._estop = threading.Event()              # latched stop for the release path (C3)
+        self._last_good_arm14 = None                 # last finite 14-joint read (right-arm hold, C4)
+        self._release_right_hold = None              # right-arm hold (7,) captured at release (C4)
+
+        # Liveness/staleness tracking (H2): the collect loop bumps _fresh_mono only when the EE
+        # pose or a policy camera frame ACTUALLY changes, so a frozen feed is detectable even
+        # though every tick is "recent". _firmware_has_error mirrors get_motion_status().
+        self._fresh_mono = 0.0
+        self._last_ee_sig = None
+        self._last_cam_sig = {}
+        self._firmware_has_error = False
 
         # Names a consumer is allowed to request (validation only — not subscribed).
         self.cameras = list(allowed_cameras)
@@ -440,14 +476,35 @@ class HumanoidEnv:
                 grip = self.robot.gripper_states()[0]
                 ee_state = self._left_ee_from(status, grip)
                 self._update_latest_poses(status)
+                self._read_arm14()                      # refresh last-good arm read (C4)
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
                 status = grip = ee_state = None
 
             frames = self._read_frames(desired)
 
+            # Freshness (H2): did the EE pose or a policy camera frame actually CHANGE? Only then
+            # bump _fresh_mono. A frozen feed (stale arm_joint_states / dropped camera) stops
+            # advancing _fresh_mono even though `now` keeps moving, so get_obs can flag staleness.
+            changed = False
+            ee_sig = tuple(np.round(ee_state, 6)) if ee_state is not None else None
+            if ee_sig is not None and ee_sig != self._last_ee_sig:
+                changed = True
+            cam_sigs = {n: self._frame_sig(frames[n][-1]) for n in (AGENT_CAMERA, HAND_CAMERA)
+                        if n in frames}
+            for n, sig in cam_sigs.items():
+                if sig != self._last_cam_sig.get(n):
+                    changed = True
+            fw_error = bool(status and status.get('error', {}).get('has_error'))
+
             with self._lock:
                 self._obs_timestamp = now
+                self._firmware_has_error = fw_error
+                if ee_sig is not None:
+                    self._last_ee_sig = ee_sig
+                self._last_cam_sig.update(cam_sigs)
+                if changed or self._fresh_mono == 0.0:
+                    self._fresh_mono = now_mono
                 for name, pair in frames.items():
                     self._frames[name] = pair
                 if ee_state is not None:
@@ -493,6 +550,34 @@ class HumanoidEnv:
             1.0 if grip[0] > 0.5 else 0.0,
         ]
 
+    @staticmethod
+    def _frame_sig(frame):
+        """Cheap change signature for a camera frame (H2): a coarse subsample, not the whole
+        image, so per-tick freeze detection stays light. None frame -> None."""
+        if frame is None:
+            return None
+        a = np.asarray(frame)
+        return a[::64, ::64].tobytes() if a.ndim >= 2 else a.tobytes()
+
+    def _firmware_unsafe(self):
+        """Defense-in-depth: True if get_motion_status reports an error or active collisions, or
+        can't be read. Polled on the release path so a firmware-detected fault triggers E-stop
+        even for hazards the (self-collision-only) sim can't see (e.g. hitting the table)."""
+        try:
+            st = self.robot_controller.get_motion_status()
+        except Exception as e:
+            print(f"[HumanoidEnv] get_motion_status failed during release: {e}")
+            return True
+        if not st:
+            return True
+        if st.get('error', {}).get('has_error'):
+            print(f"[HumanoidEnv] firmware error: {st['error'].get('message')}")
+            return True
+        if st.get('collisions'):
+            print(f"[HumanoidEnv] firmware collision(s): {st['collisions']}")
+            return True
+        return False
+
     def _update_latest_poses(self, status):
         """Refresh the cached both-arm EE poses shown by the data-collection GUI."""
         frames = status['frames']
@@ -531,6 +616,9 @@ class HumanoidEnv:
             hand_imgs:  [hand_left_{t-1}, hand_left_t]
             state:      [ee_{t-1}, ee_t]   each [pos(3), quat(4), grip(1)]
             timestamp:  float (seconds)
+            age:        seconds since the EE pose / cameras last actually changed (H2)
+            stale:      True if age > STALE_TIMEOUT or the firmware reports an error
+            firmware_error: bool
         """
         # Keep the two policy cameras warm while inference polls get_obs().
         print("[HumanoidEnv] requesting hand and head camera")
@@ -543,64 +631,149 @@ class HumanoidEnv:
             if any(self._frames.get(n) is None for n in (AGENT_CAMERA, HAND_CAMERA)):
                 print("[HumanoidEnv] Wait for Camera")
                 return None
+            age = (time.monotonic() - self._fresh_mono) if self._fresh_mono else float('inf')
+            stale = age > STALE_TIMEOUT or self._firmware_has_error
             return {
                 'agent_imgs': copy.deepcopy(self._frames[AGENT_CAMERA]),
                 'hand_imgs': copy.deepcopy(self._frames[HAND_CAMERA]),
                 'state': copy.deepcopy(self._last_two_ee_states),
                 'timestamp': self._obs_timestamp,
+                'age': age,
+                'stale': bool(stale),
+                'firmware_error': bool(self._firmware_has_error),
             }
 
     # ===================== caller -> env: hand off a prediction =====================
-    def submit_actions(self, action_chunk, releasable=False):
-        """Replace the pending action queue with the newest predicted chunk.
-
-        action_chunk: list of rows [eef_pos(3), 6D_rot(6), gripper(1)].
-        releasable: True for the manual "执行" path — the chunk is recorded as it runs in sim
-            and, once finished, becomes self._last_sim_traj (eligible for release_to_robot).
-            False for auto-run — sim only, never releasable, so auto never reaches the robot.
-        """
+    def submit_actions(self, action_chunk):
+        """Hand a chunk to the SIM-PREVIEW queue (auto-run / replay). Sim only — this path can
+        NEVER reach the robot. The hardware path is validate_and_stage() + release_to_robot()."""
         with self._lock:
             self._action_queue = copy.deepcopy(list(action_chunk)) if action_chunk else []
-            self._queue_releasable = bool(releasable and action_chunk)
-            # Start a fresh recording for a releasable chunk; a non-releasable (auto) chunk
-            # invalidates any stale releasable trajectory so it can't be released later.
-            self._sim_traj_rec = [] if self._queue_releasable else None
-            if not self._queue_releasable:
-                self._last_sim_traj = []
 
     def queue_empty(self):
         """True when no actions are pending (used by runners to detect drain)."""
         with self._lock:
             return not self._action_queue
 
-    # ===================== real-robot release ("run in sim, then release") =====================
-    def release_to_robot(self):
-        """Replay the last sim-executed trajectory on the REAL robot.
+    def _make_solve_fn(self):
+        """Build the per-action solve callback the sim validation uses: workspace check (H4) +
+        orientation smoothing (H3) + our IK. Returns (q7|None, grip, reason)."""
+        qprev_box = [None]    # local quat-smoothing state (don't disturb the preview's)
 
-        This is the ONLY way actions reach the robot, and it can only copy self._last_sim_traj
-        — a trajectory that has already finished executing in the sim — onto the robot queue.
-        So it is impossible to command the robot with an action the sim hasn't run.
-        Returns the number of points queued (0 if nothing has been validated in sim yet)."""
+        def solve_fn(action, seed):
+            pos, quat, grip = self._decode_ee_action(action)
+            pos = np.asarray(pos, dtype=np.float64)
+            if not self._pos_in_workspace(pos):                                  # H4
+                return None, grip, "target EE pos outside workspace envelope"
+            qprev_box[0] = _smooth_quat_step(qprev_box[0], quat, QUAT_ALPHA)     # H3
+            q7 = self.solver.solve(IKQuery(target_pos=pos, target_quat=qprev_box[0],
+                                           current_joints=seed))
+            if not self.solver.last_reachable:
+                return None, grip, f"IK unreachable (pos err {self.solver.last_pos_err*1000:.0f} mm)"
+            return q7, grip, None
+
+        return solve_fn
+
+    def calibrate_collisions(self, action_chunk):
+        """Learn this coarse URDF's inherent self-collision overlaps from a KNOWN-SAFE action
+        chunk: walk it through the sim (same subdivide+settle as validation) and absorb every
+        new left-side contact into the ignore baseline. Run over a representative corpus of safe
+        recordings before trusting validation, or it will false-positive on normal poses."""
+        if self.sim is None:
+            return False, "no sim running"
+        self.sim.validate(action_chunk, self._make_solve_fn(), self._last_q, MAX_JOINT_STEP,
+                          learn=True)
+        return True, "collision baseline updated"
+
+    # ===================== manual: validate a chunk in the sim, then release =====================
+    def validate_and_stage(self, action_chunk):
+        """Run a predicted chunk through the SIM (step + self-collision + joint readback) and,
+        on success, stage the sim-ACHIEVED joint trajectory for release. This is the ONLY
+        producer of self._last_sim_traj, and it requires a live sim — so without a sim nothing
+        is ever releasable. Returns (ok: bool, reason: str)."""
+        if self.sim is None:
+            return False, "no sim running — press 启动仿真预览 first"
+        if not action_chunk:
+            return False, "empty action chunk"
+
+        traj, ok, reason = self.sim.validate(action_chunk, self._make_solve_fn(),
+                                             self._last_q, MAX_JOINT_STEP)
+        with self._lock:
+            if ok and traj:
+                self._last_sim_traj = traj
+                self._validation_id += 1
+                print(f"[HumanoidEnv] sim-validated {len(traj)} points (id {self._validation_id}); "
+                      f"press 释放到真机 to run on the robot.")
+            else:
+                self._last_sim_traj = []
+                print(f"[HumanoidEnv] sim validation FAILED: {reason}")
+        return ok, (reason or "")
+
+    # ===================== real-robot release ("validate in sim, then release") =====================
+    def release_to_robot(self):
+        """Replay the LAST sim-validated trajectory on the REAL robot. The only path to
+        hardware. One-shot (a validation can be released once, H1), refused while E-stopped,
+        ramped in from the current measured pose (C5), with a right-arm hold captured from a
+        fresh good read (never zeros, C4). Returns the number of points queued."""
         if not self._real:
-            print("[HumanoidEnv] release_to_robot ignored: env built with real=False.")
+            print("[HumanoidEnv] release ignored: env built with real=False.")
+            return 0
+        if self._estop.is_set():
+            print("[HumanoidEnv] release refused: E-stop latched (press 复位 to reset).")
             return 0
         with self._lock:
             traj = list(self._last_sim_traj)
+            vid = self._validation_id
             if not traj:
-                print("[HumanoidEnv] release_to_robot: no sim-validated trajectory yet "
-                      "(run 执行 in the sim first).")
+                print("[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).")
                 return 0
-            self._robot_q.extend(traj)
-        print(f"[HumanoidEnv] released {len(traj)} sim-validated points to the robot.")
-        return len(traj)
+            if vid == self._released_id:
+                print("[HumanoidEnv] release refused: already released; run 执行 again.")
+                return 0
+        arm14 = self._read_arm14()                       # C4: need a real right-arm hold
+        if arm14 is None:
+            print("[HumanoidEnv] release refused: cannot read arm_joint_states (right-arm hold).")
+            return 0
+        ramp = self._ramp(arm14[:7], traj[0][0], MAX_JOINT_STEP, traj[0][1])   # C5 ramp-in
+        full = ramp + traj
+        with self._lock:
+            self._release_right_hold = arm14[7:].copy()
+            self._robot_q.clear()
+            self._robot_q.extend(full)
+            self._released_id = vid                      # H1: one-shot
+            self._last_sim_traj = []
+        print(f"[HumanoidEnv] released {len(traj)} validated pts (+{len(ramp)} ramp-in) to robot.")
+        return len(full)
 
     def lock_robot(self):
-        """Hard stop: drop every pending robot command so no further hardware motion happens."""
+        """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
+        current measured pose — the SDK has no brake, so re-commanding 'here' is the stop.
+        Stays latched until reset_estop(). (The physical E-stop remains the primary safety.)"""
+        self._estop.set()
         with self._lock:
             dropped = len(self._robot_q)
             self._robot_q.clear()
-        if dropped:
-            print(f"[HumanoidEnv] lock_robot: dropped {dropped} pending robot commands.")
+        print(f"[HumanoidEnv] E-STOP: latched; dropped {dropped} pending cmds; holding pose.")
+        if self._real:
+            arm14 = self._read_arm14()
+            if arm14 is None:
+                print("[HumanoidEnv] E-stop WARNING: no joint read to hold — use physical E-stop.")
+                return
+            for _ in range(3):                           # re-assert a few times to be sure
+                try:
+                    self.robot.move_arm(arm14.tolist())
+                except Exception as e:
+                    print(f"[HumanoidEnv] E-stop hold move_arm failed: {e}")
+
+    def reset_estop(self):
+        """Clear the latched E-stop (operator confirms the arm is safe). Release stays refused
+        until a fresh 执行→释放 (the previous trajectory was consumed)."""
+        self._estop.clear()
+        print("[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).")
+
+    @property
+    def estopped(self):
+        return self._estop.is_set()
 
     @property
     def robot_pending(self):
@@ -611,63 +784,98 @@ class HumanoidEnv:
         """Set the IK warm-start seed (e.g. to the robot's current left-arm joints)."""
         self._last_q = np.asarray(q7, dtype=np.float64).copy()
 
-    # ===================== consumer: execution loop (RealEnv.exec_actions) =====================
+    @staticmethod
+    def _ramp(q_from, q_to, cap, grip):
+        """Joint-space ramp from q_from to q_to with every step <= cap (rad). Includes q_to,
+        excludes q_from. Used so the first released command starts at the current pose (C5)."""
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap)) if cap > 0 else 1
+        n = max(n, 1)
+        return [(q_from + (q_to - q_from) * (i / n), float(grip)) for i in range(1, n + 1)]
+
+    def _pos_in_workspace(self, pos):
+        """True if the target EE position is inside the configured workspace AABB (H4)."""
+        (xl, xh), (yl, yh), (zl, zh) = WORKSPACE_AABB
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        return xl <= x <= xh and yl <= y <= yh and zl <= z <= zh
+
+    def _read_arm14(self):
+        """Return a finite 14-vector of arm joints, caching the last good read. Falls back to
+        the last good value on a failed/garbage read; None only if never read once (C4)."""
+        try:
+            cur, _ = self.robot.arm_joint_states()
+            arr = np.asarray(cur, dtype=np.float64)
+            if arr.shape == (14,) and np.all(np.isfinite(arr)):
+                self._last_good_arm14 = arr.copy()
+                return arr.copy()
+            print(f"[HumanoidEnv] arm_joint_states bad read (shape {arr.shape}); using last good.")
+        except Exception as e:
+            print(f"[HumanoidEnv] arm_joint_states read failed: {e}; using last good.")
+        return self._last_good_arm14.copy() if self._last_good_arm14 is not None else None
+
+    # ===================== consumer: sim-preview execution loop =====================
     def _exec_loop(self):
-        """Drain predicted EE poses -> our IK -> joints and drive the SIM only. The robot is
-        never touched here (see _release_loop); a releasable chunk is recorded as it executes
-        and, once drained, promoted to self._last_sim_traj for release_to_robot()."""
+        """Drain the sim-preview queue (auto-run / replay) -> IK -> SIM only. NEVER touches the
+        robot (that is _release_loop). Applies the same workspace + smoothing guards as
+        validation so the preview matches what would be validated."""
         while not self._stop_event.is_set():
             with self._lock:
                 action = self._action_queue.pop(0) if self._action_queue else None
-                releasable = self._queue_releasable
-                # Releasable chunk just finished draining -> publish it as the sim-validated
-                # trajectory eligible for release, then close the recording.
-                if action is None and releasable and self._sim_traj_rec is not None:
-                    if self._sim_traj_rec:
-                        self._last_sim_traj = self._sim_traj_rec
-                        print(f"[HumanoidEnv] sim-validated trajectory ready: "
-                              f"{len(self._last_sim_traj)} points (press 释放到真机 to run on robot).")
-                    self._sim_traj_rec = None
-                    self._queue_releasable = False
             if action is None:
                 self._stop_event.wait(self.dt)
-                continue                       # nothing pending; check again next tick
+                continue
 
             pos, quat, grip = self._decode_ee_action(action)
             pos = np.asarray(pos, dtype=np.float64)
+            if not self._pos_in_workspace(pos):                        # H4
+                print("[HumanoidEnv] preview: target outside workspace; skipping")
+                self._stop_event.wait(self.dt)
+                continue
             if self._smoothed_pos is None:
                 self._smoothed_pos = pos
             else:
                 self._smoothed_pos = self.pos_alpha * pos + (1.0 - self.pos_alpha) * self._smoothed_pos
+            self._quat_prev = _smooth_quat_step(self._quat_prev, quat, QUAT_ALPHA)   # H3
 
-            q7 = self._solve_ik(self._smoothed_pos, quat)
+            q7 = self._solve_ik(self._smoothed_pos, self._quat_prev)
             if q7 is None:                     # unreachable target -> skip (seed not advanced)
                 self._stop_event.wait(self.dt)
                 continue
-
-            # Drive the sim (the preview). Record into the releasable trajectory if this chunk
-            # is releasable -> only sim-executed points can ever be released to the robot.
             if self.sim is not None:
                 self.sim.command(q7, grip)
-            if releasable:
-                with self._lock:
-                    if self._sim_traj_rec is not None:
-                        self._sim_traj_rec.append((np.asarray(q7, dtype=np.float64).copy(),
-                                                   float(grip)))
             self._stop_event.wait(self.dt)
 
     def _release_loop(self):
         """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by
-        release_to_robot, which can only copy a sim-executed trajectory) and commands the arm,
-        paced at dt. Hard-stop (lock_robot) just clears the queue so this drains nothing."""
+        release_to_robot, which can only copy a sim-validated trajectory), clamps each step to
+        MAX_JOINT_STEP as a final guard (C5), and stops dead while E-stopped (C3)."""
+        last_cmd = None
         while not self._stop_event.is_set():
-            with self._lock:
-                cmd = self._robot_q.popleft() if self._robot_q else None
-            if cmd is None:
+            if self._estop.is_set():
+                last_cmd = None
                 self._stop_event.wait(self.dt)
                 continue
-            q7, grip = cmd
-            self._command_left_joints(q7, grip)
+            with self._lock:
+                cmd = self._robot_q.popleft() if self._robot_q else None
+                right_hold = self._release_right_hold
+            if cmd is None:
+                last_cmd = None
+                self._stop_event.wait(self.dt)
+                continue
+            if self._firmware_unsafe():                        # defense-in-depth: firmware fault
+                self.lock_robot()
+                continue
+            q7 = np.asarray(cmd[0], dtype=np.float64)
+            if last_cmd is not None:                          # final per-tick clamp (C5)
+                d = q7 - last_cmd
+                m = float(np.max(np.abs(d)))
+                if m > MAX_JOINT_STEP:
+                    q7 = last_cmd + d * (MAX_JOINT_STEP / m)
+            if not self._command_left_joints(q7, cmd[1], right_hold):
+                self.lock_robot()                              # couldn't form a safe cmd -> estop
+                continue
+            last_cmd = q7
             self._stop_event.wait(self.dt)
 
     def _decode_ee_action(self, action):
@@ -689,17 +897,21 @@ class HumanoidEnv:
         self._last_q = q7
         return q7
 
-    def _command_left_joints(self, q7, gripper):
-        """Command the REAL left arm to 7 joint angles via move_arm (SDK 7.2.1), holding the
-        right arm. move_arm takes 14 joint angles (both arms): left from IK, right read back
-        so it stays put. Only reached on the real+armed branch."""
-        positions = np.zeros(14, dtype=np.float64)
-        positions[:7] = q7
-        try:
-            cur, _ = self.robot.arm_joint_states()       # 14 values, both arms
-            positions[7:] = np.asarray(cur, dtype=np.float64)[7:]
-        except Exception as e:
-            print(f"[HumanoidEnv] arm_joint_states (right-arm hold) failed: {e}")
+    def _command_left_joints(self, q7, gripper, right_hold=None):
+        """Command the REAL left arm to 7 joints via move_arm (SDK 7.2.1), holding the right.
+        The right half NEVER falls to zero (C4): use the provided hold, else the last-good read;
+        if neither exists, REFUSE (return False) rather than drive the right arm to zero.
+        Returns True on success."""
+        if right_hold is None:
+            arm14 = self._read_arm14()
+            right_hold = arm14[7:] if arm14 is not None else None
+        if right_hold is None:
+            print("[HumanoidEnv] refuse move_arm: no right-arm hold (would zero the right arm).")
+            return False
+        positions = np.empty(14, dtype=np.float64)
+        positions[:7] = np.clip(np.asarray(q7, dtype=np.float64),
+                                self.solver.m.lower, self.solver.m.upper)
+        positions[7:] = np.asarray(right_hold, dtype=np.float64)
         self.robot.move_arm(positions.tolist())
         # move_gripper sets BOTH grippers, so read the current right value and leave it.
         left_cmd = 1.0 if gripper > 0.5 else 0.0
@@ -709,6 +921,7 @@ class HumanoidEnv:
         except Exception:
             right_cmd = 0.0
         self.robot.move_gripper([left_cmd, right_cmd])
+        return True
 
     # ===================== data-collection recording (ported from RobotDataCollector) =====================
     def start_recording(self, episode_name=None):

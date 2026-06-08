@@ -19,6 +19,7 @@ sim/CI path without `a2d_sdk`.
 """
 
 import os
+import queue
 import tempfile
 import threading
 import time
@@ -39,6 +40,11 @@ RIGHT_GRIPPER_JOINTS = ([f"right_narrow{i}_joint" for i in (1, 2, 3, 4)] +
                         [f"right_wide{i}_joint" for i in (1, 2, 3, 4)])
 WAIST_PITCH_JOINT = "joint_body_pitch"   # the URDF's only torso DOF (no head/lift joints)
 GRIPPER_CLOSE_RAD = 0.6   # rough scalar grip[0,1] -> joint angle (uncalibrated)
+# Self-collision is flagged only when two links INTERPENETRATE deeper than this (metres). The
+# URDF's coarse collision meshes (esp. the torso) over-approximate the real body by several cm
+# and graze at normal poses; requiring real penetration filters that noise while still catching
+# genuine collisions. Tune per URDF; pair with calibrate_collisions() over safe data if needed.
+SELF_COLLISION_PENETRATION = 0.02   # 2 cm
 
 
 def patched_urdf(urdf_path):
@@ -99,19 +105,39 @@ class SimEnv:
         tmp_urdf, search_dir = patched_urdf(urdf)
         p.setAdditionalSearchPath(search_dir)
         p.setGravity(0, 0, 0)                          # kinematic view: arm holds commanded pose
+        # NOTE: we deliberately do NOT pass URDF_USE_SELF_COLLISION. Enabling it makes the
+        # model's inherent mesh overlaps (gripper fingers, arm-base) generate contact forces
+        # that fling the unactuated right arm/body/grippers around. Self-collision is instead
+        # detected force-free via getClosestPoints (see _penetrating_pairs), which needs no flag
+        # and doesn't perturb the kinematic preview.
         try:
             self.body = p.loadURDF(tmp_urdf, useFixedBase=True)
         finally:
             os.remove(tmp_urdf)
         self.jmap = {}
         self.jlim = {}
+        self.link_name = {-1: "base"}
         for i in range(p.getNumJoints(self.body)):
             ji = p.getJointInfo(self.body, i)
             name = ji[1].decode()
             self.jmap[name] = i
             self.jlim[name] = (ji[8], ji[9])     # (lower, upper); lower>upper => no limit
+            self.link_name[i] = ji[12].decode()  # child link name of this joint
         self.arm_idx = [self.jmap[j] for j in LEFT_ARM_JOINTS]
         self.grip_idx = [self.jmap[j] for j in LEFT_GRIPPER_JOINTS if j in self.jmap]
+        # Self-collision trigger set = LEFT ARM links only (Joint*_l children). The right
+        # arm/gripper's inherent overlaps are irrelevant to a left-arm trajectory, and the LEFT
+        # gripper fingers' coarse, grip-driven meshes brush the arm base constantly -> excluded
+        # to avoid false positives. The real hazard we gate on is an ARM linkage hitting the
+        # torso / the other arm. (Gripper/environment hazards: firmware collisions + operator +
+        # physical E-stop.)
+        self._left_links = set(self.arm_idx)
+        # Parent/child link pairs always meet at their shared joint -> exclude from the
+        # force-free distance check (no EXCLUDE_PARENT flag applies to getClosestPoints).
+        self._adjacent = set()
+        for i in range(p.getNumJoints(self.body)):
+            parent = p.getJointInfo(self.body, i)[16]   # parent link index (-1 = base)
+            self._adjacent.add(tuple(sorted((i, parent))))
 
         # --- stepping / settling ---
         self.sim_hz = sim_hz
@@ -122,9 +148,19 @@ class SimEnv:
         self.settle_max_steps = max(1, int(settle_timeout_s * sim_hz))
         self.fixed_steps = max(1, int(sim_hz / playback_hz))
 
+        # --- self-collision baseline: left-arm link pairs already interpenetrating at the
+        # loaded/rest pose are inherent geometry overlaps; ignore them. Validation flags only
+        # NEW penetrations. getClosestPoints is force-free and needs no step priming.
+        self._ignore_pairs = self._penetrating_pairs()
+
         # --- live-drive handoff: latest (q7, grip) target, written by any thread ---
         self._target_lock = threading.Lock()
         self._target = None        # (np.ndarray(7,), float grip) or None
+
+        # --- job queue: validation must run on the owning thread (PyBullet single-thread). Any
+        # other thread submits a job; the owning thread runs it inside step()/run_until. ---
+        self._owner_tid = threading.get_ident()
+        self._job_q = queue.Queue()
 
     def connected(self):
         return p.isConnected()
@@ -188,11 +224,37 @@ class SimEnv:
                 cmds[n] = gr
         self._set_joints(cmds)
 
-    def step(self):
-        """Apply the latest commanded target (if any) and advance one sim step.
+    # ===================== jobs that must run on the owning thread =====================
+    def _drain_jobs(self):
+        """Run any queued owning-thread jobs (e.g. validation). Owning thread only."""
+        while True:
+            try:
+                fn, box, ev = self._job_q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                box["result"] = fn()
+            except Exception as e:                       # surface to the submitting thread
+                box["err"] = e
+            finally:
+                ev.set()
 
-        Owning thread only. GUI mode sleeps one dt so playback runs near real time.
-        """
+    def submit_job(self, fn):
+        """Run `fn` on the owning thread and return its result. Inline if already on the owning
+        thread; otherwise enqueue and block until step()/run_until executes it."""
+        if threading.get_ident() == self._owner_tid:
+            return fn()
+        box, ev = {}, threading.Event()
+        self._job_q.put((fn, box, ev))
+        ev.wait()
+        if "err" in box:
+            raise box["err"]
+        return box.get("result")
+
+    def step(self):
+        """Run pending owning-thread jobs, apply the latest commanded target (if any), and
+        advance one sim step. Owning thread only. GUI mode sleeps one dt for near real time."""
+        self._drain_jobs()
         with self._target_lock:
             target = self._target
         if target is not None:
@@ -219,6 +281,7 @@ class SimEnv:
 
     def idle_step(self):
         """Step once with no command applied (keeps the GUI responsive while idle)."""
+        self._drain_jobs()
         if self.direct:
             time.sleep(0.02)
         else:
@@ -227,6 +290,118 @@ class SimEnv:
 
     def _cur_arm_q(self):
         return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
+
+    # ===================== validation (run on the owning thread) =====================
+    def validate(self, actions, solve_fn, seed_q, max_joint_step, learn=False):
+        """Run a chunk through the sim; return (validated_traj, ok, reason). Thread-safe entry
+        (marshals to the owning thread via submit_job).
+
+        For each action: `solve_fn(action, seed) -> (q7|None, grip, reason)` (IK + envelope
+        checks done by the caller); subdivide seed->q7 so every step <= max_joint_step; apply,
+        settle, self-collision check; record the sim-ACHIEVED joints (not raw IK).
+        learn=False (validate): abort (ok=False) on a None q7 or any NEW left-side self-collision.
+        learn=True (calibrate): never abort on collision — instead ABSORB every new left-side
+        pair into the ignore baseline (used to learn this coarse URDF's inherent overlaps from
+        known-SAFE motions). Leaves the arm where it ended."""
+        return self.submit_job(
+            lambda: self._validate_impl(actions, solve_fn, seed_q, max_joint_step, learn))
+
+    def _validate_impl(self, actions, solve_fn, seed_q, max_joint_step, learn=False):
+        seed = np.asarray(seed_q, dtype=np.float64).copy()
+        # Deterministic start (so learn & validate see the same path, and repeat runs agree):
+        # reset the left arm to the seed AND the gripper to open.
+        self.reset_arm(seed)
+        for k in self.grip_idx:
+            p.resetJointState(self.body, k, 0.0)
+        out = []
+        for k, action in enumerate(actions):
+            q7, grip, why = solve_fn(action, seed)
+            if q7 is None:
+                if learn:                       # skip unreachable while learning; keep going
+                    continue
+                return [], False, f"action {k}: {why}"
+            q7 = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
+            for sub in self._subdivide(seed, q7, max_joint_step):
+                self._apply_arm(sub, grip)
+                self._settle(sub)
+                new = self._new_left_pairs()
+                if new:
+                    if learn:
+                        self._ignore_pairs |= new          # absorb inherent overlap
+                    else:
+                        a, b = sorted(new)[0]
+                        return [], False, (f"action {k}: self-collision "
+                                           f"{self.link_name.get(a, a)} <-> {self.link_name.get(b, b)}")
+                out.append((self._cur_arm_q().copy(), float(grip)))   # sim-ACHIEVED, not raw IK
+            seed = q7
+        return out, True, None
+
+    @staticmethod
+    def _subdivide(q_from, q_to, cap):
+        """Configs from q_from->q_to (excl. start, incl. end) with every step <= cap rad."""
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap)) if cap > 0 else 1
+        n = max(n, 1)
+        return [q_from + (q_to - q_from) * (i / n) for i in range(1, n + 1)]
+
+    def _apply_arm(self, q7, grip):
+        p.setJointMotorControlArray(self.body, self.arm_idx, p.POSITION_CONTROL,
+                                    targetPositions=np.asarray(q7, dtype=np.float64).tolist(),
+                                    forces=[200.0] * len(self.arm_idx))
+        if self.grip_idx:
+            g = float(np.clip(grip, 0, 1)) * GRIPPER_CLOSE_RAD
+            p.setJointMotorControlArray(self.body, self.grip_idx, p.POSITION_CONTROL,
+                                        targetPositions=[g] * len(self.grip_idx),
+                                        forces=[20.0] * len(self.grip_idx))
+
+    def _settle(self, q_des):
+        """Step until the arm reaches q_des (or settle timeout). Sleeps in GUI mode so the user
+        sees the validated motion play out."""
+        q_des = np.asarray(q_des, dtype=np.float64)
+        for _ in range(self.settle_max_steps):
+            p.stepSimulation()
+            if not self.direct:
+                time.sleep(self.sim_dt)
+            if np.max(np.abs(self._cur_arm_q() - q_des)) < self.settle_tol:
+                break
+
+    def calibrate_collision(self, arm_configs):
+        """Union the self-collision pairs seen across KNOWN-SAFE left-arm configs into the ignore
+        baseline, then return its size. This URDF's torso/base collision meshes are coarse and
+        overlap the arm at normal operating poses; those overlaps are inherent (not real
+        collisions), so feed a representative corpus of safe configs (e.g. from recordings)
+        before validating. Genuinely novel/dangerous folds still trip NEW pairs. Owning thread."""
+        def job():
+            keep = self._cur_arm_q()
+            for q in arm_configs:
+                self.reset_arm(q)
+                self._ignore_pairs |= self._penetrating_pairs()
+            self.reset_arm(keep)
+            return len(self._ignore_pairs)
+        return self.submit_job(job)
+
+    def _penetrating_pairs(self):
+        """LEFT-ARM link vs any-other-link pairs interpenetrating beyond
+        SELF_COLLISION_PENETRATION, via getClosestPoints (geometry only -> no contact forces, no
+        URDF self-collision flag needed). Adjacent (parent/child) pairs are skipped."""
+        n = p.getNumJoints(self.body)
+        others = [-1] + list(range(n))
+        hits = set()
+        for la in self.arm_idx:
+            for lb in others:
+                if lb == la or tuple(sorted((la, lb))) in self._adjacent:
+                    continue
+                for cp in p.getClosestPoints(self.body, self.body, 0.0,
+                                             linkIndexA=la, linkIndexB=lb):
+                    if cp[8] < -SELF_COLLISION_PENETRATION:     # cp[8] = signed distance (<0 = overlap)
+                        hits.add(tuple(sorted((la, lb))))
+                        break
+        return hits
+
+    def _new_left_pairs(self):
+        """Set of NEW penetrating left-arm pairs (beyond the rest-pose baseline)."""
+        return self._penetrating_pairs() - self._ignore_pairs
 
     # ===================== recording replay (owning thread) =====================
     def replay(self, recording, recordings_dir, max_frames, emit):

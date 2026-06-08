@@ -129,6 +129,14 @@ class InferenceController:
         obs = self.obs_source.get_obs()
         if obs is None:
             return False
+        # Refuse to predict from stale/frozen sensors or under a firmware error (H2). A frozen
+        # camera/EE feed still has an advancing wall-clock timestamp, so the timestamp check
+        # below is NOT sufficient — `stale` reflects whether the data actually changed.
+        if obs.get('stale'):
+            print(f"[InferenceController] ABORT: observations are stale "
+                  f"(age={obs.get('age'):.2f}s, firmware_error={obs.get('firmware_error')}). "
+                  f"Not predicting from frozen sensor data.")
+            return False
         # Skip if we've already inferred on this observation (env publishes a
         # wall-clock timestamp with every snapshot).
         ts = obs['timestamp']
@@ -186,23 +194,23 @@ class InferenceController:
         return self._run_inference(submit=False)
 
     # ------------------------------------------------------------------ #
-    #  Hand the most recent stored prediction to the env's exec queue      #
+    #  Manual: validate the last prediction IN THE SIM, then stage it      #
     # ------------------------------------------------------------------ #
     def execute_inference_result(self, once: bool = False):
-        """Submit the last published action chunk to the env for execution.
+        """Run the last published action chunk through the SIM (step + self-collision +
+        readback) and stage the sim-validated trajectory for release. This is the manual
+        "执行" path; it never touches the robot — that needs a subsequent release_to_robot().
 
-        once=True submits only the first action row.
+        once=True validates only the first action row. Returns (ok, reason).
         """
         env = self.humanoid_env
         if env is None or self.robot_info is None:
-            return
+            return False, "no env / robot_info"
         with self.robot_info.lock:
             actions = copy.deepcopy(self.robot_info.left_joint_predict_action_values) or []
         if not actions:
-            return
-        # Manual execute is releasable: it runs in the sim AND becomes the trajectory the user
-        # can then release to the robot (auto-run uses the default releasable=False -> sim only).
-        env.submit_actions(actions[:1] if once else actions, releasable=True)
+            return False, "no prediction yet (run 推理一次 first)"
+        return env.validate_and_stage(actions[:1] if once else actions)
 
     # ------------------------------------------------------------------ #
     #  Auto loop: predict + submit continuously                            #

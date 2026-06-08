@@ -5,10 +5,85 @@
   - __init__：初始化机器人/相机/服务器与共享状态，搭建界面、启动后台线程
   - setup_ui：顶层布局
   - on_closing / main：生命周期与退出清理
+
+
+测试顺序
+Stage A — Automated checks (any machine with sim deps; no robot, no policy)
+A1. SDK-free import
+
+cd ~/Documents/Humanoid/humanoid
+.venv/bin/python -c "import real_world.humanoid_env, real_world.sim_backend, real_world.inference_controller; print('import OK')"
+Pass: prints import OK (proves the guarded SDK import works on a machine without a2d_sdk).
+
+A2. Safety-invariant suite (the fakes test — no hardware). Save it and run:
+
+
+.venv/bin/python /tmp/safety_suite.py   # the script from the last verification step
+Pass: FULL SAFETY SUITE: ALL PASS (C1 C2 C3 C4 C5 H1).
+This is your regression gate — re-run it after any change to humanoid_env.py/sim_backend.py. It checks: no-sim refusal, validate→release reaches robot, step ≤ cap, one-shot, E-stop latch+hold+refuse+reset, no-zero-right-arm.
+
+
+Stage B — Sim-only runner, no policy (no robot)
+
+.venv/bin/python scripts/sim_infer_eval.py --source replay \
+  --recording recording021 --recordings ~/Downloads/recordings
+Pass: PyBullet opens, the left arm tracks the recorded trajectory, exits clean. Watch for: arm starts at the recording's pose, motion is smooth, no IK unreachable spam.
+
+
+Stage C — Policy round-trip (needs the policy server reachable)
+
+python3 ping_inference_server.py --host 10.12.11.144 --port 9001   # reachability first
+.venv/bin/python scripts/sim_infer_eval.py --source policy \
+  --recording recording021 --recordings ~/Downloads/recordings \
+  --host 10.12.11.144 --port 9001
+Pass: predictions arrive, the sim arm follows the policy's output (not the recording). This validates the full inference→IK→sim path with zero hardware risk.
+
+
+Stage D — Tune the safety limits BEFORE the GUI (critical, do not skip)
+The defaults are guesses and must match your robot/workspace:
+
+Workspace envelope — confirm your real left-EE poses fall inside WORKSPACE_AABB (humanoid_env.py):
+
+.venv/bin/python -c "
+import numpy as np; from real_world.sim_backend import load_trajectory
+p,_,_,_,_ = load_trajectory('$HOME/Downloads/recordings','recording021')
+print('x',p[:,0].min(),p[:,0].max()); print('y',p[:,1].min(),p[:,1].max()); print('z',p[:,2].min(),p[:,2].max())"
+Set WORKSPACE_AABB to enclose real reachable space with margin. Pass: replaying a recording shows no "outside workspace" skips for known-good poses.
+SELF_COLLISION_PENETRATION and (optional) calibrate_collisions() — confirm safe recordings validate cleanly and an obvious folded pose is rejected.
+MAX_JOINT_STEP — start conservative (current 0.05 rad/tick ≈ 86°/s ceiling); only raise after a successful slow run.
+
+
+Stage E — On the robot machine, GUI, sim preview only (never release)
+Robot powered, physical E-stop in hand, arm workspace clear.
+
+python robot_control_gui.py
+
+启动仿真预览 → PyBullet opens and the sim matches the real arm's current pose (both arms, grippers, torso pitch). Pass: poses visibly match.
+推理一次 → a prediction is produced (no motion).
+仿真验证(整条) → status bar shows ✅ 仿真验证通过 (or ❌ … reason). Pass: the sim plays the trajectory; the real robot does NOT move.
+Confirm the real arm stayed still throughout. Do not press 释放到真机 yet.
+
+
+Stage F — Gated hardware release (physical E-stop in hand, finger ready)
+
+Only after E passes. Start with the arm in open space.
+
+推理一次 → 仿真验证(整条) → verify ✅ and watch the sim path is safe.
+🚀 释放到真机 → the real arm should ramp from its current pose (no jump) and follow the validated path slowly.
+Mid-motion, press ⛔ 急停 → arm must stop and hold immediately; status/log shows latch. Verify 复位急停 is required before another release works.
+Verify re-pressing 释放到真机 without a new 仿真验证 is refused (no snap-back).
+Verify a deliberately bad case: unplug/freeze a camera → 推理一次 should refuse with a stale-obs message.
+Abort criteria at any hardware stage: any unexpected motion, a jump at release start, E-stop not holding, or the right arm twitching → hit the physical E-stop, stop, and recheck.
+
+Two things I'd confirm before Stage F specifically:
+
+The active-hold stop assumes move_arm(current_joints) actually holds; verify the firmware behavior on a slow motion first (Stage F step 3 is exactly that test).
+The self-collision gate is best-effort (coarse meshes) — Stage F step 1's sim preview is your real visual check; don't rely on the gate alone.
 """
 
 import os
 import signal
+import sys
 import threading
 import time
 import tkinter as tk
@@ -331,6 +406,27 @@ class RobotControlGUI(
             os._exit(0)
 
 
+def _safety_preflight():
+    """Run the safety-invariant suite (scripts/test_safety_invariants.py) before the GUI builds
+    the robot. A failure means a safety regression and BLOCKS launch — the GUI can drive
+    hardware, so it must not start on a broken release pipeline. Set
+    HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (logs a loud warning)."""
+    if os.environ.get("HUMANOID_SKIP_SAFETY_PREFLIGHT") == "1":
+        print("\n*** WARNING: safety pre-flight SKIPPED via HUMANOID_SKIP_SAFETY_PREFLIGHT=1 ***\n")
+        return
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    print("[startup] running safety pre-flight (scripts/test_safety_invariants.py)…")
+    try:
+        from test_safety_invariants import run as run_safety
+        run_safety()
+    except Exception as e:
+        print(f"\n*** SAFETY PRE-FLIGHT FAILED: {type(e).__name__}: {e}\n"
+              f"*** Refusing to launch the control GUI. Fix the regression, or set\n"
+              f"*** HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (NOT recommended).\n")
+        sys.exit(1)
+    print("[startup] safety pre-flight passed.\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", action="store_true")
@@ -338,6 +434,8 @@ def main():
     args = parser.parse_args()
 
     camera_mode = "data" if args.data else "all"
+
+    _safety_preflight()    # block launch if the safety invariants regressed
 
     root = tk.Tk()
     app = RobotControlGUI(root, camera_mode)  # 样式由 _setup_styles 统一配置

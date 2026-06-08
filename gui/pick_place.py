@@ -1,5 +1,6 @@
 import copy
 import math
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -14,6 +15,17 @@ from constants import *
 
 class PickPlaceMixin:
     """抓取任务：手/目标坐标、轨迹规划与执行、抓取动作、抓取任务面板。"""
+
+    def _run_validation(self, once=False):
+        """Validate the last prediction in the sim off the Tk thread (it can take a few seconds
+        while the sim plays the trajectory) and report the result to the status bar."""
+        def worker():
+            ok, reason = self.inference.execute_inference_result(once=once)
+            msg = ("✅ 仿真验证通过，可释放到真机" if ok
+                   else f"❌ 仿真验证失败：{reason}")
+            self.root.after(0, lambda: self.status_text.set(msg))
+        self.status_text.set("仿真验证中…")
+        threading.Thread(target=worker, daemon=True).start()
 
     @property
     def wheel_angle_deg(self):
@@ -388,13 +400,16 @@ class PickPlaceMixin:
                    style="Primary.TButton",
                    command=lambda: self.inference.inference_once()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(manual_row, text="执行一次推理轨迹",
+        # "执行" now means VALIDATE-IN-SIM (step + self-collision + readback); it stages the
+        # sim-validated trajectory but does NOT touch the robot. Run off the Tk thread so the
+        # GUI doesn't freeze while the sim plays the trajectory.
+        ttk.Button(manual_row, text="仿真验证(单步)",
                    style="Primary.TButton",
-                   command=lambda: self.inference.execute_inference_result(once=True)
+                   command=lambda: self._run_validation(once=True)
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(manual_row, text="执行剩余推理轨迹",
+        ttk.Button(manual_row, text="仿真验证(整条)",
                    style="Primary.TButton",
-                   command=lambda: self.inference.execute_inference_result()
+                   command=lambda: self._run_validation(once=False)
                    ).pack(side=tk.LEFT, padx=4)
 
         auto_row = ttk.Frame(sec_inf)
@@ -419,15 +434,20 @@ class PickPlaceMixin:
                    style="Primary.TButton",
                    command=lambda: self.launch_sim()
                    ).pack(side=tk.LEFT, padx=4)
-        # Release the LAST sim-executed trajectory to the robot (only path to hardware).
+        # Release the LAST sim-VALIDATED trajectory to the robot (only path to hardware).
         ttk.Button(sim_row, text="🚀 释放到真机",
                    style="Danger.TButton",
                    command=lambda: self.env.release_to_robot()
                    ).pack(side=tk.LEFT, padx=4)
-        # Hard stop: drop everything pending on the robot.
-        ttk.Button(sim_row, text="⛔ 急停真机",
-                   style="Muted.TButton",
+        # E-STOP: latched; drops pending + actively holds. Physical E-stop remains primary.
+        ttk.Button(sim_row, text="⛔ 急停",
+                   style="Danger.TButton",
                    command=lambda: self.env.lock_robot()
+                   ).pack(side=tk.LEFT, padx=4)
+        # Clear the latched E-stop (only after the operator confirms the arm is safe).
+        ttk.Button(sim_row, text="复位急停",
+                   style="Muted.TButton",
+                   command=lambda: self.env.reset_estop()
                    ).pack(side=tk.LEFT, padx=4)
 
         # ===== 6. VR控制 =====
