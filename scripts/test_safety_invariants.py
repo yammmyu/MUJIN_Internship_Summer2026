@@ -68,8 +68,18 @@ class _FakeRobot:
 
 
 class _FakeCtl:
+    def __init__(self):
+        self.moves = []          # recorded 14-joint waypoints (left7 + right7)
+
     def get_motion_status(self):
         return {'error': {'has_error': False}, 'collisions': []}
+
+    def trajectory_tracking_control(self, infer_timestamp, robot_states, robot_actions,
+                                    robot_link="base_link", trajectory_reference_time=1.0):
+        for a in robot_actions:
+            left = np.asarray(a["left_arm"]["action_data"], dtype=float)
+            right = np.asarray(a["right_arm"]["action_data"], dtype=float)
+            self.moves.append(np.concatenate([left, right]))
 
 
 def run(verbose=True):
@@ -87,6 +97,7 @@ def run(verbose=True):
     env = HumanoidEnv(robot=_FakeRobot(), robot_controller=_FakeCtl(), sim=sim,
                       real=True, seed_q=seed)
     robot = env.robot
+    ctl = env.robot_controller          # records the commanded waypoints (trajectory_tracking_control)
     actions = _synthetic_actions(env, seed)
     env.start(run_collect=False, run_exec=True)
     try:
@@ -103,8 +114,8 @@ def run(verbose=True):
         # release reaches the robot; C5 — every released step <= MAX_JOINT_STEP
         nr = env.release_to_robot()
         time.sleep(nr / 30.0 + 1.0)
-        assert nr > 0 and len(robot.moves) >= nr - 2, "release did not reach the robot"
-        dmax = float(np.max(np.abs(np.diff(np.array(robot.moves)[:, :7], axis=0))))
+        assert nr > 0 and len(ctl.moves) >= nr - 2, "release did not reach the robot"
+        dmax = float(np.max(np.abs(np.diff(np.array(ctl.moves)[:, :7], axis=0))))
         assert dmax <= MAX_JOINT_STEP + 1e-6, f"C5: step {dmax:.4f} exceeds cap {MAX_JOINT_STEP}"
 
         # H1 — one-shot
@@ -114,12 +125,12 @@ def run(verbose=True):
         env.validate_and_stage(actions)
         env.release_to_robot()
         time.sleep(0.2)
-        before = len(robot.moves)
+        before = len(ctl.moves)
         env.lock_robot()
         time.sleep(0.3)
         assert env.estopped, "C3: E-stop not latched"
         assert env.robot_pending == 0, "C3: pending commands not dropped"
-        assert len(robot.moves) - before >= 1, "C3: no active-hold command issued"
+        assert len(ctl.moves) - before >= 1, "C3: no active-hold command issued"
         assert env.release_to_robot() == 0, "C3: release allowed while E-stopped"
         env.reset_estop()
         assert not env.estopped, "C3: reset_estop did not clear the latch"
@@ -128,7 +139,7 @@ def run(verbose=True):
         robot.fail = True
         env._last_good_arm14 = None
         assert env._command_left_joints(np.zeros(7), 0.0) is False, \
-            "C4: must refuse move_arm when the right-arm hold can't be read"
+            "C4: must refuse arm command when the right-arm hold can't be read"
     finally:
         env.stop()
         sim.disconnect()

@@ -47,7 +47,7 @@ RECORD_HZ = 30
 # Max per-tick change of any single arm joint on the hardware path (rad). The
 # validation pass subdivides to respect this and the release loop clamps to it,
 # so a step-change target becomes a bounded ramp instead of a snap. (C5)
-MAX_JOINT_STEP = 0.05            # ~2.9 deg per tick @ RECORD_HZ -> ~86 deg/s ceiling
+MAX_JOINT_STEP = 0.02            # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
 # Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
 QUAT_ALPHA = 0.5
 # Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
@@ -887,10 +887,7 @@ class HumanoidEnv:
                 print("[HumanoidEnv] E-stop WARNING: no joint read to hold — use physical E-stop.")
                 return
             for _ in range(3):                           # re-assert a few times to be sure
-                try:
-                    self.robot.move_arm(arm14.tolist())
-                except Exception as e:
-                    print(f"[HumanoidEnv] E-stop hold move_arm failed: {e}")
+                self._send_abs_joint_waypoint(arm14[:7], arm14[7:])  # hold both arms in place
 
     def reset_estop(self):
         """Clear the latched E-stop (operator confirms the arm is safe). Release stays refused
@@ -1024,22 +1021,42 @@ class HumanoidEnv:
         self._last_q = q7
         return q7
 
+    def _send_abs_joint_waypoint(self, left7, right7):
+        """Drive both arms to ONE absolute-joint waypoint via trajectory_tracking_control
+        (ABS_JOINT, SDK 8.2.4) — the per-tick actuation the release loop streams in place of
+        move_arm. left7/right7 are absolute joint targets (rad). reference_time is one loop tick,
+        so the controller drives toward the point within the tick (smaller => faster). robot_states
+        is left empty (documented optional); ABS_JOINT targets are self-contained. Returns True on
+        success."""
+        robot_actions = [{
+            "left_arm":  {"action_data": np.asarray(left7, dtype=np.float64).tolist(),
+                          "control_type": "ABS_JOINT"},
+            "right_arm": {"action_data": np.asarray(right7, dtype=np.float64).tolist(),
+                          "control_type": "ABS_JOINT"},
+        }]
+        try:
+            self.robot_controller.trajectory_tracking_control(
+                int(time.time() * 1e9), {}, robot_actions, "base_link", self.dt)
+            return True
+        except Exception as e:
+            print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
+            return False
+
     def _command_left_joints(self, q7, gripper, right_hold=None):
-        """Command the REAL left arm to 7 joints via move_arm (SDK 7.2.1), holding the right.
-        The right half NEVER falls to zero (C4): use the provided hold, else the last-good read;
-        if neither exists, REFUSE (return False) rather than drive the right arm to zero.
-        Returns True on success."""
+        """Command the REAL left arm to 7 joints via trajectory_tracking_control (ABS_JOINT,
+        SDK 8.2.4), holding the right. The right half NEVER falls to zero (C4): use the provided
+        hold, else the last-good read; if neither exists, REFUSE (return False) rather than drive
+        the right arm to zero. Returns True on success."""
         if right_hold is None:
             arm14 = self._read_arm14()
             right_hold = arm14[7:] if arm14 is not None else None
         if right_hold is None:
-            print("[HumanoidEnv] refuse move_arm: no right-arm hold (would zero the right arm).")
+            print("[HumanoidEnv] refuse arm cmd: no right-arm hold (would zero the right arm).")
             return False
-        positions = np.empty(14, dtype=np.float64)
-        positions[:7] = np.clip(np.asarray(q7, dtype=np.float64),
-                                self.solver.m.lower, self.solver.m.upper)
-        positions[7:] = np.asarray(right_hold, dtype=np.float64)
-        self.robot.move_arm(positions.tolist())
+        left7 = np.clip(np.asarray(q7, dtype=np.float64),
+                        self.solver.m.lower, self.solver.m.upper)
+        if not self._send_abs_joint_waypoint(left7, right_hold):
+            return False
         # move_gripper sets BOTH grippers, so read the current right value and leave it.
         left_cmd = 1.0 if gripper > 0.5 else 0.0
         try:
