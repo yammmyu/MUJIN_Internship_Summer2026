@@ -13,6 +13,11 @@ from camera_pose import compute_point_B_world
 from constants import *
 
 
+def _grip_label(grip):
+    """Binary {0,1} gripper command -> readable label for the substep monitor."""
+    return "闭(1)" if float(grip) >= 0.5 else "开(0)"
+
+
 class PickPlaceMixin:
     """抓取任务：手/目标坐标、轨迹规划与执行、抓取动作、抓取任务面板。"""
 
@@ -83,14 +88,20 @@ class PickPlaceMixin:
         shows the joint value and its delta vs the previous row / the live pose). Reschedules
         itself ~5 Hz; the staged buffer draining in real time produces the rolling effect."""
         try:
-            # --- live actual left-arm joints (delta reference for substep #0) ---
+            # --- live actual left-arm joints + gripper (delta reference for substep #0) ---
             try:
                 actual = list(self.left_arm_joint_values)
             except Exception:
                 actual = None
+            try:
+                live_grip = float(self.robot.gripper_states()[0][0])  # left gripper {0,1}
+            except Exception:
+                live_grip = None
             if actual is not None and len(actual) >= 7:
-                self._monitor_actual_var.set(
-                    "   ".join(f"J{k+1}:{actual[k]:+.3f}" for k in range(7)))
+                txt = "   ".join(f"J{k+1}:{actual[k]:+.3f}" for k in range(7))
+                if live_grip is not None:
+                    txt += f"   夹爪:{_grip_label(live_grip)}"
+                self._monitor_actual_var.set(txt)
                 prev = np.asarray(actual[:7], dtype=np.float64)
             else:
                 self._monitor_actual_var.set("（无法读取关节）")
@@ -104,16 +115,17 @@ class PickPlaceMixin:
             for i in range(self._monitor_rows):
                 iid = f"subrow{i}"
                 if i < len(subs):
-                    q = np.asarray(subs[i], dtype=np.float64)
+                    q, grip = subs[i]
+                    q = np.asarray(q, dtype=np.float64)
                     if prev is not None and len(prev) >= 7:
                         d = q - prev
                         vals = [f"{q[k]:+.3f} (Δ{d[k]:+.3f})" for k in range(7)]
                     else:
                         vals = [f"{q[k]:+.3f}" for k in range(7)]
-                    self._monitor_tree.item(iid, values=(i, *vals))
+                    self._monitor_tree.item(iid, values=(i, *vals, _grip_label(grip)))
                     prev = q
                 else:
-                    self._monitor_tree.item(iid, values=(i, *[""] * 7))
+                    self._monitor_tree.item(iid, values=(i, *[""] * 8))
         except tk.TclError:
             self._monitor_after_id = None       # widget destroyed (window closed) -> stop
             return
@@ -593,18 +605,20 @@ class PickPlaceMixin:
         # Rolling table: one row per upcoming substep, value "q (Δ)" per joint. Rows are
         # pre-created and rewritten in place each tick so substeps appear to scroll up as
         # they are released.
-        cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7")
+        cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "grip")
         tree = ttk.Treeview(sec_monitor, columns=cols, show="headings", height=10)
         tree.heading("idx", text="#")
         tree.column("idx", width=32, anchor="center", stretch=True)
-        for k, c in enumerate(cols[1:], start=1):
+        for k, c in enumerate(cols[1:8], start=1):
             tree.heading(c, text=f"J{k}")
             tree.column(c, width=120, anchor="center", stretch=True)
+        tree.heading("grip", text="夹爪")
+        tree.column("grip", width=72, anchor="center", stretch=True)
         tree.pack(fill=tk.X, padx=8, pady=(0, 8))
         self._monitor_tree = tree
         self._monitor_rows = 10
         for i in range(self._monitor_rows):
-            tree.insert("", "end", iid=f"subrow{i}", values=(i, *[""] * 7))
+            tree.insert("", "end", iid=f"subrow{i}", values=(i, *[""] * 8))
 
         # Start the periodic refresh (idempotent — only schedules once).
         if getattr(self, "_monitor_after_id", None) is None:

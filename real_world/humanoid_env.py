@@ -57,7 +57,16 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
-STEP_TIME = 0.05 #each sub step will be executed over 0.05 seconds
+STEP_TIME = 1/30 #each sub step will be executed over 0.05 seconds
+
+# Gripper is BINARY open/close. The policy emits a noisy raw [0,~85] gripper signal (transient
+# spikes exist), so at inference we binarize it to {0,1} (see InferenceController): only a
+# (near-)fully-closed reading counts as CLOSED. Everything downstream (sim preview, validation,
+# staging, release) then carries {0,1}; the LEFT gripper is then driven via the 'gripper' group of
+# trajectory_tracking_control (never move_gripper), so the right gripper is never addressed.
+GRIPPER_CLOSE_THRESH = 80.0     # raw gripper value at/above which we call it CLOSED (-> 1)
+GRIPPER_CLOSE_CMD = 1.0         # 'gripper' action_data value sent for a closed gripper
+GRIPPER_OPEN_CMD = 0.0          # 'gripper' action_data value sent for an open gripper
 # Cameras captured to disk during data collection (mirrors the old
 # RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
 # hand_left; hand_right is recorded for future use.
@@ -810,11 +819,12 @@ class HumanoidEnv:
             return len(self._staged_release)
 
     def staged_preview(self, n=10):
-        """The next up-to-n staged substeps as 7-joint arrays (copies), in release order.
-        For the live substep monitor; cheap snapshot under the lock."""
+        """The next up-to-n staged substeps as (7-joint array, grip) pairs (copies), in release
+        order. grip is the binary {0,1} gripper command staged with the substep. For the live
+        substep monitor; cheap snapshot under the lock."""
         with self._lock:
             items = list(self._staged_release)[:n]
-        return [np.asarray(q, dtype=np.float64).copy() for (q, _grip) in items]
+        return [(np.asarray(q, dtype=np.float64).copy(), float(grip)) for (q, grip) in items]
 
     def release_n_substeps(self, n):
         """Release up to N staged substeps to the robot: pops the next n from the ready-to-release
@@ -903,8 +913,8 @@ class HumanoidEnv:
                 # has no trajectory abort, so this can only PREEMPT (not cancel) an in-flight
                 # trajectory — clearing _robot_q above stops further batches; the physical E-stop
                 # remains primary for an already-dispatched batch.
-                self.run_trajectory_control([(arm14[:7], 0.0)], set_gripper=False,
-                                            ignore_estop=True)  # hold must send while estopped
+                self.run_trajectory_control([(arm14[:7], None)],  # None grip -> gripper untouched
+                                            ignore_estop=True)    # hold must send while estopped
 
     def reset_estop(self):
         """Clear the latched E-stop (operator confirms the arm is safe). Release stays refused
@@ -1037,17 +1047,17 @@ class HumanoidEnv:
         self._last_q = q7
         return q7
 
-    def run_trajectory_control(self, points, set_gripper=True, ignore_estop=False):
+    def run_trajectory_control(self, points, ignore_estop=False):
         """Stream a batch of sim-validated LEFT-arm waypoints to trajectory_tracking_control ONE at
         a time (ABS_JOINT, SDK doc 8.2.4), pacing at STEP_TIME and bailing on E-stop between points
         so the arm can be halted mid-batch (the SDK has no trajectory abort). robot_states is read
         once up front as the observation anchor (a read, never a command).
 
-        points: [(q7, grip), ...] sim-achieved left-arm joints (rad) + gripper in [0,1]. BLOCKS for
-        ~len(points) * STEP_TIME while streaming. Only the LEFT arm is ever placed in robot_actions
-        — the right arm is never addressed, so it physically holds. When set_gripper, the left
-        gripper is driven per waypoint (the E-stop hold passes False to leave it untouched).
-        Returns True on normal completion or an E-stop/shutdown halt; False on a dispatch error."""
+        points: [(q7, grip), ...] sim-achieved left-arm joints (rad) + binary {0,1} gripper, or
+        grip=None to leave the gripper untouched (the E-stop hold). BLOCKS for ~len(points) *
+        STEP_TIME while streaming. Each waypoint addresses only the LEFT arm and (when grip is not
+        None) the 'gripper' group — the right arm and right gripper are never addressed, so they
+        hold. Returns True on normal completion or an E-stop/shutdown halt; False on a dispatch error."""
         if not points:
             return True
         # Bound per-waypoint travel to MAX_JOINT_STEP (C5). The sim-ACHIEVED readback can overshoot
@@ -1084,19 +1094,23 @@ class HumanoidEnv:
             infer_timestamp = int(time.time() * 1e9)     
             left7 = np.clip(np.asarray(q7, dtype=np.float64),
                             self._jlower, self._jupper)      # joint-limit clamp (no IK solver needed)
-            robot_actions = [{"left_arm": {"action_data": left7.tolist(),
-                                           "control_type": "ABS_JOINT"}}]
-
+            # ONE waypoint driving BOTH the left arm and (optionally) the left gripper, via the
+            # 'left_arm' and 'gripper' GROUP_IDS (8.2.1). No move_gripper call, and neither the
+            # right arm nor the right gripper is ever addressed, so both hold.
+            robot_action = [{"left_arm": {"action_data": left7.tolist(),
+                                         "control_type": "ABS_JOINT"}}]
+            if grip is not None:                         # None -> leave the gripper alone (E-stop hold)
+                # grip is already the binary {0,1} normalized at inference -> open/close command.
+                grip_cmd = GRIPPER_CLOSE_CMD if grip >= 0.5 else GRIPPER_OPEN_CMD
+                self.robot.move_gripper([grip_cmd, 0])
             try:
                 self.robot_controller.trajectory_tracking_control(
-                    infer_timestamp, robot_states, robot_actions, "base_link", STEP_TIME
+                    infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
                     )
-                
+                1
             except Exception as e:
                 print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
                 return False
-            if set_gripper:
-                self._command_left_gripper(grip)             # per-point grip (now correctly timed)
             self._stop_event.wait(STEP_TIME)                 # pace; interruptible by stop_event
         return True
 
@@ -1118,17 +1132,6 @@ class HumanoidEnv:
                 out.append((prev + d * (i / n), grip))
             prev = q
         return out
-
-    def _command_left_gripper(self, grip):
-        """Drive the LEFT gripper to grip (open/close). move_gripper sets BOTH, so read the
-        current right value and pass it back unchanged (a read, not a right-arm motion)."""
-        left_cmd = 1.0 if grip > 0.5 else 0.0
-        try:
-            cur, _ = self.robot.gripper_states()
-            right_cmd = float(cur[1]) if cur is not None and len(cur) > 1 else 0.0
-        except Exception:
-            right_cmd = 0.0
-        self.robot.move_gripper([left_cmd, right_cmd])
 
     # ===================== data-collection recording (ported from RobotDataCollector) =====================
     def start_recording(self, episode_name=None):

@@ -39,7 +39,16 @@ LEFT_GRIPPER_JOINTS = ([f"left_narrow{i}_joint" for i in (1, 2, 3, 4)] +
 RIGHT_GRIPPER_JOINTS = ([f"right_narrow{i}_joint" for i in (1, 2, 3, 4)] +
                         [f"right_wide{i}_joint" for i in (1, 2, 3, 4)])
 WAIST_PITCH_JOINT = "joint_body_pitch"   # the URDF's only torso DOF (no head/lift joints)
-GRIPPER_CLOSE_RAD = 0.6   # rough scalar grip[0,1] -> joint angle (uncalibrated)
+# Finger joint angle for a fully OPEN gripper. Measured from the URDF: at angle 0 the jaws are
+# together (CLOSED, ~27mm tip gap) and at ~0.6 rad they are apart (OPEN, ~70mm) — larger angle =
+# more open. (The old name GRIPPER_CLOSE_RAD was backwards and rendered open/close swapped.)
+GRIPPER_OPEN_RAD = 0.6
+
+
+def _grip_to_finger_angle(grip):
+    """Normalized grip (0 = open, 1 = closed) -> URDF finger joint angle. Inverted because angle 0
+    is CLOSED and GRIPPER_OPEN_RAD is OPEN: grip 1 -> 0 rad (jaws together), grip 0 -> 0.6 (apart)."""
+    return (1.0 - float(np.clip(grip, 0.0, 1.0))) * GRIPPER_OPEN_RAD
 # Self-collision is flagged only when two links INTERPENETRATE deeper than this (metres). The
 # URDF's coarse collision meshes (esp. the torso) over-approximate the real body by several cm
 # and graze at normal poses; requiring real penetration filters that noise while still catching
@@ -216,8 +225,8 @@ class SimEnv:
         if body_pitch is not None:
             cmds[WAIST_PITCH_JOINT] = float(body_pitch)
         if gripper_lr is not None:
-            gl = float(np.clip(gripper_lr[0], 0, 1)) * GRIPPER_CLOSE_RAD
-            gr = float(np.clip(gripper_lr[1], 0, 1)) * GRIPPER_CLOSE_RAD
+            gl = _grip_to_finger_angle(gripper_lr[0])
+            gr = _grip_to_finger_angle(gripper_lr[1])
             for n in LEFT_GRIPPER_JOINTS:
                 cmds[n] = gl
             for n in RIGHT_GRIPPER_JOINTS:
@@ -263,7 +272,7 @@ class SimEnv:
                                         targetPositions=q7.tolist(),
                                         forces=[200.0] * len(self.arm_idx))
             if self.grip_idx:
-                g = float(np.clip(grip, 0, 1)) * GRIPPER_CLOSE_RAD
+                g = _grip_to_finger_angle(grip)
                 p.setJointMotorControlArray(self.body, self.grip_idx, p.POSITION_CONTROL,
                                             targetPositions=[g] * len(self.grip_idx),
                                             forces=[20.0] * len(self.grip_idx))
@@ -309,10 +318,11 @@ class SimEnv:
     def _validate_impl(self, actions, solve_fn, seed_q, max_joint_step, learn=False):
         seed = np.asarray(seed_q, dtype=np.float64).copy()
         # Deterministic start (so learn & validate see the same path, and repeat runs agree):
-        # reset the left arm to the seed AND the gripper to open.
+        # reset the left arm to the seed AND the gripper to open (GRIPPER_OPEN_RAD, since angle 0
+        # is CLOSED — see _grip_to_finger_angle).
         self.reset_arm(seed)
         for k in self.grip_idx:
-            p.resetJointState(self.body, k, 0.0)
+            p.resetJointState(self.body, k, GRIPPER_OPEN_RAD)
         out = []
         for k, action in enumerate(actions):
             q7, grip, why = solve_fn(action, seed)
@@ -350,7 +360,7 @@ class SimEnv:
                                     targetPositions=np.asarray(q7, dtype=np.float64).tolist(),
                                     forces=[200.0] * len(self.arm_idx))
         if self.grip_idx:
-            g = float(np.clip(grip, 0, 1)) * GRIPPER_CLOSE_RAD
+            g = _grip_to_finger_angle(grip)
             p.setJointMotorControlArray(self.body, self.grip_idx, p.POSITION_CONTROL,
                                         targetPositions=[g] * len(self.grip_idx),
                                         forces=[20.0] * len(self.grip_idx))
@@ -452,7 +462,7 @@ class SimEnv:
                                         targetPositions=q_des.tolist(),
                                         forces=[200.0] * len(self.arm_idx))
             if self.grip_idx:
-                g = float(np.clip(grip[i], 0, 1)) * GRIPPER_CLOSE_RAD
+                g = _grip_to_finger_angle(grip[i])
                 p.setJointMotorControlArray(self.body, self.grip_idx, p.POSITION_CONTROL,
                                             targetPositions=[g] * len(self.grip_idx),
                                             forces=[20.0] * len(self.grip_idx))

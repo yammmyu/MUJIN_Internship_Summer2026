@@ -26,6 +26,8 @@ import time
 import cv2
 import numpy as np
 
+from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
+
 RECORD_HZ = 30
 INFERENCE_HZ = 10
 PC4080_HOST = "10.12.11.144"
@@ -163,7 +165,14 @@ class InferenceController:
 
         # action rows: [eef_pos(3), 6D_rot(6), gripper(1)]
         action = np.asarray(resp['action'], dtype=np.float32)
-        print(f"[InferenceController] response recieved! Details:{action}")
+        print(f"[InferenceController] response recieved! Details:{action}")   # raw (incl. raw gripper)
+        # Binarize the gripper column (idx 9) HERE, as soon as the chunk arrives: the raw [0,~85]
+        # gripper signal is noisy (transient spikes), so only a (near-)fully-closed reading
+        # (>= GRIPPER_CLOSE_THRESH) becomes closed=1, else open=0. Everything downstream — sim
+        # preview, validation, staging, release — then carries a clean {0,1}, and the spikes no
+        # longer pollute the next inference's state context.
+        if action.ndim == 2 and action.shape[1] >= 10:
+            action[:, 9] = (action[:, 9] >= GRIPPER_CLOSE_THRESH).astype(action.dtype)
         self._last_inference_obs_ts = ts
         # A fresh chunk restarts the manual step-through from the first row.
         self._exec_cursor = 0
