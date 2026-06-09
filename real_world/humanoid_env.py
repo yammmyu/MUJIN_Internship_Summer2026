@@ -57,6 +57,7 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
+STEP_TIME = 0.5 #each sub step will be executed over 0.5 seconds
 # Cameras captured to disk during data collection (mirrors the old
 # RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
 # hand_left; hand_right is recorded for future use.
@@ -176,13 +177,18 @@ class HumanoidEnv:
         #     self._staged_release; it cannot run without a live sim, so "no sim" => nothing is
         #     ever releasable.
         #   * Only the release entry points enqueue onto self._robot_q, and only by copying
-        #     freshly sim-validated substeps (E-stop-guarded, C4/C5-guarded): release_to_robot()
-        #     (one-shot, whole trajectory) and release_next_substep / release_remaining_substeps
+        #     freshly sim-validated substeps (E-stop-guarded, C5 ramp-in): release_to_robot()
+        #     (one-shot, whole trajectory) and release_n_substeps/ release_remaining_substeps
         #     (drain the accumulating self._staged_release buffer).
-        #   * _release_loop is the ONLY caller of _command_left_joints, draining _robot_q.
+        #   * _release_loop is the ONLY caller of run_trajectory_control, draining _robot_q in
+        #     batches; only the LEFT arm is ever commanded, so the right arm is never moved.
         #   * _exec_loop drives the sim only (auto/replay preview); it never touches the robot.
         self.sim = sim                               # SimEnv (command/validate), or None
         self.solver = solver if solver is not None else build_solver()
+        # Left-arm joint limits (rad), captured once so the execution path can clamp commands
+        # without reaching into the IK solver (it only needs the bounds, not the solver).
+        self._jlower = np.asarray(self.solver.m.lower, dtype=np.float64).copy()
+        self._jupper = np.asarray(self.solver.m.upper, dtype=np.float64).copy()
         self._real = real
         # IK warm-start seed (7,). Seeded from the recording's first arm joints when given,
         # else the limit-clipped zero config.
@@ -196,12 +202,12 @@ class HumanoidEnv:
         self._robot_q = deque()                      # released, sim-validated cmds pending on robot
         # Substep-by-substep release buffer: each successful validate_and_stage APPENDS its
         # sim-achieved substeps here ("ready to release"). release_next_substep / release_remaining_substeps
-        # move substeps from here onto _robot_q (which _release_loop drains at the 33ms tick).
+        # move substeps from here onto _robot_q, which _release_loop hands to trajectory_tracking_control.
         self._staged_release = deque()               # [(q7_achieved, grip)] validated, awaiting release
+        self._dispatching = False                    # True while a batch is in flight on the controller
         self._release_thread = None
         self._estop = threading.Event()              # latched stop for the release path (C3)
-        self._last_good_arm14 = None                 # last finite 14-joint read (right-arm hold, C4)
-        self._release_right_hold = None              # right-arm hold (7,) captured at release (C4)
+        self._last_good_arm14 = None                 # last finite 14-joint read (observation anchor)
 
         # Liveness/staleness tracking (H2): the collect loop bumps _fresh_mono only when the EE
         # pose or a policy camera frame ACTUALLY changes, so a frozen feed is detectable even
@@ -734,15 +740,16 @@ class HumanoidEnv:
         validation replicates the arm's REAL pose (both arms + torso + grippers), the same sync
         SimEnv gets at preview launch. No-op when:
           * there's no sim, or
-          * substeps are already staged or streaming (self._staged_release / self._robot_q
-            non-empty) — then we're staging AHEAD of execution and must keep planning continuously
-            from the prior segment's end (traj[-1][0]) instead of snapping back to live, or
+          * substeps are staged, queued, or a batch is in flight (self._staged_release /
+            self._robot_q non-empty or self._dispatching) — then we're staging AHEAD of execution
+            and must keep planning continuously from the prior segment's end (traj[-1][0]) instead
+            of snapping back to a transient mid-motion pose, or
           * the live arm read fails (leave the seed intact).
         reset_full is owning-thread-only, so it's marshalled via submit_job like validate."""
         if self.sim is None:
             return
         with self._lock:
-            if self._staged_release or self._robot_q:
+            if self._staged_release or self._robot_q or self._dispatching:
                 return
         arm14 = self._read_arm14()                       # both arms (rad); None if never readable
         if arm14 is None:
@@ -764,8 +771,8 @@ class HumanoidEnv:
     def release_to_robot(self):
         """Replay the LAST sim-validated trajectory on the REAL robot. The only path to
         hardware. One-shot (a validation can be released once, H1), refused while E-stopped,
-        ramped in from the current measured pose (C5), with a right-arm hold captured from a
-        fresh good read (never zeros, C4). Returns the number of points queued."""
+        ramped in from the current measured LEFT-arm pose (C5). Only the left arm is ever
+        commanded — the right arm is never addressed, so it holds. Returns points queued."""
         if not self._real:
             print("[HumanoidEnv] release ignored: env built with real=False.")
             return 0
@@ -781,14 +788,13 @@ class HumanoidEnv:
             if vid == self._released_id:
                 print("[HumanoidEnv] release refused: already released; run 执行 again.")
                 return 0
-        arm14 = self._read_arm14()                       # C4: need a real right-arm hold
+        arm14 = self._read_arm14()                       # current LEFT pose for the C5 ramp-in
         if arm14 is None:
-            print("[HumanoidEnv] release refused: cannot read arm_joint_states (right-arm hold).")
+            print("[HumanoidEnv] release refused: cannot read arm_joint_states (ramp-in start).")
             return 0
         ramp = self._ramp(arm14[:7], traj[0][0], MAX_JOINT_STEP, traj[0][1])   # C5 ramp-in
         full = ramp + traj
         with self._lock:
-            self._release_right_hold = arm14[7:].copy()
             self._robot_q.clear()
             self._robot_q.extend(full)
             self._released_id = vid                      # H1: one-shot
@@ -810,28 +816,34 @@ class HumanoidEnv:
             items = list(self._staged_release)[:n]
         return [np.asarray(q, dtype=np.float64).copy() for (q, _grip) in items]
 
-    def release_next_substep(self):
-        """Release exactly ONE staged substep to the robot (one 33ms tick of motion). Pops the
-        next substep from the ready-to-release buffer onto _robot_q. Refused while E-stopped;
-        the shared _enqueue_for_release preserves the C4 right-arm hold and C5 ramp-in. Returns
-        the number of commands queued (1 in the synced case; more if a ramp-in was needed)."""
+    def release_n_substeps(self, n):
+        """Release up to N staged substeps to the robot: pops the next n from the ready-to-release
+        buffer onto _robot_q (which _release_loop hands to the trajectory controller). Releases
+        whatever is left when fewer than n are staged. Refused while E-stopped; _enqueue_for_release
+        adds the C5 ramp-in. Returns the number of commands queued (>= n in the synced case; more if
+        a ramp-in was needed)."""
         if not self._real:
             print("[HumanoidEnv] release ignored: env built with real=False.")
             return 0
         if self._estop.is_set():
             print("[HumanoidEnv] release refused: E-stop latched (press 重置急停 to reset).")
             return 0
+        if n <= 0:
+            return 0
         with self._lock:
             if not self._staged_release:
                 print("[HumanoidEnv] release refused: no staged substeps (run 仿真验证 first).")
                 return 0
-            sub = self._staged_release.popleft()
-        return self._enqueue_for_release([sub])
+            subs = [self._staged_release.popleft()
+                    for _ in range(min(n, len(self._staged_release)))]
+            print(f"[HumanoidEnv] releasing {len(subs)} substep(s) "
+                  f"({len(self._staged_release)} still staged)")
+        return self._enqueue_for_release(subs)
 
     def release_remaining_substeps(self):
-        """Release ALL staged substeps to the robot; _release_loop drains them at the 33ms tick.
-        Refused while E-stopped; same C4/C5 guards as release_next_substep. Returns the number of
-        commands queued."""
+        """Release ALL staged substeps to the robot; _release_loop hands them to the trajectory
+        controller. Refused while E-stopped; same C5 ramp-in as release_n_substeps. Returns the
+        number of commands queued."""
         if not self._real:
             print("[HumanoidEnv] release ignored: env built with real=False.")
             return 0
@@ -847,28 +859,28 @@ class HumanoidEnv:
         return self._enqueue_for_release(subs)
 
     def _enqueue_for_release(self, subs):
-        """Append validated substeps [(q7, grip)] onto _robot_q with the same hardware guards as
-        release_to_robot: a fresh right-arm hold (C4 — refuse rather than zero the right arm) and,
-        when the robot queue is idle, a ramp-in from the current measured pose to the first
-        substep (C5; collapses to a single command when already in sync). Returns commands queued."""
+        """Append validated substeps [(q7, grip)] onto _robot_q. When the release pipeline is
+        idle (queue empty and nothing in flight) prepend a C5 ramp-in from the current measured
+        LEFT-arm pose to the first substep (collapses to a single command when already in sync);
+        while a batch is already streaming just append, continuous. Only the left arm is ever
+        commanded — the right arm is never addressed. Returns commands queued."""
         if not subs:
             return 0
-        arm14 = self._read_arm14()                       # C4: need a real right-arm hold
+        arm14 = self._read_arm14()                       # current LEFT pose for the C5 ramp-in
         if arm14 is None:
-            print("[HumanoidEnv] release refused: cannot read arm_joint_states (right-arm hold).")
+            print("[HumanoidEnv] release refused: cannot read arm_joint_states (ramp-in start).")
             with self._lock:                             # don't lose the popped substeps
                 self._staged_release.extendleft(reversed(subs))
             return 0
         with self._lock:
-            if self._robot_q:                            # already streaming -> just append; the
-                full = list(subs)                        # _release_loop per-tick clamp guards it
+            if self._robot_q or self._dispatching:       # already streaming -> append, continuous
+                full = list(subs)
             else:                                        # idle -> C5 ramp from the measured pose
                 ramp = self._ramp(arm14[:7], subs[0][0], MAX_JOINT_STEP, subs[0][1])
                 full = ramp + list(subs)[1:]             # ramp's last point IS subs[0]
-            self._release_right_hold = arm14[7:].copy()
             self._robot_q.extend(full)
-            staged_left = len(self._staged_release)
-        print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_left} substep(s) still staged).")
+            staged_substep_remaining = len(self._staged_release)
+        print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_substep_remaining} substep(s) still staged).")
         return len(full)
 
     def lock_robot(self):
@@ -887,7 +899,11 @@ class HumanoidEnv:
                 print("[HumanoidEnv] E-stop WARNING: no joint read to hold — use physical E-stop.")
                 return
             for _ in range(3):                           # re-assert a few times to be sure
-                self._send_abs_joint_waypoint(arm14[:7], arm14[7:])  # hold both arms in place
+                # Hold the LEFT arm at its current pose; don't touch the gripper. NOTE: the SDK
+                # has no trajectory abort, so this can only PREEMPT (not cancel) an in-flight
+                # trajectory — clearing _robot_q above stops further batches; the physical E-stop
+                # remains primary for an already-dispatched batch.
+                self.run_trajectory_control([(arm14[:7], 0.0)], set_gripper=False)
 
     def reset_estop(self):
         """Clear the latched E-stop (operator confirms the arm is safe). Release stays refused
@@ -972,35 +988,34 @@ class HumanoidEnv:
 
     def _release_loop(self):
         """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by the
-        release entry points, which can only copy sim-validated substeps), clamps each step to
-        MAX_JOINT_STEP as a final guard (C5), and stops dead while E-stopped (C3)."""
-        last_cmd = None
+        release entry points, which can only copy sim-validated substeps) by handing the whole
+        pending batch to trajectory_tracking_control and letting the controller pace it; stops
+        dead while E-stopped (C3). run_trajectory_control re-subdivides each batch to <= MAX_JOINT_STEP
+        per waypoint (C5), so the per-segment velocity stays bounded without a per-tick clamp."""
         while not self._stop_event.is_set():
             if self._estop.is_set():
-                last_cmd = None
                 self._stop_event.wait(self.dt)
                 continue
             with self._lock:
-                cmd = self._robot_q.popleft() if self._robot_q else None
-                right_hold = self._release_right_hold
-            if cmd is None:
-                last_cmd = None
+                batch = list(self._robot_q)
+                self._robot_q.clear()
+                self._dispatching = bool(batch)
+            if not batch:
                 self._stop_event.wait(self.dt)
                 continue
-            if self._firmware_unsafe():                        # defense-in-depth: firmware fault
-                self.lock_robot()
-                continue
-            q7 = np.asarray(cmd[0], dtype=np.float64)
-            if last_cmd is not None:                          # final per-tick clamp (C5)
-                d = q7 - last_cmd
-                m = float(np.max(np.abs(d)))
-                if m > MAX_JOINT_STEP:
-                    q7 = last_cmd + d * (MAX_JOINT_STEP / m)
-            if not self._command_left_joints(q7, cmd[1], right_hold):
-                self.lock_robot()                              # couldn't form a safe cmd -> estop
-                continue
-            last_cmd = q7
-            self._stop_event.wait(self.dt)
+            try:
+                if self._firmware_unsafe():                    # defense-in-depth: firmware fault
+                    self.lock_robot()
+                    continue
+                if not self.run_trajectory_control(batch):
+                    self.lock_robot()                          # couldn't dispatch -> estop
+                    continue
+                # Let the controller track this batch before dispatching the next. The points are
+                # ~one tick apart, so the natural duration is len(batch) * self.dt.
+                self._stop_event.wait(max(len(batch) * STEP_TIME, STEP_TIME))
+            finally:
+                with self._lock:
+                    self._dispatching = False
 
     def _decode_ee_action(self, action):
         """action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip)."""
@@ -1021,51 +1036,89 @@ class HumanoidEnv:
         self._last_q = q7
         return q7
 
-    def _send_abs_joint_waypoint(self, left7, right7):
-        """Drive both arms to ONE absolute-joint waypoint via trajectory_tracking_control
-        (ABS_JOINT, SDK 8.2.4) — the per-tick actuation the release loop streams in place of
-        move_arm. left7/right7 are absolute joint targets (rad). reference_time is one loop tick,
-        so the controller drives toward the point within the tick (smaller => faster). robot_states
-        is left empty (documented optional); ABS_JOINT targets are self-contained. Returns True on
-        success."""
-        robot_actions = [{
-            "left_arm":  {"action_data": np.asarray(left7, dtype=np.float64).tolist(),
-                          "control_type": "ABS_JOINT"},
-            "right_arm": {"action_data": np.asarray(right7, dtype=np.float64).tolist(),
-                          "control_type": "ABS_JOINT"},
-        }]
+    def run_trajectory_control(self, points, set_gripper=True):
+        """Hand a batch of sim-validated LEFT-arm waypoints to trajectory_tracking_control and let
+        the controller pace them, following the ABS_JOINT sample in SDK doc 8.2.4: build robot_states
+        from the current observation (a read, never a command) and a LIST of ABS_JOINT robot_actions,
+        then one trajectory_tracking_control call.
+
+        points: [(q7, grip), ...] sim-achieved left-arm joints (rad) + gripper in [0,1].
+        Only the LEFT arm is ever placed in robot_actions — the right arm is never addressed, so it
+        physically holds (no zeroing risk, no right-arm command). When set_gripper, the left gripper
+        is driven to the batch's final grip after the arm trajectory (the E-stop hold passes False
+        to leave the gripper untouched). Returns True on success."""
+        if not points:
+            return True
+        # Bound per-waypoint travel to MAX_JOINT_STEP (C5). The sim-ACHIEVED readback can overshoot
+        # between validated substeps, and trajectory_tracking_control allots ~one dt per waypoint, so
+        # an over-cap gap would mean an over-cap joint velocity. Re-subdivide to restore the bound.
+        points = self._subdivide_points(points)
+        # robot_states: the observation that anchors the trajectory (8.2.4). Reads only, optional.
+        robot_states = {}
+        arm14 = self._read_arm14()
+        if arm14 is not None:
+            robot_states["arm"] = arm14.tolist()
+        try:
+            robot_states["waist"] = list(self.robot.waist_joint_states()[0])
+        except Exception:
+            pass
+        try:
+            robot_states["head"] = list(self.robot.head_joint_states()[0])
+        except Exception:
+            pass
+        # robot_actions: one ABS_JOINT waypoint per staged point, LEFT arm only (8.2.4 loop).
+        robot_actions = []
+        for q7, _grip in points:
+            left7 = np.clip(np.asarray(q7, dtype=np.float64),
+                            self._jlower, self._jupper)  # joint-limit clamp (no IK solver needed)
+            robot_actions.append(
+                {"left_arm": 
+                 {"action_data": left7.tolist(),
+                  "control_type": "ABS_JOINT"
+                  }
+                }
+            )
+        infer_timestamp = int(time.time() * 1e9)                  # ns, per 8.2.4
+        ref_time = max(len(robot_actions) * STEP_TIME, STEP_TIME)     # ~original cadence; tunable
         try:
             self.robot_controller.trajectory_tracking_control(
-                int(time.time() * 1e9), {}, robot_actions, "base_link", self.dt)
-            return True
+                infer_timestamp, robot_states, robot_actions, "base_link", ref_time)
         except Exception as e:
             print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
             return False
+        if set_gripper:
+            self._command_left_gripper(points[-1][1])
+        return True
 
-    def _command_left_joints(self, q7, gripper, right_hold=None):
-        """Command the REAL left arm to 7 joints via trajectory_tracking_control (ABS_JOINT,
-        SDK 8.2.4), holding the right. The right half NEVER falls to zero (C4): use the provided
-        hold, else the last-good read; if neither exists, REFUSE (return False) rather than drive
-        the right arm to zero. Returns True on success."""
-        if right_hold is None:
-            arm14 = self._read_arm14()
-            right_hold = arm14[7:] if arm14 is not None else None
-        if right_hold is None:
-            print("[HumanoidEnv] refuse arm cmd: no right-arm hold (would zero the right arm).")
-            return False
-        left7 = np.clip(np.asarray(q7, dtype=np.float64),
-                        self.solver.m.lower, self.solver.m.upper)
-        if not self._send_abs_joint_waypoint(left7, right_hold):
-            return False
-        # move_gripper sets BOTH grippers, so read the current right value and leave it.
-        left_cmd = 1.0 if gripper > 0.5 else 0.0
+    @staticmethod
+    def _subdivide_points(points):
+        """Insert linearly-interpolated LEFT-arm waypoints so every consecutive gap <= MAX_JOINT_STEP
+        (C5 velocity bound under trajectory control). grip carries from each segment's target point.
+        A single point (or already-fine spacing) passes through unchanged."""
+        pts = list(points)
+        if len(pts) < 2:
+            return pts
+        out = [pts[0]]
+        prev = np.asarray(pts[0][0], dtype=np.float64)
+        for q, grip in pts[1:]:
+            q = np.asarray(q, dtype=np.float64)
+            d = q - prev
+            n = max(int(np.ceil(np.max(np.abs(d)) / MAX_JOINT_STEP)), 1) if MAX_JOINT_STEP > 0 else 1
+            for i in range(1, n + 1):
+                out.append((prev + d * (i / n), grip))
+            prev = q
+        return out
+
+    def _command_left_gripper(self, grip):
+        """Drive the LEFT gripper to grip (open/close). move_gripper sets BOTH, so read the
+        current right value and pass it back unchanged (a read, not a right-arm motion)."""
+        left_cmd = 1.0 if grip > 0.5 else 0.0
         try:
             cur, _ = self.robot.gripper_states()
             right_cmd = float(cur[1]) if cur is not None and len(cur) > 1 else 0.0
         except Exception:
             right_cmd = 0.0
         self.robot.move_gripper([left_cmd, right_cmd])
-        return True
 
     # ===================== data-collection recording (ported from RobotDataCollector) =====================
     def start_recording(self, episode_name=None):

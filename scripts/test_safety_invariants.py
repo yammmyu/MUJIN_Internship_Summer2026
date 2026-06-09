@@ -10,7 +10,7 @@ MUST block deployment:
   C5  rate limit / ramp    -> released steps are <= MAX_JOINT_STEP, ramped from the current pose
   H1  one-shot release     -> a validation can be released once (no re-release snap-back)
   C3  E-stop               -> latched, actively holds, refuses release until reset
-  C4  right-arm hold       -> a failed joint read REFUSES move_arm (never zeros the right arm)
+  C4  right arm untouched  -> the right arm is NEVER placed in a trajectory action (so it holds)
 
 Self-contained: targets are the FK of a small joint sweep near a safe seed, so they are
 reachable and self-consistent without needing a recording.
@@ -69,7 +69,8 @@ class _FakeRobot:
 
 class _FakeCtl:
     def __init__(self):
-        self.moves = []          # recorded 14-joint waypoints (left7 + right7)
+        self.moves = []          # recorded LEFT-arm waypoints (7,)
+        self.right_touched = False   # set if any action ever addresses the right arm (C4)
 
     def get_motion_status(self):
         return {'error': {'has_error': False}, 'collisions': []}
@@ -77,9 +78,9 @@ class _FakeCtl:
     def trajectory_tracking_control(self, infer_timestamp, robot_states, robot_actions,
                                     robot_link="base_link", trajectory_reference_time=1.0):
         for a in robot_actions:
-            left = np.asarray(a["left_arm"]["action_data"], dtype=float)
-            right = np.asarray(a["right_arm"]["action_data"], dtype=float)
-            self.moves.append(np.concatenate([left, right]))
+            if "right_arm" in a:
+                self.right_touched = True
+            self.moves.append(np.asarray(a["left_arm"]["action_data"], dtype=float))
 
 
 def run(verbose=True):
@@ -135,11 +136,10 @@ def run(verbose=True):
         env.reset_estop()
         assert not env.estopped, "C3: reset_estop did not clear the latch"
 
-        # C4 — a failed joint read REFUSES (never zeros the right arm)
-        robot.fail = True
-        env._last_good_arm14 = None
-        assert env._command_left_joints(np.zeros(7), 0.0) is False, \
-            "C4: must refuse arm command when the right-arm hold can't be read"
+        # C4 — the right arm is NEVER commanded (no right_arm in any trajectory action), so it
+        # physically holds. With move_arm gone there is no right-arm zeroing risk to guard; the
+        # invariant is now "we never address the right arm" across every release + the E-stop hold.
+        assert not ctl.right_touched, "C4: right arm was placed in a trajectory action"
     finally:
         env.stop()
         sim.disconnect()

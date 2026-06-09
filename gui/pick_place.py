@@ -50,14 +50,14 @@ class PickPlaceMixin:
         self.status_text.set("推理中…")
         threading.Thread(target=worker, daemon=True).start()
 
-    def _run_release_substeps(self, remaining=False):
-        """释放 staged substeps to the real robot. remaining=False sends the next single substep
-        (one 33ms tick); remaining=True streams all staged substeps at the 33ms tick. No-op (with
-        a status note) when nothing is staged."""
+    def _run_release_substeps(self, remaining=False, count=1):
+        """释放 staged substeps to the real robot. remaining=True streams ALL staged substeps;
+        otherwise releases the next `count` (1 or 10). Releases whatever is left if fewer remain.
+        No-op (with a status note) when nothing is staged."""
         if remaining:
             n = self.env.release_remaining_substeps()
         else:
-            n = self.env.release_next_substep()
+            n = self.env.release_n_substeps(count)
         staged = self.env.staged_substeps
         if n > 0:
             self.status_text.set(f"🚀 已下发 {n} 条指令到真机（剩余待释放 {staged} 子步）")
@@ -129,7 +129,7 @@ class PickPlaceMixin:
         except Exception:
             staged = 0
         flag = "!disabled" if staged > 0 else "disabled"
-        for name in ("_btn_release_step", "_btn_release_rest"):
+        for name in ("_btn_release_step", "_btn_release_ten", "_btn_release_rest"):
             btn = getattr(self, name, None)
             if btn is not None:
                 btn.state([flag])
@@ -522,18 +522,18 @@ class PickPlaceMixin:
         # No prediction yet -> start disabled; 推理一次 re-enables them.
         self._refresh_validation_buttons()
 
-        auto_row = ttk.Frame(sec_inf)
-        auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
-        ttk.Label(auto_row, text="自动:",
-                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(auto_row, text="⚠ 开始自动运行",
-                   style="Danger.TButton",
-                   command=print("Hello World") #lambda: self.inference.auto_inference() #temporarily disabled
-                   ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(auto_row, text="■ 停止自动运行",
-                   style="Muted.TButton",
-                   command=print("No Hello World") #lambda: self.inference.auto_inference(stop=True) #temporarily disabled
-                   ).pack(side=tk.LEFT, padx=4)
+        # auto_row = ttk.Frame(sec_inf)
+        # auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
+        # ttk.Label(auto_row, text="自动:",
+        #           style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        # ttk.Button(auto_row, text="⚠ 开始自动运行",
+        #            style="Danger.TButton",
+        #            command=print("Hello World") #lambda: self.inference.auto_inference() #temporarily disabled
+        #            ).pack(side=tk.LEFT, padx=4)
+        # ttk.Button(auto_row, text="■ 停止自动运行",
+        #            style="Muted.TButton",
+        #            command=print("No Hello World") #lambda: self.inference.auto_inference(stop=True) #temporarily disabled
+        #            ).pack(side=tk.LEFT, padx=4)
 
         # ===== 仿真预览 + 真机释放（先在仿真里预览，确认后再解锁真机执行）=====
         sim_row = ttk.Frame(sec_inf)
@@ -545,12 +545,16 @@ class PickPlaceMixin:
                    command=lambda: self.launch_sim()
                    ).pack(side=tk.LEFT, padx=4)
         # Release staged sim-validated substeps to the robot (only path to hardware). 仿真验证
-        # accumulates substeps; 释放(单步) sends the next one (one 33ms tick), 释放(剩余) streams
-        # the rest at the 33ms tick.
+        # accumulates substeps; 释放(单步) sends the next one, 释放(10步) the next ten, 释放(剩余)
+        # streams the rest.
         self._btn_release_step = ttk.Button(sim_row, text="🚀 释放子步(单步)",
                    style="Danger.TButton",
-                   command=lambda: self._run_release_substeps(remaining=False))
+                   command=lambda: self._run_release_substeps(remaining=False, count=1))
         self._btn_release_step.pack(side=tk.LEFT, padx=4)
+        self._btn_release_ten = ttk.Button(sim_row, text="🚀 释放子步(10步)",
+                   style="Danger.TButton",
+                   command=lambda: self._run_release_substeps(remaining=False, count=10))
+        self._btn_release_ten.pack(side=tk.LEFT, padx=4)
         self._btn_release_rest = ttk.Button(sim_row, text="🚀 释放子步(剩余)",
                    style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=True))
@@ -592,7 +596,7 @@ class PickPlaceMixin:
         cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7")
         tree = ttk.Treeview(sec_monitor, columns=cols, show="headings", height=10)
         tree.heading("idx", text="#")
-        tree.column("idx", width=32, anchor="center", stretch=False)
+        tree.column("idx", width=32, anchor="center", stretch=True)
         for k, c in enumerate(cols[1:], start=1):
             tree.heading(c, text=f"J{k}")
             tree.column(c, width=120, anchor="center", stretch=True)
