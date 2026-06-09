@@ -114,7 +114,16 @@ def run(verbose=True):
 
         # release reaches the robot; C5 — every released step <= MAX_JOINT_STEP
         nr = env.release_to_robot()
-        time.sleep(nr / 30.0 + 1.0)
+        # The release loop now STREAMS waypoints at STEP_TIME each (slower than 30Hz, and
+        # subdivision adds points), so poll until it has drained + finished rather than guess.
+        t0 = time.time()
+        while time.time() - t0 < 20.0:
+            with env._lock:
+                drained = (not env._robot_q) and (not env._dispatching)
+            if drained:
+                break
+            time.sleep(0.05)
+        time.sleep(0.1)
         assert nr > 0 and len(ctl.moves) >= nr - 2, "release did not reach the robot"
         dmax = float(np.max(np.abs(np.diff(np.array(ctl.moves)[:, :7], axis=0))))
         assert dmax <= MAX_JOINT_STEP + 1e-6, f"C5: step {dmax:.4f} exceeds cap {MAX_JOINT_STEP}"

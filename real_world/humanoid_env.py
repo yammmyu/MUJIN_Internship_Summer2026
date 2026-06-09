@@ -57,7 +57,7 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
-STEP_TIME = 0.5 #each sub step will be executed over 0.5 seconds
+STEP_TIME = 0.05 #each sub step will be executed over 0.05 seconds
 # Cameras captured to disk during data collection (mirrors the old
 # RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
 # hand_left; hand_right is recorded for future use.
@@ -903,7 +903,8 @@ class HumanoidEnv:
                 # has no trajectory abort, so this can only PREEMPT (not cancel) an in-flight
                 # trajectory — clearing _robot_q above stops further batches; the physical E-stop
                 # remains primary for an already-dispatched batch.
-                self.run_trajectory_control([(arm14[:7], 0.0)], set_gripper=False)
+                self.run_trajectory_control([(arm14[:7], 0.0)], set_gripper=False,
+                                            ignore_estop=True)  # hold must send while estopped
 
     def reset_estop(self):
         """Clear the latched E-stop (operator confirms the arm is safe). Release stays refused
@@ -930,7 +931,7 @@ class HumanoidEnv:
         excludes q_from. Used so the first released command starts at the current pose (C5)."""
         q_from = np.asarray(q_from, dtype=np.float64)
         q_to = np.asarray(q_to, dtype=np.float64)
-        n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap)) if cap > 0 else 1
+        n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap))
         n = max(n, 1)
         return [(q_from + (q_to - q_from) * (i / n), float(grip)) for i in range(1, n + 1)]
 
@@ -988,10 +989,10 @@ class HumanoidEnv:
 
     def _release_loop(self):
         """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by the
-        release entry points, which can only copy sim-validated substeps) by handing the whole
-        pending batch to trajectory_tracking_control and letting the controller pace it; stops
-        dead while E-stopped (C3). run_trajectory_control re-subdivides each batch to <= MAX_JOINT_STEP
-        per waypoint (C5), so the per-segment velocity stays bounded without a per-tick clamp."""
+        release entry points, which can only copy sim-validated substeps); run_trajectory_control
+        then STREAMS the batch one waypoint at a time so an E-stop halts the arm mid-batch (C3).
+        run_trajectory_control re-subdivides each batch to <= MAX_JOINT_STEP per waypoint (C5), so
+        the per-segment velocity stays bounded without a per-tick clamp."""
         while not self._stop_event.is_set():
             if self._estop.is_set():
                 self._stop_event.wait(self.dt)
@@ -1010,9 +1011,9 @@ class HumanoidEnv:
                 if not self.run_trajectory_control(batch):
                     self.lock_robot()                          # couldn't dispatch -> estop
                     continue
-                # Let the controller track this batch before dispatching the next. The points are
-                # ~one tick apart, so the natural duration is len(batch) * self.dt.
-                self._stop_event.wait(max(len(batch) * STEP_TIME, STEP_TIME))
+                # run_trajectory_control streams the batch internally, pacing per waypoint on
+                # self._stop_event (so it blocks ~len(batch) * STEP_TIME and an E-stop breaks it
+                # within ~STEP_TIME). No post-dispatch wait needed; the next drain polls below.
             finally:
                 with self._lock:
                     self._dispatching = False
@@ -1036,17 +1037,17 @@ class HumanoidEnv:
         self._last_q = q7
         return q7
 
-    def run_trajectory_control(self, points, set_gripper=True):
-        """Hand a batch of sim-validated LEFT-arm waypoints to trajectory_tracking_control and let
-        the controller pace them, following the ABS_JOINT sample in SDK doc 8.2.4: build robot_states
-        from the current observation (a read, never a command) and a LIST of ABS_JOINT robot_actions,
-        then one trajectory_tracking_control call.
+    def run_trajectory_control(self, points, set_gripper=True, ignore_estop=False):
+        """Stream a batch of sim-validated LEFT-arm waypoints to trajectory_tracking_control ONE at
+        a time (ABS_JOINT, SDK doc 8.2.4), pacing at STEP_TIME and bailing on E-stop between points
+        so the arm can be halted mid-batch (the SDK has no trajectory abort). robot_states is read
+        once up front as the observation anchor (a read, never a command).
 
-        points: [(q7, grip), ...] sim-achieved left-arm joints (rad) + gripper in [0,1].
-        Only the LEFT arm is ever placed in robot_actions — the right arm is never addressed, so it
-        physically holds (no zeroing risk, no right-arm command). When set_gripper, the left gripper
-        is driven to the batch's final grip after the arm trajectory (the E-stop hold passes False
-        to leave the gripper untouched). Returns True on success."""
+        points: [(q7, grip), ...] sim-achieved left-arm joints (rad) + gripper in [0,1]. BLOCKS for
+        ~len(points) * STEP_TIME while streaming. Only the LEFT arm is ever placed in robot_actions
+        — the right arm is never addressed, so it physically holds. When set_gripper, the left
+        gripper is driven per waypoint (the E-stop hold passes False to leave it untouched).
+        Returns True on normal completion or an E-stop/shutdown halt; False on a dispatch error."""
         if not points:
             return True
         # Bound per-waypoint travel to MAX_JOINT_STEP (C5). The sim-ACHIEVED readback can overshoot
@@ -1055,9 +1056,12 @@ class HumanoidEnv:
         points = self._subdivide_points(points)
         # robot_states: the observation that anchors the trajectory (8.2.4). Reads only, optional.
         robot_states = {}
-        arm14 = self._read_arm14()
-        if arm14 is not None:
-            robot_states["arm"] = arm14.tolist()
+
+
+        try:
+            robot_states["arm"] = list(self.robot.arm_joint_states()[0])
+        except Exception:
+            pass
         try:
             robot_states["waist"] = list(self.robot.waist_joint_states()[0])
         except Exception:
@@ -1066,28 +1070,34 @@ class HumanoidEnv:
             robot_states["head"] = list(self.robot.head_joint_states()[0])
         except Exception:
             pass
-        # robot_actions: one ABS_JOINT waypoint per staged point, LEFT arm only (8.2.4 loop).
-        robot_actions = []
-        for q7, _grip in points:
+        # Stream the batch ONE waypoint at a time (not one big trajectory). The SDK has no
+        # trajectory abort, so this is what makes an E-stop effective: latched mid-batch, we simply
+        # stop sending the next waypoint and the arm halts within ~STEP_TIME at the last point.
+        # Each point is its own single-waypoint ABS_JOINT trajectory (8.2.4 schema, LEFT arm only ->
+        # right arm never moves) with reference_time = STEP_TIME; we pace on self._stop_event so a
+        # shutdown breaks promptly too.
+        for q7, grip in points:
+            # Stop streaming a RELEASE batch the instant an E-stop latches (or on shutdown). The
+            # E-stop HOLD itself passes ignore_estop=True so it can re-assert the pose while latched.
+            if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
+                return True                                  # halt: send no further waypoints
+            infer_timestamp = int(time.time() * 1e9)     
             left7 = np.clip(np.asarray(q7, dtype=np.float64),
-                            self._jlower, self._jupper)  # joint-limit clamp (no IK solver needed)
-            robot_actions.append(
-                {"left_arm": 
-                 {"action_data": left7.tolist(),
-                  "control_type": "ABS_JOINT"
-                  }
-                }
-            )
-        infer_timestamp = int(time.time() * 1e9)                  # ns, per 8.2.4
-        ref_time = max(len(robot_actions) * STEP_TIME, STEP_TIME)     # ~original cadence; tunable
-        try:
-            self.robot_controller.trajectory_tracking_control(
-                infer_timestamp, robot_states, robot_actions, "base_link", ref_time)
-        except Exception as e:
-            print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
-            return False
-        if set_gripper:
-            self._command_left_gripper(points[-1][1])
+                            self._jlower, self._jupper)      # joint-limit clamp (no IK solver needed)
+            robot_actions = [{"left_arm": {"action_data": left7.tolist(),
+                                           "control_type": "ABS_JOINT"}}]
+
+            try:
+                self.robot_controller.trajectory_tracking_control(
+                    infer_timestamp, robot_states, robot_actions, "base_link", STEP_TIME
+                    )
+                
+            except Exception as e:
+                print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
+                return False
+            if set_gripper:
+                self._command_left_gripper(grip)             # per-point grip (now correctly timed)
+            self._stop_event.wait(STEP_TIME)                 # pace; interruptible by stop_event
         return True
 
     @staticmethod
