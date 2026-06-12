@@ -15,93 +15,6 @@ resources; this controller only calls the policy server, publishes predictions
 to robot_info (for robot_info_server / visualisation), and hands action chunks
 to the env.
 
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.1825711727142334
-[InferenceController] sending request | Time elapsed; 0.3417365550994873
-inference request sent
-POST http://10.12.11.144:9001/predict (622776 bytes, timeout=10s)
-response: HTTP 200 (5024 bytes) in 0.203s
-[InferenceController] response recieved! | Time elapsed; 0.5827891826629639
-[InferenceController] sending chunk for validation | Time elapsed; 0.5832719802856445
-world time: 1781252135.73395 | obs time: 1781252134.0745692 | time elapsed:1.6594243049621582
-[HumanoidEnv] auto-splice: f=32/32, +1 ramp -> queue 35
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.16855573654174805
-[InferenceController] sending request | Time elapsed; 0.2885773181915283
-inference request sent
-POST http://10.12.11.144:9001/predict (625464 bytes, timeout=10s)
-response: HTTP 200 (5133 bytes) in 0.177s
-[InferenceController] response recieved! | Time elapsed; 0.518195390701294
-[InferenceController] sending chunk for validation | Time elapsed; 0.518435001373291
-world time: 1781252137.2869906 | obs time: 1781252135.6423209 | time elapsed:1.6446871757507324
-[HumanoidEnv] auto-splice: f=28/28, +5 ramp -> queue 7
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.13499045372009277
-[InferenceController] sending request | Time elapsed; 0.31638002395629883
-inference request sent
-POST http://10.12.11.144:9001/predict (627152 bytes, timeout=10s)
-response: HTTP 200 (5126 bytes) in 0.187s
-[InferenceController] response recieved! | Time elapsed; 0.5273327827453613
-[InferenceController] sending chunk for validation | Time elapsed; 0.5276644229888916
-[MP] connection error: [Errno 111] Connection refused; retry in 10.0s
-world time: 1781252139.2337005 | obs time: 1781252137.1877792 | time elapsed:2.0460145473480225
-[HumanoidEnv] auto-splice: f=42/42, +1 ramp -> queue 48
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.10855746269226074
-[InferenceController] sending request | Time elapsed; 0.2907736301422119
-inference request sent
-POST http://10.12.11.144:9001/predict (635728 bytes, timeout=10s)
-response: HTTP 200 (5145 bytes) in 0.170s
-[InferenceController] response recieved! | Time elapsed; 0.498201847076416
-[InferenceController] sending chunk for validation | Time elapsed; 0.5076971054077148
-world time: 1781252141.0454435 | obs time: 1781252139.1577823 | time elapsed:1.8876776695251465
-[HumanoidEnv] auto-splice: f=36/36, +11 ramp -> queue 13
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7a72781d0ee0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.08347511291503906
-[InferenceController] sending request | Time elapsed; 0.2057206630706787
-inference request sent
-POST http://10.12.11.144:9001/predict (625892 bytes, timeout=10s)
-response: HTTP 200 (5153 bytes) in 0.176s
-[InferenceController] response recieved! | Time elapsed; 0.4152364730834961
-[InferenceController] sending chunk for validation | Time elapsed; 0.417496919631958
-[InferenceController] Stopping auto_inference thread...
-world time: 1781252142.7116804 | obs time: 1781252140.9713137 | time elapsed:1.7404396533966064
-[HumanoidEnv] auto-splice: f=38/38, +8 ramp -> queue 53
-[HumanoidEnv] camera unsubscribed (OFF): head
-[HumanoidEnv] camera unsubscribed (OFF): hand_left
-[MP] connection error: [Errno 111] Connection refused; retry in 10.0s
-[MP] connection error: [Errno 111] Connection refused; retry in 10.0s
-^C[MP] client loop stopped
 
 """
 
@@ -118,7 +31,7 @@ import numpy as np
 from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 
 RECORD_HZ = 30
-INFERENCE_HZ = 10 #not used, the inference time is 15 to 20hz
+INFERENCE_HZ = 2  # auto-inference cadence cap (Hz); <=0 -> run as fast as latency allows
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -381,7 +294,13 @@ class InferenceController:
         self.is_auto_inference = True
 
         def _run_auto_inference():
+            # Target a fixed inference cadence so the loop is controllable via inference_hz (a
+            # value <= 0 means "as fast as latency allows"). We measure each cycle and sleep only
+            # the REMAINDER of the period; if an inference already overran the period we go again
+            # immediately (no sleep), so this caps the rate without ever slowing a slow cycle.
+            period = (1.0 / self.inference_hz) if self.inference_hz and self.inference_hz > 0 else 0.0
             while self.is_auto_inference:
+                cycle_start = time.monotonic()
                 # Any E-stop source (operator 急停 OR a firmware-triggered lock_robot from
                 # _release_loop) disarms auto: we exit the loop so motion does NOT silently
                 # resume when the E-stop is later reset — the operator must press 启动 again.
@@ -391,11 +310,17 @@ class InferenceController:
                     print("[InferenceController] E-stop latched — disarming auto-inference.")
                     self.is_auto_inference = False
                     break
-                # submit=True -> validate + splice onto the robot. Server+validation latency paces
-                # the loop; only back off briefly when an inference is skipped (stale obs, server
-                # error, validation failure) so we don't busy-spin.
+                # submit=True -> validate + splice onto the robot. On a skipped inference (stale
+                # obs, server error, validation failure) back off briefly so we don't busy-spin.
                 if not self._run_inference(submit=True):
                     time.sleep(0.01)
+                    continue
+                # Pace to inference_hz: sleep whatever is left of the period after this cycle's
+                # work. remaining <= 0 (cycle overran the period) -> no sleep, loop immediately.
+                if period > 0.0:
+                    remaining = period - (time.monotonic() - cycle_start)
+                    if remaining > 0.0:
+                        time.sleep(remaining)
 
         # Reap a thread that self-exited on E-stop (handle left non-None) so a restart is treated
         # as a fresh start instead of being blocked by the dead handle.
