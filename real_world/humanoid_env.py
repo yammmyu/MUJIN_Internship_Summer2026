@@ -64,9 +64,7 @@ STEP_TIME = 1/30 #each sub step will be executed over 0.05 seconds
 # (near-)fully-closed reading counts as CLOSED. Everything downstream (sim preview, validation,
 # staging, release) then carries {0,1}; the LEFT gripper is then driven via the 'gripper' group of
 # trajectory_tracking_control (never move_gripper), so the right gripper is never addressed.
-GRIPPER_CLOSE_THRESH = 80.0     # raw gripper value at/above which we call it CLOSED (-> 1)
-GRIPPER_CLOSE_CMD = 1.0         # 'gripper' action_data value sent for a closed gripper
-GRIPPER_OPEN_CMD = 0.0          # 'gripper' action_data value sent for an open gripper
+GRIPPER_CLOSE_THRESH = 10.0     # raw gripper value at/above which we call it CLOSED (-> 1)
 # Cameras captured to disk during data collection (mirrors the old
 # RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
 # hand_left; hand_right is recorded for future use.
@@ -213,7 +211,6 @@ class HumanoidEnv:
         # sim-achieved substeps here ("ready to release"). release_next_substep / release_remaining_substeps
         # move substeps from here onto _robot_q, which _release_loop hands to trajectory_tracking_control.
         self._staged_release = deque()               # [(q7_achieved, grip)] validated, awaiting release
-        self._dispatching = False                    # True while a batch is in flight on the controller
         self._release_thread = None
         self._estop = threading.Event()              # latched stop for the release path (C3)
         self._last_good_arm14 = None                 # last finite 14-joint read (observation anchor)
@@ -707,6 +704,19 @@ class HumanoidEnv:
                           learn=True)
         return True, "collision baseline updated"
 
+    # ===================== shared sim-validation core (manual + auto) =====================
+    def _validate_chunk(self, action_chunk, seed_q):
+        """Run a chunk through self.sim from seed_q (step + self-collision + joint readback) and
+        return (traj, ok, reason) where traj is the sim-ACHIEVED [(q7, grip), ...]. The single
+        validation primitive shared by the manual validate_and_stage and auto-inference (which
+        validates on the SAME preview sim, then auto-splices instead of waiting for a manual
+        release). A fresh solve_fn per call gives independent quat-smoothing state."""
+        if self.sim is None:
+            return [], False, "no sim running — press 启动仿真预览 first"
+        if not action_chunk:
+            return [], False, "empty action chunk"
+        return self.sim.validate(action_chunk, self._make_solve_fn(), seed_q, MAX_JOINT_STEP)
+
     # ===================== manual: validate a chunk in the sim, then release =====================
     def validate_and_stage(self, action_chunk):
         """Run a predicted chunk through the SIM (step + self-collision + joint readback) and,
@@ -724,8 +734,7 @@ class HumanoidEnv:
         # staging ahead we keep planning continuously from the prior segment's end (see below).
         self._resync_to_robot_if_idle()
 
-        traj, ok, reason = self.sim.validate(action_chunk, self._make_solve_fn(),
-                                             self._last_q, MAX_JOINT_STEP)
+        traj, ok, reason = self._validate_chunk(action_chunk, self._last_q)
         with self._lock:
             if ok and traj:
                 self._last_sim_traj = traj
@@ -749,16 +758,15 @@ class HumanoidEnv:
         validation replicates the arm's REAL pose (both arms + torso + grippers), the same sync
         SimEnv gets at preview launch. No-op when:
           * there's no sim, or
-          * substeps are staged, queued, or a batch is in flight (self._staged_release /
-            self._robot_q non-empty or self._dispatching) — then we're staging AHEAD of execution
-            and must keep planning continuously from the prior segment's end (traj[-1][0]) instead
-            of snapping back to a transient mid-motion pose, or
+          * substeps are staged or queued (self._staged_release / self._robot_q non-empty) — then
+            we're staging/executing AHEAD and must keep planning continuously from the prior
+            segment's end (traj[-1][0]) instead of snapping back to a transient mid-motion pose, or
           * the live arm read fails (leave the seed intact).
         reset_full is owning-thread-only, so it's marshalled via submit_job like validate."""
         if self.sim is None:
             return
         with self._lock:
-            if self._staged_release or self._robot_q or self._dispatching:
+            if self._staged_release or self._robot_q:
                 return
         arm14 = self._read_arm14()                       # both arms (rad); None if never readable
         if arm14 is None:
@@ -802,7 +810,7 @@ class HumanoidEnv:
             print("[HumanoidEnv] release refused: cannot read arm_joint_states (ramp-in start).")
             return 0
         ramp = self._ramp(arm14[:7], traj[0][0], MAX_JOINT_STEP, traj[0][1])   # C5 ramp-in
-        full = ramp + traj
+        full = self._subdivide_points(ramp + traj)       # <= MAX_JOINT_STEP for the live per-tick drain
         with self._lock:
             self._robot_q.clear()
             self._robot_q.extend(full)
@@ -883,15 +891,68 @@ class HumanoidEnv:
                 self._staged_release.extendleft(reversed(subs))
             return 0
         with self._lock:
-            if self._robot_q or self._dispatching:       # already streaming -> append, continuous
+            if self._robot_q:                            # already streaming -> append, continuous
                 full = list(subs)
             else:                                        # idle -> C5 ramp from the measured pose
                 ramp = self._ramp(arm14[:7], subs[0][0], MAX_JOINT_STEP, subs[0][1])
                 full = ramp + list(subs)[1:]             # ramp's last point IS subs[0]
-            self._robot_q.extend(full)
+            self._robot_q.extend(self._subdivide_points(full))
             staged_substep_remaining = len(self._staged_release)
         print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_substep_remaining} substep(s) still staged).")
         return len(full)
+
+    # ===================== auto-inference: validate + time-aligned splice (no manual accept) =====================
+    def auto_ingest_chunk(self, action_chunk, obs_ts):
+        """Auto-inference entry point: validate a predicted chunk on the preview sim (the SAME
+        sim-before-robot self-collision check the manual path uses) and, on success, splice the
+        sim-achieved substeps into the LIVE _robot_q time-aligned to `obs_ts` — no manual release.
+        Refused while E-stopped / without a sim. On validation FAILURE the previous trajectory keeps
+        draining (we just skip this inference). Returns (ok: bool, reason: str)."""
+        if not self._real:
+            return False, "env built with real=False"
+        if self.sim is None:
+            return False, "no sim running — launch the preview first"
+        if self._estop.is_set():
+            return False, "E-stop latched"
+        # Seed validation from a FRESH real left-arm read so the self-collision check and IK plan
+        # from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
+        arm14 = self._read_arm14()
+        seed = arm14[:7] if arm14 is not None else self._last_q
+        traj, ok, reason = self._validate_chunk(action_chunk, seed)
+        if not ok or not traj:
+            return False, reason or "empty validated trajectory"
+        self._auto_splice(traj, obs_ts)
+        return True, ""
+
+    def _auto_splice(self, traj, obs_ts):
+        """Integrate a freshly validated trajectory into the live _robot_q so consecutive inferences
+        join smoothly. `traj` = sim-achieved [(q7, grip), ...] spaced at STEP_TIME, starting from the
+        pose observed at `obs_ts`. The substep of `traj` that corresponds to "now" is
+        f = round((now - obs_ts) / STEP_TIME) — derived from MEASURED elapsed time, so the splice
+        auto-adapts to any inference gap. We keep the committed next substep, _ramp from it to
+        traj[f] (bounded <= MAX_JOINT_STEP, so no joint jump), then follow with traj[f+1:],
+        replacing everything else in the queue. When idle/first inference we ramp from the real pose
+        to traj[0] instead (the whole trajectory plays)."""
+        f = max(0, min(int(round((time.time() - obs_ts) / STEP_TIME)), len(traj) - 1))
+        arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
+        start = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)
+        with self._lock:
+            if not self._robot_q:                         # idle / first inference -> fresh ramp-in
+                ramp = self._ramp(start, traj[0][0], MAX_JOINT_STEP, traj[0][1])
+                new_q = ramp + list(traj[1:])             # ramp's last point IS traj[0]
+            else:
+                # Keep the next up-to-two committed substeps (deque has no slicing) as runway, then
+                # bridge from the LAST kept substep to traj[f]. keep[-1] is robust when only one is left.
+                keep = [self._robot_q[i] for i in range(min(2, len(self._robot_q)))]
+                target = traj[f]
+                ramp = self._ramp(keep[-1][0], target[0], MAX_JOINT_STEP, target[1])  # bridge -> f
+                new_q = keep + ramp + list(traj[f + 1:])   # ramp ends at traj[f]; replace the rest
+            self._robot_q.clear()
+            self._robot_q.extend(self._subdivide_points(new_q))
+            qlen = len(self._robot_q)
+            # Advance the IK warm-start seed to the end of this trajectory for continuity.
+            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
+        print(f"[HumanoidEnv] auto-splice: f={f}/{len(traj)-1}, +{len(ramp)} ramp -> queue {qlen}")
 
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
@@ -943,7 +1004,8 @@ class HumanoidEnv:
         q_to = np.asarray(q_to, dtype=np.float64)
         n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap))
         n = max(n, 1)
-        return [(q_from + (q_to - q_from) * (i / n), float(grip)) for i in range(1, n + 1)]
+        return [(q_from + (q_to - q_from) * (i / n), float(grip)) for i in range(1, n+1)]
+        # this gives the points that provides a smooth transition BETWEEN q_from and q_to (incl. q_to)
 
     def _pos_in_workspace(self, pos):
         """True if the target EE position is inside the configured workspace AABB (H4)."""
@@ -983,6 +1045,8 @@ class HumanoidEnv:
                 print("[HumanoidEnv] preview: target outside workspace; skipping")
                 self._stop_event.wait(self.dt)
                 continue
+
+            #check if there exists a smoothed path, if no smooth it
             if self._smoothed_pos is None:
                 self._smoothed_pos = pos
             else:
@@ -998,35 +1062,27 @@ class HumanoidEnv:
             self._stop_event.wait(self.dt)
 
     def _release_loop(self):
-        """The ONLY driver of real-robot motion. Drains self._robot_q (filled exclusively by the
-        release entry points, which can only copy sim-validated substeps); run_trajectory_control
-        then STREAMS the batch one waypoint at a time so an E-stop halts the arm mid-batch (C3).
-        run_trajectory_control re-subdivides each batch to <= MAX_JOINT_STEP per waypoint (C5), so
-        the per-segment velocity stays bounded without a per-tick clamp."""
+        """The ONLY driver of real-robot motion. Drains self._robot_q ONE substep per STEP_TIME,
+        LIVE (popleft under the lock each tick), so an auto-inference splice into the queue takes
+        effect on the very next tick. Substeps are pre-subdivided to <= MAX_JOINT_STEP at
+        enqueue/splice time, so per-tick streaming stays velocity-bounded (C5). Each substep is its
+        own single-waypoint trajectory, so an E-stop halts the arm within ~STEP_TIME (C3)."""
         while not self._stop_event.is_set():
             if self._estop.is_set():
-                self._stop_event.wait(self.dt)
+                self._stop_event.wait(STEP_TIME)
                 continue
             with self._lock:
-                batch = list(self._robot_q)
-                self._robot_q.clear()
-                self._dispatching = bool(batch)
-            if not batch:
-                self._stop_event.wait(self.dt)
+                sub = self._robot_q.popleft() if self._robot_q else None
+            if sub is None:
+                self._stop_event.wait(STEP_TIME)
                 continue
-            try:
-                if self._firmware_unsafe():                    # defense-in-depth: firmware fault
-                    self.lock_robot()
-                    continue
-                if not self.run_trajectory_control(batch):
-                    self.lock_robot()                          # couldn't dispatch -> estop
-                    continue
-                # run_trajectory_control streams the batch internally, pacing per waypoint on
-                # self._stop_event (so it blocks ~len(batch) * STEP_TIME and an E-stop breaks it
-                # within ~STEP_TIME). No post-dispatch wait needed; the next drain polls below.
-            finally:
-                with self._lock:
-                    self._dispatching = False
+            if self._firmware_unsafe():                        # defense-in-depth: firmware fault
+                self.lock_robot()
+                continue
+            # run_trajectory_control([sub]) sends the one waypoint AND paces STEP_TIME internally,
+            # so there is no extra wait here (that would double the period).
+            if not self.run_trajectory_control([sub]):
+                self.lock_robot()                              # couldn't dispatch -> estop
 
     def _decode_ee_action(self, action):
         """action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip)."""
@@ -1060,10 +1116,9 @@ class HumanoidEnv:
         hold. Returns True on normal completion or an E-stop/shutdown halt; False on a dispatch error."""
         if not points:
             return True
-        # Bound per-waypoint travel to MAX_JOINT_STEP (C5). The sim-ACHIEVED readback can overshoot
-        # between validated substeps, and trajectory_tracking_control allots ~one dt per waypoint, so
-        # an over-cap gap would mean an over-cap joint velocity. Re-subdivide to restore the bound.
-        points = self._subdivide_points(points)
+        # points are already <= MAX_JOINT_STEP apart (C5): subdivision now happens UPSTREAM at
+        # enqueue/splice time, so the live _robot_q can be drained one substep per tick (and spliced
+        # into mid-stream by auto-inference) without an over-cap velocity.
         # robot_states: the observation that anchors the trajectory (8.2.4). Reads only, optional.
         robot_states = {}
 
@@ -1101,13 +1156,12 @@ class HumanoidEnv:
                                          "control_type": "ABS_JOINT"}}]
             if grip is not None:                         # None -> leave the gripper alone (E-stop hold)
                 # grip is already the binary {0,1} normalized at inference -> open/close command.
-                grip_cmd = GRIPPER_CLOSE_CMD if grip >= 0.5 else GRIPPER_OPEN_CMD
+                grip_cmd = 1 if grip >= 0.5 else 0
                 self.robot.move_gripper([grip_cmd, 0])
             try:
                 self.robot_controller.trajectory_tracking_control(
                     infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
                     )
-                1
             except Exception as e:
                 print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
                 return False

@@ -29,7 +29,7 @@ import numpy as np
 from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 
 RECORD_HZ = 30
-INFERENCE_HZ = 10
+INFERENCE_HZ = 10 #not used, the inference time is 15 to 20hz
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -189,7 +189,12 @@ class InferenceController:
                 self.robot_info.inference_timestamp = ts
 
         if submit:
-            env.submit_actions(action.tolist())
+            # AUTO-to-robot: validate this chunk on the preview sim and time-aligned-splice it into
+            # the live robot queue (no manual release). ts is the obs wall-clock used to align the
+            # splice; validation failure just skips this inference (the previous trajectory drains on).
+            ok, reason = env.auto_ingest_chunk(action.tolist(), ts)
+            if not ok:
+                print(f"[InferenceController] auto: chunk skipped — {reason}")
         return True
 
     def inference_once(self) -> bool:
@@ -258,27 +263,53 @@ class InferenceController:
     #  Auto loop: predict + submit continuously                            #
     # ------------------------------------------------------------------ #
     def auto_inference(self, stop: bool = False):
+        """Continuous auto-inference that DRIVES THE REAL ROBOT. Each inference is validated on the
+        preview sim and time-aligned-spliced into the live robot queue (env.auto_ingest_chunk) — no
+        manual release. The inference cadence is set by the server+validation latency itself (the
+        substep queue absorbs the gap), so there is no fixed inference_hz sleep. Requires the preview
+        sim to be running (validation) and real=True; the GUI launches the sim before starting."""
         if stop:
             self.is_auto_inference = False
             if self.inference_thread is not None:
                 print("[InferenceController] Stopping auto_inference thread...")
                 self.inference_thread.join()
                 self.inference_thread = None
-            # Stop feeding the robot: drop any queued actions in the env.
-            if self.humanoid_env is not None:
-                self.humanoid_env.submit_actions([])
+            # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
+            # the env E-stop to halt immediately instead.)
+            return
+
+        env = self.humanoid_env
+        if env is None or getattr(env, "sim", None) is None:
+            print("[InferenceController] auto refused: launch the simulation preview first "
+                  "(validation runs through it).")
             return
 
         self.is_auto_inference = True
 
         def _run_auto_inference():
             while self.is_auto_inference:
-                if self._run_inference(submit=True):
-                    time.sleep(1 / self.inference_hz)
-                else:
+                # Any E-stop source (operator 急停 OR a firmware-triggered lock_robot from
+                # _release_loop) disarms auto: we exit the loop so motion does NOT silently
+                # resume when the E-stop is later reset — the operator must press 启动 again.
+                # (auto_ingest_chunk also refuses while latched, so nothing is spliced even in
+                # the brief window before we notice here.)
+                if self.humanoid_env.estopped:
+                    print("[InferenceController] E-stop latched — disarming auto-inference.")
+                    self.is_auto_inference = False
+                    break
+                # submit=True -> validate + splice onto the robot. Server+validation latency paces
+                # the loop; only back off briefly when an inference is skipped (stale obs, server
+                # error, validation failure) so we don't busy-spin.
+                if not self._run_inference(submit=True):
                     time.sleep(0.01)
+
+        # Reap a thread that self-exited on E-stop (handle left non-None) so a restart is treated
+        # as a fresh start instead of being blocked by the dead handle.
+        if self.inference_thread is not None and not self.inference_thread.is_alive():
+            self.inference_thread.join()
+            self.inference_thread = None
 
         if self.inference_thread is None:
             self.inference_thread = threading.Thread(target=_run_auto_inference, daemon=True)
-            print("[InferenceController] Starting auto_inference thread...")
+            print("[InferenceController] Starting auto_inference (-> robot) thread...")
             self.inference_thread.start()

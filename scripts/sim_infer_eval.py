@@ -28,6 +28,8 @@ Usage:
 import argparse
 import os
 import sys
+import threading
+import time
 
 import numpy as np
 
@@ -36,7 +38,7 @@ from real_world.ik import quat_xyzw_to_se3, DEFAULT_URDF, DEFAULT_CALIBRATION  #
 from real_world.sim_backend import SimEnv, load_trajectory  # noqa: E402
 from real_world.recorded_obs import RecordedObsSource  # noqa: E402
 # These import a2d_sdk (only present on the robot machine), so keep them after the SDK-free ones.
-from real_world.humanoid_env import HumanoidEnv, RECORD_HZ  # noqa: E402
+from real_world.humanoid_env import HumanoidEnv, RECORD_HZ, GRIPPER_CLOSE_THRESH, MAX_JOINT_STEP  # noqa: E402
 from real_world.inference_controller import (  # noqa: E402
     InferenceController, PC4080_HOST, PC4080_PORT, INFERENCE_HZ,
 )
@@ -59,6 +61,64 @@ class _NoRobot:
                 f"_NoRobot: SDK call '{name}' blocked — sim_infer_eval is sim-only and must "
                 f"never touch the robot.")
         return _blocked
+
+
+class _SimRobot:
+    """Non-raising sim-side SDK stand-in for --source auto, so the REAL auto pipeline
+    (validate -> time-aligned splice -> live release) can be exercised from a recording WITHOUT
+    hardware. Serves as BOTH robot and robot_controller: it tracks the last commanded LEFT joints
+    (closed loop — arm_joint_states returns what was last commanded) and records every streamed
+    waypoint so the executed trajectory can be checked. Holds no DDS handle and never moves a robot.
+    """
+
+    def __init__(self, q0, sim=None):
+        self._lock = threading.Lock()
+        self._left = np.asarray(q0, dtype=np.float64).copy()   # tracked left-arm joints (7,)
+        self._grip = 0.0
+        self.moves = []                                        # recorded LEFT-arm waypoints (7,)
+        self.right_touched = False
+        self._sim = sim                                        # drive the preview for GUI viz
+
+    # --- RobotDds-style reads / commands ---
+    def arm_joint_states(self):
+        with self._lock:
+            return (np.concatenate([self._left, np.zeros(7)]).tolist(), 0)
+
+    def gripper_states(self):
+        with self._lock:
+            return ([self._grip, 0.0], 0)
+
+    def waist_joint_states(self):
+        return ([0.0, 0.0], 0)
+
+    def head_joint_states(self):
+        return ([0.0, 0.0], 0)
+
+    def move_gripper(self, positions):
+        with self._lock:
+            self._grip = float(positions[0])
+
+    def move_arm(self, positions):
+        pass
+
+    # --- RobotController-style ---
+    def get_motion_status(self, timestamp=None):
+        return {'error': {'has_error': False}, 'collisions': []}
+
+    def trajectory_tracking_control(self, infer_timestamp, robot_states, robot_actions,
+                                    robot_link="base_link", trajectory_reference_time=1.0):
+        with self._lock:
+            for a in robot_actions:
+                if "right_arm" in a or "right_gripper" in a:
+                    self.right_touched = True
+                left = np.asarray(a["left_arm"]["action_data"], dtype=np.float64)
+                self._left = left.copy()       # closed loop: the "robot" reaches the commanded pose
+                self.moves.append(left.copy())
+                grip = self._grip
+        # Drive the preview sim with the EXECUTED waypoint so the GUI shows the spliced motion (not
+        # just validation playback). Thread-safe (sim.command only sets a target; no p.* call here).
+        if self._sim is not None:
+            self._sim.command(left, grip)
 
 
 def pose_to_action_row(pos, quat_xyzw, grip):
@@ -84,6 +144,44 @@ def run_replay(env, args):
     return lambda: env.queue_empty()
 
 
+def run_auto_replay(env, args):
+    """Drive the NEW auto-to-robot pipeline (validate + time-aligned splice + live release) from a
+    recording: feed OVERLAPPING chunks of recorded EE poses through env.auto_ingest_chunk, exactly
+    as the policy would, so the splice integrates consecutive 'inferences'. The _SimRobot pushes each
+    EXECUTED waypoint into the preview sim, so (without --direct) the GUI shows the spliced motion —
+    though validation also drives the sim and will briefly flicker the view (single PyBullet client).
+    The gripper is binarized to {0,1} here, mirroring the real inference-retrieval normalization."""
+    ee_pos, ee_quat, grip, _arm, n = load_trajectory(
+        args.recordings, args.recording, args.max_frames)
+    rows = [pose_to_action_row(ee_pos[i], ee_quat[i],
+                               1.0 if grip[i] >= GRIPPER_CLOSE_THRESH else 0.0)
+            for i in range(n)]
+    chunk_len, gap = args.chunk_len, args.auto_gap
+    advance = max(1, int(round(gap * RECORD_HZ)))      # window step per 'inference'
+    print(f"[sim_infer_eval] auto: {n} recorded frames -> overlapping chunks of {chunk_len} every "
+          f"{gap:.2f}s (advance {advance}) -> validate + splice + release")
+
+    def feeder():
+        idx = fed = skipped = 0
+        while idx < n and not env._stop_event.is_set():
+            chunk = rows[idx: idx + chunk_len]
+            if len(chunk) < 2:
+                break
+            ok, reason = env.auto_ingest_chunk(chunk, time.time())
+            fed += 1
+            if not ok:
+                skipped += 1
+                print(f"[auto] chunk@{idx} skipped: {reason}")
+            idx += advance
+            time.sleep(gap)
+        print(f"[auto] feeder done: {fed} chunks fed, {skipped} skipped")
+
+    t = threading.Thread(target=feeder, daemon=True)
+    t.start()
+    # Done when every chunk has been fed AND the live robot queue has drained.
+    return lambda: (not t.is_alive()) and env.robot_pending == 0
+
+
 def run_policy(env, obs, args):
     """Run the policy on recorded obs; predictions flow through the exec path to the sim."""
     inf = InferenceController(env, robot_info=None, obs_source=obs,
@@ -101,10 +199,15 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recording", default="recording001")
     ap.add_argument("--recordings", default=DEFAULT_RECORDINGS)
-    ap.add_argument("--source", choices=["policy", "replay"], default="policy",
+    ap.add_argument("--source", choices=["policy", "replay", "auto"], default="policy",
                     help="policy: run the policy server on recorded obs; "
-                         "replay: feed recorded EE poses directly (no server)")
-    ap.add_argument("--max-frames", type=int, default=0, help="0 = all (replay only)")
+                         "replay: feed recorded EE poses straight to the sim (no server); "
+                         "auto: drive the NEW auto-to-robot pipeline (validate+splice+release) from "
+                         "the recording via a sim-backed fake robot (no hardware)")
+    ap.add_argument("--max-frames", type=int, default=0, help="0 = all (replay/auto only)")
+    ap.add_argument("--chunk-len", type=int, default=8, help="auto: rows per 'inference' chunk")
+    ap.add_argument("--auto-gap", type=float, default=0.16,
+                    help="auto: simulated seconds between inferences (the window advance)")
     ap.add_argument("--urdf", default=DEFAULT_URDF)
     ap.add_argument("--calibration", default=DEFAULT_CALIBRATION)
     ap.add_argument("--sim-hz", type=float, default=240.0)
@@ -123,11 +226,17 @@ def main():
                  sim_hz=args.sim_hz, direct=args.direct)
     sim.reset_arm(q0)
 
-    # Execution path: IK -> sim only. real=False AND a tripwire _NoRobot in place of the SDK
-    # handles => no live DDS connection exists and any SDK call raises. Provably no hardware
-    # motion. (Also means no robot/DDS needs to be running to use this runner.)
-    env = HumanoidEnv(robot=_NoRobot(), robot_controller=_NoRobot(),
-                      sim=sim, real=False, seed_q=q0, frequency=RECORD_HZ)
+    # policy/replay: IK -> sim only. real=False + a tripwire _NoRobot => no DDS handle and any SDK
+    # call raises (provably no hardware motion). auto: the new pipeline NEEDS real=True + a robot
+    # that responds, so use a sim-backed _SimRobot that tracks/records commands (still no hardware).
+    if args.source == "auto":
+        sim_robot = _SimRobot(q0, sim=sim)          # drive the preview with executed waypoints
+        env = HumanoidEnv(robot=sim_robot, robot_controller=sim_robot,
+                          sim=sim, real=True, seed_q=q0, frequency=RECORD_HZ)
+    else:
+        sim_robot = None
+        env = HumanoidEnv(robot=_NoRobot(), robot_controller=_NoRobot(),
+                          sim=sim, real=False, seed_q=q0, frequency=RECORD_HZ)
     env.start(run_collect=False, run_exec=True)
 
     obs = None
@@ -135,6 +244,8 @@ def main():
     try:
         if args.source == "replay":
             stop_fn = run_replay(env, args)
+        elif args.source == "auto":
+            stop_fn = run_auto_replay(env, args)
         else:
             obs = RecordedObsSource(args.recording, args.recordings,
                                     record_hz=RECORD_HZ, inference_hz=args.inference_hz)
@@ -147,6 +258,17 @@ def main():
         if obs is not None:
             obs.close()
         sim.disconnect()
+
+    if sim_robot is not None:                          # auto: report the executed trajectory
+        moves = np.array(sim_robot.moves)
+        if len(moves) > 1:
+            dmax = float(np.max(np.abs(np.diff(moves, axis=0))))
+            ok = dmax <= MAX_JOINT_STEP + 1e-6
+            print(f"[sim_infer_eval] auto executed {len(moves)} waypoints; max joint step "
+                  f"{dmax:.4f} (cap {MAX_JOINT_STEP}) -> {'SMOOTH ✓' if ok else 'OVER-CAP ✗'}; "
+                  f"right arm {'TOUCHED ✗' if sim_robot.right_touched else 'untouched ✓'}")
+        else:
+            print(f"[sim_infer_eval] auto executed {len(moves)} waypoints (nothing streamed?)")
     print("[sim_infer_eval] done.")
 
 

@@ -55,6 +55,29 @@ class PickPlaceMixin:
         self.status_text.set("推理中…")
         threading.Thread(target=worker, daemon=True).start()
 
+    def _start_auto_inference(self):
+        """Begin auto-inference -> robot. Validation runs through the preview sim, so launch it
+        first if needed, then wait (non-blocking) until env.sim is ready before starting the loop."""
+        if getattr(self.env, "sim", None) is None:
+            self.launch_sim()
+        self.status_text.set("⏳ 启动仿真中，准备自动运行…")
+        self._await_sim_then_auto()
+
+    def _await_sim_then_auto(self, tries=0):
+        """Poll (via root.after, non-blocking) for the preview sim to come up, then start auto."""
+        if getattr(self.env, "sim", None) is not None:
+            self.inference.auto_inference()
+            self.status_text.set("⚠ 自动运行中（推理→仿真验证→真机，急停可随时停止）")
+        elif tries < 50:                     # ~5s budget for the sim thread to build
+            self.root.after(100, lambda: self._await_sim_then_auto(tries + 1))
+        else:
+            self.status_text.set("⚠ 仿真启动超时，无法开始自动运行")
+
+    def _stop_auto_inference(self):
+        """Stop feeding new chunks; the release loop drains whatever is queued (use 急停 to halt)."""
+        self.inference.auto_inference(stop=True)
+        self.status_text.set("■ 已停止自动运行（队列将自然排空；急停可立即停止）")
+
     def _run_release_substeps(self, remaining=False, count=1):
         """释放 staged substeps to the real robot. remaining=True streams ALL staged substeps;
         otherwise releases the next `count` (1 or 10). Releases whatever is left if fewer remain.
@@ -534,18 +557,21 @@ class PickPlaceMixin:
         # No prediction yet -> start disabled; 推理一次 re-enables them.
         self._refresh_validation_buttons()
 
-        # auto_row = ttk.Frame(sec_inf)
-        # auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
-        # ttk.Label(auto_row, text="自动:",
-        #           style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        # ttk.Button(auto_row, text="⚠ 开始自动运行",
-        #            style="Danger.TButton",
-        #            command=print("Hello World") #lambda: self.inference.auto_inference() #temporarily disabled
-        #            ).pack(side=tk.LEFT, padx=4)
-        # ttk.Button(auto_row, text="■ 停止自动运行",
-        #            style="Muted.TButton",
-        #            command=print("No Hello World") #lambda: self.inference.auto_inference(stop=True) #temporarily disabled
-        #            ).pack(side=tk.LEFT, padx=4)
+        # Auto-inference -> robot: each inference is validated on the preview sim and time-aligned-
+        # spliced onto the live robot queue (no manual release). Start launches the preview sim if
+        # needed (validation runs through it), then begins the loop. 急停 (below) halts immediately.
+        auto_row = ttk.Frame(sec_inf)
+        auto_row.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Label(auto_row, text="自动:",
+                  style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(auto_row, text="⚠ 开始自动运行",
+                   style="Danger.TButton",
+                   command=lambda: self._start_auto_inference()
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_row, text="■ 停止自动运行",
+                   style="Muted.TButton",
+                   command=lambda: self._stop_auto_inference()
+                   ).pack(side=tk.LEFT, padx=4)
 
         # ===== 仿真预览 + 真机释放（先在仿真里预览，确认后再解锁真机执行）=====
         sim_row = ttk.Frame(sec_inf)
