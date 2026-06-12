@@ -47,7 +47,7 @@ RECORD_HZ = 30
 # Max per-tick change of any single arm joint on the hardware path (rad). The
 # validation pass subdivides to respect this and the release loop clamps to it,
 # so a step-change target becomes a bounded ramp instead of a snap. (C5)
-MAX_JOINT_STEP = 0.02            # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
+MAX_JOINT_STEP = 0.005  #0.02         # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
 # Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
 QUAT_ALPHA = 0.5
 # Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
@@ -933,6 +933,7 @@ class HumanoidEnv:
         traj[f] (bounded <= MAX_JOINT_STEP, so no joint jump), then follow with traj[f+1:],
         replacing everything else in the queue. When idle/first inference we ramp from the real pose
         to traj[0] instead (the whole trajectory plays)."""
+        print(f"world time: {time.time()} | obs time: {obs_ts} | time elapsed:{time.time() - obs_ts}")
         f = max(0, min(int(round((time.time() - obs_ts) / STEP_TIME)), len(traj) - 1))
         arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
         start = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)

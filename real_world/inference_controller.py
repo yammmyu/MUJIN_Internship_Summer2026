@@ -127,13 +127,14 @@ class InferenceController:
         Returns True if a fresh inference was produced.
         """
 
-        print(f"[InferenceController] running inference...")
+      
         env = self.humanoid_env
         if env is None:
             print("[InferenceController] humanoid_env not accessible")
             return False
 
         obs = self.obs_source.get_obs()
+        print(f"[InferenceController] inference pipeline starting")
         if obs is None:
             return False
         # Refuse to predict from stale/frozen sensors or under a firmware error (H2). A frozen
@@ -151,12 +152,14 @@ class InferenceController:
             print("[InferenceController] timestamp has not advanced")
             return False
 
+        print(f"[InferenceController] preping request | Time elapsed; {time.time()- ts}")
         req = {
             'agent_imgs': [encode_image(img) for img in obs['agent_imgs']],
             'hand_imgs': [encode_image(img) for img in obs['hand_imgs']],
             'state': obs['state'],
         }
 
+        print(f"[InferenceController] sending request | Time elapsed; {time.time()- ts}")
         resp = post_predict(self.host, self.port, req, timeout=10)
 
         if 'error' in resp:
@@ -165,7 +168,7 @@ class InferenceController:
 
         # action rows: [eef_pos(3), 6D_rot(6), gripper(1)]
         action = np.asarray(resp['action'], dtype=np.float32)
-        print(f"[InferenceController] response recieved! Details:{action}")   # raw (incl. raw gripper)
+        print(f"[InferenceController] response recieved! | Time elapsed; {time.time()- ts} | Details:{action}")   # raw (incl. raw gripper)
         # Binarize the gripper column (idx 9) HERE, as soon as the chunk arrives: the raw [0,~85]
         # gripper signal is noisy (transient spikes), so only a (near-)fully-closed reading
         # (>= GRIPPER_CLOSE_THRESH) becomes closed=1, else open=0. Everything downstream — sim
@@ -188,6 +191,7 @@ class InferenceController:
                 self.robot_info.left_joint_predict_action_values = action.tolist()
                 self.robot_info.inference_timestamp = ts
 
+        print(f"[InferenceController] sending chunk for validation | Time elapsed; {time.time()- ts}")
         if submit:
             # AUTO-to-robot: validate this chunk on the preview sim and time-aligned-splice it into
             # the live robot queue (no manual release). ts is the obs wall-clock used to align the
