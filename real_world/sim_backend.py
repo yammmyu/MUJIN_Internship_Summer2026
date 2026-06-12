@@ -301,7 +301,7 @@ class SimEnv:
         return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
 
     # ===================== validation (run on the owning thread) =====================
-    def validate(self, actions, solve_fn, seed_q, max_joint_step, learn=False):
+    def validate(self, actions, solve_fn, seed_q, max_joint_step, learn=False, fast=False):
         """Run a chunk through the sim; return (validated_traj, ok, reason). Thread-safe entry
         (marshals to the owning thread via submit_job).
 
@@ -311,11 +311,12 @@ class SimEnv:
         learn=False (validate): abort (ok=False) on a None q7 or any NEW left-side self-collision.
         learn=True (calibrate): never abort on collision — instead ABSORB every new left-side
         pair into the ignore baseline (used to learn this coarse URDF's inherent overlaps from
-        known-SAFE motions). Leaves the arm where it ended."""
+        known-SAFE motions). Leaves the arm where it ended.
+        fast=True: skip the per-substep real-time sleep (auto-inference latency path)."""
         return self.submit_job(
-            lambda: self._validate_impl(actions, solve_fn, seed_q, max_joint_step, learn))
+            lambda: self._validate_impl(actions, solve_fn, seed_q, max_joint_step, learn, fast))
 
-    def _validate_impl(self, actions, solve_fn, seed_q, max_joint_step, learn=False):
+    def _validate_impl(self, actions, solve_fn, seed_q, max_joint_step, learn=False, fast=False):
         seed = np.asarray(seed_q, dtype=np.float64).copy()
         # Deterministic start (so learn & validate see the same path, and repeat runs agree):
         # reset the left arm to the seed AND the gripper to open (GRIPPER_OPEN_RAD, since angle 0
@@ -333,7 +334,7 @@ class SimEnv:
             q7 = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
             for sub in self._subdivide(seed, q7, max_joint_step):
                 self._apply_arm(sub, grip)
-                self._settle(sub)
+                self._settle(sub, fast=fast)
                 new = self._new_left_pairs()
                 if new:
                     if learn:
@@ -365,13 +366,15 @@ class SimEnv:
                                         targetPositions=[g] * len(self.grip_idx),
                                         forces=[20.0] * len(self.grip_idx))
 
-    def _settle(self, q_des):
+    def _settle(self, q_des, fast=False):
         """Step until the arm reaches q_des (or settle timeout). Sleeps in GUI mode so the user
-        sees the validated motion play out."""
+        sees the validated motion play out — UNLESS fast=True (auto-inference), where the per-step
+        real-time sleep is pure latency (nobody is watching the substeps): the GUI still renders
+        the achieved poses, just faster. This sleep is the dominant cost of one inference cycle."""
         q_des = np.asarray(q_des, dtype=np.float64)
         for _ in range(self.settle_max_steps):
             p.stepSimulation()
-            if not self.direct:
+            if not self.direct and not fast:
                 time.sleep(self.sim_dt)
             if np.max(np.abs(self._cur_arm_q() - q_des)) < self.settle_tol:
                 break

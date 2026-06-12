@@ -705,17 +705,20 @@ class HumanoidEnv:
         return True, "collision baseline updated"
 
     # ===================== shared sim-validation core (manual + auto) =====================
-    def _validate_chunk(self, action_chunk, seed_q):
+    def _validate_chunk(self, action_chunk, seed_q, fast=False):
         """Run a chunk through self.sim from seed_q (step + self-collision + joint readback) and
         return (traj, ok, reason) where traj is the sim-ACHIEVED [(q7, grip), ...]. The single
         validation primitive shared by the manual validate_and_stage and auto-inference (which
         validates on the SAME preview sim, then auto-splices instead of waiting for a manual
-        release). A fresh solve_fn per call gives independent quat-smoothing state."""
+        release). A fresh solve_fn per call gives independent quat-smoothing state.
+        fast=True (auto path): skip the per-substep real-time sleep — that sleep is just for the
+        operator to watch the manual preview and is ~1s of pure latency per auto inference."""
         if self.sim is None:
             return [], False, "no sim running — press 启动仿真预览 first"
         if not action_chunk:
             return [], False, "empty action chunk"
-        return self.sim.validate(action_chunk, self._make_solve_fn(), seed_q, MAX_JOINT_STEP)
+        return self.sim.validate(action_chunk, self._make_solve_fn(), seed_q, MAX_JOINT_STEP,
+                                 fast=fast)
 
     # ===================== manual: validate a chunk in the sim, then release =====================
     def validate_and_stage(self, action_chunk):
@@ -918,10 +921,10 @@ class HumanoidEnv:
         # from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
         arm14 = self._read_arm14()
         seed = arm14[:7] if arm14 is not None else self._last_q
-        traj, ok, reason = self._validate_chunk(action_chunk, seed)
+        traj, ok, reason = self._validate_chunk(action_chunk, seed, fast=True)
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
-        self._auto_splice(traj, obs_ts)
+        self._auto_splice_nearest(traj, obs_ts)
         return True, ""
 
     def _auto_splice(self, traj, obs_ts):
@@ -954,6 +957,38 @@ class HumanoidEnv:
             # Advance the IK warm-start seed to the end of this trajectory for continuity.
             self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
         print(f"[HumanoidEnv] auto-splice: f={f}/{len(traj)-1}, +{len(ramp)} ramp -> queue {qlen}")
+
+    def _auto_splice_nearest(self, traj, obs_ts=None):
+        """Same intent as _auto_splice, but pick the "now" substep f by MATCHING JOINT STATE
+        instead of elapsed wall-clock. traj = sim-achieved [(q7, grip), ...] of ABSOLUTE left-arm
+        joint angles (rad). We read the live left-arm joints and choose f = the traj row whose
+        joints are closest to the current pose under L1 (sum-of-abs-difference) — the cheapest
+        nearest-neighbour we can run (vectorised over the whole chunk, no sqrt, no Python loop).
+        obs_ts is accepted for signature-compat but unused here. The ramp is kept for safety even
+        though matched f should already sit near the live pose."""
+        arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
+        live = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)
+        # (N,7) matrix of the trajectory's absolute joint angles -> L1 distance to live -> argmin.
+        traj_q = np.array([t[0] for t in traj], dtype=np.float64)        # (N, 7)
+        f = int(np.abs(traj_q - live).sum(axis=1).argmin())             # nearest substep
+        start = live
+        with self._lock:
+            if not self._robot_q:                         # idle / first inference -> fresh ramp-in
+                ramp = self._ramp(start, traj[0][0], MAX_JOINT_STEP, traj[0][1])
+                new_q = ramp + list(traj[1:])             # ramp's last point IS traj[0]
+            else:
+                # Keep the next up-to-two committed substeps as runway, then bridge from the LAST
+                # kept substep to traj[f]. keep[-1] is robust when only one is left.
+                keep = [self._robot_q[i] for i in range(min(2, len(self._robot_q)))]
+                target = traj[f]
+                ramp = self._ramp(keep[-1][0], target[0], MAX_JOINT_STEP, target[1])  # bridge -> f
+                new_q = keep + ramp + list(traj[f + 1:])   # ramp ends at traj[f]; replace the rest
+            self._robot_q.clear()
+            self._robot_q.extend(self._subdivide_points(new_q))
+            qlen = len(self._robot_q)
+            # Advance the IK warm-start seed to the end of this trajectory for continuity.
+            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
+        print(f"[HumanoidEnv] auto-splice(nearest): f={f}/{len(traj)-1}, +{len(ramp)} ramp -> queue {qlen}")
 
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
