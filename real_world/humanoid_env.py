@@ -246,6 +246,9 @@ class HumanoidEnv:
         self._frames = {}                                      # name -> rolling [prev, cur]
         self._intrinsics = {}                                  # name -> intrinsics dict (lazy)
         self._last_two_ee_states = None                        # [s_{t-1}, s_t]
+        # robot0_left_joint obs (policy input): rolling [j_{t-1}, j_t], each = 7 LEFT-arm joint
+        # angles (rad) + 1 RAW gripper value (8-dim). Built alongside the EE pair in _collect_loop.
+        self._last_two_joint_states = None
         self._obs_timestamp = 0.0
 
         # Latest both-arm EE poses, refreshed every collect tick (for GUI display).
@@ -495,10 +498,13 @@ class HumanoidEnv:
                 grip = self.robot.gripper_states()[0]
                 ee_state = self._left_ee_from(status, grip)
                 self._update_latest_poses(status)
-                self._read_arm14()                      # refresh last-good arm read (C4)
+                arm14 = self._read_arm14()              # refresh last-good arm read (C4)
+                # robot0_left_joint obs: 7 LEFT-arm joint angles (rad) + RAW gripper (matches the
+                # training zarr layout). None if the arm was never readable.
+                joint_state = (list(arm14[:7]) + [grip]) if arm14 is not None else None
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
-                status = grip = ee_state = None
+                status = grip = ee_state = joint_state = None
 
             frames = self._read_frames(desired)
 
@@ -531,6 +537,11 @@ class HumanoidEnv:
                         self._last_two_ee_states = [self._last_two_ee_states[-1], ee_state]
                     else:
                         self._last_two_ee_states = [ee_state, ee_state]
+                if joint_state is not None:
+                    if self._last_two_joint_states:
+                        self._last_two_joint_states = [self._last_two_joint_states[-1], joint_state]
+                    else:
+                        self._last_two_joint_states = [joint_state, joint_state]
 
             # Append a recording row while a session is active.
             with self._rec_lock:
@@ -644,8 +655,8 @@ class HumanoidEnv:
         self.request(AGENT_CAMERA)
         self.request(HAND_CAMERA)
         with self._lock:
-            if self._last_two_ee_states is None:
-                print("[HumanoidEnv] Waiting for EE states")
+            if self._last_two_ee_states is None or self._last_two_joint_states is None:
+                print("[HumanoidEnv] Waiting for EE / joint states")
                 return None
             if any(self._frames.get(n) is None for n in (AGENT_CAMERA, HAND_CAMERA)):
                 print("[HumanoidEnv] Wait for Camera")
@@ -656,6 +667,8 @@ class HumanoidEnv:
                 'agent_imgs': copy.deepcopy(self._frames[AGENT_CAMERA]),
                 'hand_imgs': copy.deepcopy(self._frames[HAND_CAMERA]),
                 'state': copy.deepcopy(self._last_two_ee_states),
+                # robot0_left_joint policy input: [j_{t-1}, j_t], each 7 left-arm joints + raw gripper.
+                'joint_state': copy.deepcopy(self._last_two_joint_states),
                 'timestamp': self._obs_timestamp,
                 'age': age,
                 'stale': bool(stale),

@@ -176,6 +176,9 @@ class InferenceController:
             'agent_imgs': [encode_image(img) for img in obs['agent_imgs']],
             'hand_imgs': [encode_image(img) for img in obs['hand_imgs']],
             'state': obs['state'],
+            # robot0_left_joint policy input: [j_{t-1}, j_t], each = 7 left-arm joints (rad) + raw
+            # gripper. Server must map this to robot0_left_joint (see train config shape_meta).
+            'left_joint': obs['joint_state'],
         }
 
         print(f"[InferenceController] sending request | Time elapsed; {time.time()- ts}")
