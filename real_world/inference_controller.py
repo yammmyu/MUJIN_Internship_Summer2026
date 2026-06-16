@@ -28,10 +28,22 @@ import time
 import cv2
 import numpy as np
 
-from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
+from collections import deque
+
+from real_world.humanoid_env import GRIPPER_CLOSE_THRESH, STEP_TIME
 
 RECORD_HZ = 30
-INFERENCE_HZ = 2  # auto-inference cadence cap (Hz); <=0 -> run as fast as latency allows
+INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (max overlap for TE)
+
+# --- Temporal ensemble (ACT-style) -------------------------------------------------
+# Chunk-level EE-space smoothing: each new chunk is averaged against recent overlapping
+# chunks before validation. A buffered chunk's row j targets wall-clock ts_obs + j*STEP_TIME;
+# for a query time we take its nearest row and weight it exp(-TE_M * age) (age = inferences old,
+# newest = 0). NOTE: this only smooths once chunks actually OVERLAP in time, i.e. when
+# (horizon * STEP_TIME) > inference_period. Below that it safely passes the newest chunk through.
+USE_TEMPORAL_ENSEMBLE = True
+TE_M = 0.01            # decay; larger -> trust the newest chunk more (less averaging)
+TE_BUFFER_LEN = 8      # how many recent raw chunks to keep for averaging
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -100,6 +112,10 @@ class InferenceController:
         self.inference_thread = None
         self.is_auto_inference = False
         self._last_inference_obs_ts = 0.0
+        # Temporal-ensemble state: rolling buffer of recent RAW chunks (ts_obs, action[N,10]).
+        # Always averaged from raw — never re-buffer ensembled output, or smoothing compounds.
+        self.use_temporal_ensemble = USE_TEMPORAL_ENSEMBLE
+        self._te_buffer = deque(maxlen=TE_BUFFER_LEN)
         # Manual step-through cursor: index of the NEXT unexecuted action row in the
         # current chunk. Reset to 0 on every fresh inference; advanced by
         # execute_inference_result. cursor >= chunk length => the chunk is fully consumed
@@ -113,6 +129,7 @@ class InferenceController:
         """Prepare for inference. The injected env's threads are started by the
         caller (the GUI starts env before this), so we only reset our cursor."""
         self._last_inference_obs_ts = 0.0
+        self._te_buffer.clear()
         print("[InferenceController] InferenceController ready (env owned by caller).")
 
     def stop(self):
@@ -183,6 +200,14 @@ class InferenceController:
         # A fresh chunk restarts the manual step-through from the first row.
         self._exec_cursor = 0
 
+        # Temporal ensemble: buffer this RAW chunk, then average it with recent overlapping chunks
+        # in EE space. The ensembled chunk is what we publish + validate; the raw one stays only in
+        # the buffer for future averaging. No-op (returns the newest chunk) until chunks overlap.
+        print(f"[InferenceController] sending for temporal ensemble! | Time elapsed; {time.time()- ts}")
+        if self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10:
+            self._te_buffer.append((ts, action.copy()))
+            action = self._temporal_ensemble(ts, action)
+        print(f"[InferenceController] ensemble finished | Time elapsed; {time.time()- ts}")
         # Publish for robot_info_server / visualisation. left_*_predict_* carry
         # EE-pose data here (see robot_info_server.RobotInfo notes):
         #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
@@ -203,6 +228,39 @@ class InferenceController:
             if not ok:
                 print(f"[InferenceController] auto: chunk skipped — {reason}")
         return True
+
+    def _temporal_ensemble(self, ts_new, new_action):
+        """ACT-style chunk-level temporal ensemble, in EE-pose space.
+
+        Returns an (N,10) chunk: for each row k of the newest chunk (target time
+        t_k = ts_new + k*STEP_TIME) we gather, from every buffered RAW chunk, its row nearest to
+        t_k, weight it w = exp(-TE_M * age) (age = how many inferences old, newest = 0), and take
+        the weighted mean. pos (0:3) and rot6d (3:9) average linearly (rot6d is re-orthonormalised
+        downstream by rot6d_to_quat); gripper (9), already {0,1}, averages then re-thresholds at
+        0.5. With no temporal overlap only the newest chunk contributes -> identity (safe no-op).
+        Assumes the caller has appended the new raw chunk to self._te_buffer already."""
+        N = new_action.shape[0]
+        out = new_action.copy()
+        buf = list(self._te_buffer)                 # oldest -> newest
+        newest_idx = len(buf) - 1
+        print(f"Current TE buffer list{newest_idx}")
+        for k in range(N):
+            t_k = ts_new + k * STEP_TIME
+            rows, weights = [], []
+            for idx, (ts_i, act_i) in enumerate(buf):
+                j = int(round((t_k - ts_i) / STEP_TIME))
+                if 0 <= j < act_i.shape[0]:
+                    age = newest_idx - idx              # newest chunk -> 0
+                    rows.append(act_i[j])
+                    weights.append(np.exp(-TE_M * age))
+            if len(rows) <= 1:                          # only the newest covers t_k -> identity
+                continue
+            w = np.asarray(weights, dtype=np.float64)
+            w /= w.sum()
+            avg = (w[:, None] * np.asarray(rows, dtype=np.float64)).sum(axis=0)
+            out[k, :9] = avg[:9]                         # pos + rot6d (linear)
+            out[k, 9] = 1.0 if avg[9] >= 0.5 else 0.0    # gripper re-binarised
+        return out
 
     def inference_once(self) -> bool:
         """Predict + publish only (no execution).

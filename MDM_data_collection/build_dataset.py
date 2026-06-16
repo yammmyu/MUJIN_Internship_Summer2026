@@ -9,7 +9,7 @@ Output Zarr schema:
   data/robot0_eye_in_hand_image     (N, 84, 84, 3)  uint8    — hand_left camera (RGB)
   data/robot0_eef_pos               (N, 3)          float32  — EE position (metres)
   data/robot0_eef_quat              (N, 4)          float32  — EE quaternion [qx,qy,qz,qw]
-  data/robot0_gripper_qpos          (N, 2)          float32  — left gripper (duplicated to match shape [2])
+  data/robot0_left_joint            (N, 8)          float32  — 7 left arm joint angles (rad) + 1 left gripper
   data/action                       (N, 10)         float32  — [pos(3) + rot6d(6) + gripper(1)]
   meta/episode_ends                 (E,)            int64    — cumulative frame boundaries
 
@@ -32,6 +32,7 @@ IMG_SIZE      = 84
 CHUNK_T       = 100
 COMPRESSOR    = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
 SMOOTH_SIGMA  = 1.7   # Gaussian sigma in frames; set to 0 to disable smoothing
+FROZEN_JOINT_EPS = 1e-3  # rad; per-episode joint range below this ⇒ frozen arm_joint_states
 
 
 # ─── Rotation conversion ─────────────────────────────────────────────────────
@@ -112,7 +113,7 @@ def init_zarr(out_path: pathlib.Path) -> tuple[zarr.Group, dict]:
         'robot0_eye_in_hand_image': arr('robot0_eye_in_hand_image', IMG_SIZE, IMG_SIZE, 3, dtype='u1'),
         'robot0_eef_pos':           arr('robot0_eef_pos',           3),
         'robot0_eef_quat':          arr('robot0_eef_quat',          4),
-        'robot0_gripper_qpos':      arr('robot0_gripper_qpos',      2),
+        'robot0_left_joint':        arr('robot0_left_joint',        8),
         'action':                   arr('action',                   10),
     }
     return store, arrays
@@ -161,9 +162,20 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         hand_frames = hand_frames[:n]
 
         # ── Left arm state ───────────────────────────────────────────────────
-        left_pos  = states['left_pos'][:n]    # (N, 3)
-        left_quat = states['left_quat'][:n]   # (N, 4)  [qx,qy,qz,qw]
-        gripper   = states['gripper'][:n, :1] # (N, 1)  left gripper value
+        left_pos   = states['left_pos'][:n]        # (N, 3)
+        left_quat  = states['left_quat'][:n]       # (N, 4)  [qx,qy,qz,qw]
+        gripper    = states['gripper'][:n, :1]     # (N, 1)  left gripper value
+        left_joint = states['arm_joints'][:n, :7]  # (N, 7)  left arm joint angles (rad)
+
+        # Guard: arm_joint_states() freezes (stale, constant) unless a Slam()
+        # instance was alive in the collection process. A frozen episode yields a
+        # near-constant robot0_left_joint, which is useless as an observation.
+        if n > 1:
+            joint_span = float(np.ptp(left_joint, axis=0).max())
+            if joint_span < FROZEN_JOINT_EPS:
+                print(f"  WARNING — arm_joints look FROZEN "
+                      f"(max range {joint_span:.2e} rad < {FROZEN_JOINT_EPS:.0e}); "
+                      f"was Slam() running during collection?")
 
         # ── Action = [pos(3) + rot6d(6) + gripper(1)] ───────────────────────
         # Observations stay raw (must match camera ground truth).
@@ -178,15 +190,15 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         smooth_pos_all.append(pos_smooth)
         smooth_quat_all.append(quat_smooth)
 
-        # gripper_qpos duplicated to satisfy config shape [2]
-        gripper_qpos = np.repeat(gripper, 2, axis=1)                # (N, 2)
+        # left_joint = 7 arm joint angles + 1 gripper, to satisfy config shape [8]
+        robot0_left_joint = np.concatenate([left_joint, gripper], axis=1)  # (N, 8)
 
         # ── Append ───────────────────────────────────────────────────────────
         append_to(arrays['agentview_image'],          head_frames)
         append_to(arrays['robot0_eye_in_hand_image'], hand_frames)
         append_to(arrays['robot0_eef_pos'],           left_pos)
         append_to(arrays['robot0_eef_quat'],          left_quat)
-        append_to(arrays['robot0_gripper_qpos'],      gripper_qpos)
+        append_to(arrays['robot0_left_joint'],        robot0_left_joint)
         append_to(arrays['action'],                   action)
 
         total += n
