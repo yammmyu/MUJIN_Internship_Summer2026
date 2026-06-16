@@ -500,8 +500,9 @@ class HumanoidEnv:
                 self._update_latest_poses(status)
                 arm14 = self._read_arm14()              # refresh last-good arm read (C4)
                 # robot0_left_joint obs: 7 LEFT-arm joint angles (rad) + RAW gripper (matches the
-                # training zarr layout). None if the arm was never readable.
-                joint_state = (list(arm14[:7]) + [grip]) if arm14 is not None else None
+                # training zarr layout). grip is array-like (cf. _left_ee_from's grip[0]); take the
+                # scalar and .tolist() so the row is pure Python floats (JSON-safe, homogeneous).
+                joint_state = (arm14[:7].tolist() + [float(grip[0])]) if arm14 is not None else None
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
                 status = grip = ee_state = joint_state = None
