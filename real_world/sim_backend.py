@@ -333,8 +333,20 @@ class SimEnv:
                 return [], False, f"action {k}: {why}"
             q7 = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
             for sub in self._subdivide(seed, q7, max_joint_step):
-                self._apply_arm(sub, grip)
-                self._settle(sub, fast=fast)
+                if fast:
+                    # Collision-only fast path: KINEMATIC TELEPORT, no physics settle. The preview is
+                    # gravity-free position-hold, so resetJointState to `sub` IS the achieved pose,
+                    # and getClosestPoints (below) is a geometric query computed from the current
+                    # config — it needs no stepSimulation. This drops the per-substep settle loop
+                    # (up to settle_max_steps steps), which was the dominant validation cost.
+                    self.reset_arm(sub)
+                    if self.grip_idx:
+                        g = _grip_to_finger_angle(grip)
+                        for gk in self.grip_idx:
+                            p.resetJointState(self.body, gk, g)
+                else:
+                    self._apply_arm(sub, grip)         # position control + physics settle (GUI watch)
+                    self._settle(sub)
                 new = self._new_left_pairs()
                 if new:
                     if learn:

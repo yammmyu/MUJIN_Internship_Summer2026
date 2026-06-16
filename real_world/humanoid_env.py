@@ -47,7 +47,7 @@ RECORD_HZ = 30
 # Max per-tick change of any single arm joint on the hardware path (rad). The
 # validation pass subdivides to respect this and the release loop clamps to it,
 # so a step-change target becomes a bounded ramp instead of a snap. (C5)
-MAX_JOINT_STEP = 0.005  #0.02         # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
+MAX_JOINT_STEP = 0.007 #0.02         # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
 # Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
 QUAT_ALPHA = 0.5
 # Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
@@ -57,7 +57,7 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
-STEP_TIME = 1/30 #each sub step will be executed over 0.05 seconds
+STEP_TIME = 1/120 #each sub step will be executed over 0.05 seconds
 
 # Gripper is BINARY open/close. The policy emits a noisy raw [0,~85] gripper signal (transient
 # spikes exist), so at inference we binarize it to {0,1} (see InferenceController): only a
@@ -986,7 +986,7 @@ class HumanoidEnv:
               f"+{len(ramp)} ramp -> queue {qlen}")
 
     def _auto_splice_nearest(self, traj, obs_ts=None,
-                             match_win=8, blend_win=8, search_radius=15):
+                             match_win=16, blend_win=10, search_radius=30):
         """Alternative to the time-based _auto_splice: align the new chunk to the in-flight queue by
         WINDOWED SHAPE-MATCHING, then CROSSFADE old->new (instead of a hard ramp).
 
