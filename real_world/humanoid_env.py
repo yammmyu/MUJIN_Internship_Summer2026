@@ -943,66 +943,109 @@ class HumanoidEnv:
 
     def _auto_splice(self, traj, obs_ts):
         """Integrate a freshly validated trajectory into the live _robot_q so consecutive inferences
-        join smoothly. `traj` = sim-achieved [(q7, grip), ...] spaced at STEP_TIME, starting from the
-        pose observed at `obs_ts`. The substep of `traj` that corresponds to "now" is
-        f = round((now - obs_ts) / STEP_TIME) — derived from MEASURED elapsed time, so the splice
-        auto-adapts to any inference gap. We keep the committed next substep, _ramp from it to
-        traj[f] (bounded <= MAX_JOINT_STEP, so no joint jump), then follow with traj[f+1:],
-        replacing everything else in the queue. When idle/first inference we ramp from the real pose
-        to traj[0] instead (the whole trajectory plays)."""
+        join smoothly. `traj` = sim-achieved [(q7, grip), ...], one element per executed substep
+        (drained at one substep / STEP_TIME), starting from the pose observed at `obs_ts`. The
+        substep that corresponds to "now" is f = round((now - obs_ts)/STEP_TIME) — MEASURED elapsed
+        time, so it auto-adapts to the inference gap.
+
+        RUNWAY: we keep a runway of `keep_n ≈ f` committed substeps (one inference-latency's worth)
+        rather than just 2, so a STALE chunk only rewrites the FUTURE tail, not motion the arm is
+        already committed to. We then splice the new chunk at the TIME-ALIGNED index g = f + keep_n
+        — the substep whose wall-clock matches the END of the runway — and _ramp (bounded <=
+        MAX_JOINT_STEP) from the runway's last point to traj[g], then follow traj[g+1:]. Keeping only
+        2 substeps + splicing at traj[f] was the back-and-forth bug: keep[-1] and traj[f] are the
+        SAME instant but from different (old vs new) plans, so the bridge could run backward. With
+        the shift, keep[-1] and traj[g] refer to the same FUTURE instant -> forward, short bridge,
+        and the chunk is joined where it is still fresh (needs horizon_substeps > ~2f; otherwise g
+        saturates at the end -> clean lurch, no oscillation). When idle/first inference we ramp from
+        the real pose to traj[0] (the whole trajectory plays)."""
         print(f"world time: {time.time()} | obs time: {obs_ts} | time elapsed:{time.time() - obs_ts}")
         f = max(0, min(int(round((time.time() - obs_ts) / STEP_TIME)), len(traj) - 1))
         arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
         start = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)
+        keep_n, g = 0, f                                  # for logging; set in the merge branch
         with self._lock:
             if not self._robot_q:                         # idle / first inference -> fresh ramp-in
                 ramp = self._ramp(start, traj[0][0], MAX_JOINT_STEP, traj[0][1])
                 new_q = ramp + list(traj[1:])             # ramp's last point IS traj[0]
             else:
-                # Keep the next up-to-two committed substeps (deque has no slicing) as runway, then
-                # bridge from the LAST kept substep to traj[f]. keep[-1] is robust when only one is left.
-                keep = [self._robot_q[i] for i in range(min(2, len(self._robot_q)))]
-                target = traj[f]
-                ramp = self._ramp(keep[-1][0], target[0], MAX_JOINT_STEP, target[1])  # bridge -> f
-                new_q = keep + ramp + list(traj[f + 1:])   # ramp ends at traj[f]; replace the rest
+                # Keep ~f substeps of committed runway (capped by what's queued), then bridge from
+                # the runway's last point to the TIME-ALIGNED substep g = f + keep_n and replace the
+                # tail. keep[-1] is robust when fewer than keep_n remain.
+                keep_n = max(1, min(f, len(self._robot_q)))
+                keep = [self._robot_q[i] for i in range(keep_n)]
+                g = min(f + keep_n, len(traj) - 1)
+                ramp = self._ramp(keep[-1][0], traj[g][0], MAX_JOINT_STEP, traj[g][1])  # bridge -> g
+                new_q = keep + ramp + list(traj[g + 1:])   # ramp ends at traj[g]; replace the tail
             self._robot_q.clear()
             self._robot_q.extend(self._subdivide_points(new_q))
             qlen = len(self._robot_q)
             # Advance the IK warm-start seed to the end of this trajectory for continuity.
             self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
-        print(f"[HumanoidEnv] auto-splice: f={f}/{len(traj)-1}, +{len(ramp)} ramp -> queue {qlen}")
+        print(f"[HumanoidEnv] auto-splice: f={f}/{len(traj)-1}, keep={keep_n}, g={g}, "
+              f"+{len(ramp)} ramp -> queue {qlen}")
 
-    def _auto_splice_nearest(self, traj, obs_ts=None):
-        """Same intent as _auto_splice, but pick the "now" substep f by MATCHING JOINT STATE
-        instead of elapsed wall-clock. traj = sim-achieved [(q7, grip), ...] of ABSOLUTE left-arm
-        joint angles (rad). We read the live left-arm joints and choose f = the traj row whose
-        joints are closest to the current pose under L1 (sum-of-abs-difference) — the cheapest
-        nearest-neighbour we can run (vectorised over the whole chunk, no sqrt, no Python loop).
-        obs_ts is accepted for signature-compat but unused here. The ramp is kept for safety even
-        though matched f should already sit near the live pose."""
-        arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
+    def _auto_splice_nearest(self, traj, obs_ts=None,
+                             match_win=8, blend_win=8, search_radius=15):
+        """Alternative to the time-based _auto_splice: align the new chunk to the in-flight queue by
+        WINDOWED SHAPE-MATCHING, then CROSSFADE old->new (instead of a hard ramp).
+
+        Why windowed: matching a SINGLE pose is ambiguous — many substeps share a joint config, so
+        argmin can latch onto the wrong one (the back-and-forth). Instead we slide a window of the
+        committed queue's front against the new traj and pick the offset d minimizing windowed L1
+        over the curve's SHAPE:  cost(d) = Σ_{i<W} |old_q[i] - new_q[d+i]|₁.
+        Why bounded: when obs_ts is known we restrict d to [f-R, f+R] around the time estimate
+        f=round((now-obs_ts)/STEP_TIME) — time gets the neighbourhood, shape locks on, so a
+        featureless (slow/straight) stretch can't mis-match far away.
+        Merge: crossfade old->new over blend_win substeps (αᵢ: 0->1), then follow traj[d+B:].
+        CAVEAT: the blended segment interpolates two validated paths but is not itself collision-
+        checked (same as the ramp it replaces); _subdivide_points still bounds each step to
+        MAX_JOINT_STEP. Idle/first inference -> plain ramp-in from the real pose."""
+        arm14 = self._read_arm14()                        # DDS I/O, outside the lock
         live = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)
-        # (N,7) matrix of the trajectory's absolute joint angles -> L1 distance to live -> argmin.
-        traj_q = np.array([t[0] for t in traj], dtype=np.float64)        # (N, 7)
-        f = int(np.abs(traj_q - live).sum(axis=1).argmin())             # nearest substep
-        start = live
+        new_q = np.array([t[0] for t in traj], dtype=np.float64)        # (N, 7)
+        N = new_q.shape[0]
         with self._lock:
             if not self._robot_q:                         # idle / first inference -> fresh ramp-in
-                ramp = self._ramp(start, traj[0][0], MAX_JOINT_STEP, traj[0][1])
-                new_q = ramp + list(traj[1:])             # ramp's last point IS traj[0]
+                ramp = self._ramp(live, traj[0][0], MAX_JOINT_STEP, traj[0][1])
+                self._robot_q.extend(self._subdivide_points(ramp + list(traj[1:])))
+                qlen = len(self._robot_q)
+                self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
+                print(f"[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue {qlen}")
+                return
+            # Snapshot the committed queue's joints (front = next to execute = "now").
+            old_q = np.array([self._robot_q[i][0] for i in range(len(self._robot_q))],
+                             dtype=np.float64)             # (M, 7)
+            M = old_q.shape[0]
+            W = max(1, min(match_win, M, N))
+            d_max = N - W                                  # last valid window start (>=0 since W<=N)
+            # Candidate offsets: bound near the time estimate f if obs_ts known, else the whole traj.
+            # Clamp BOTH ends to [0, d_max] so new_q[d:d+W] is always a full window — when latency
+            # >> horizon, f-search_radius can exceed d_max and an unclamped lo crashes the L1 below.
+            if obs_ts is not None:
+                f = int(round((time.time() - obs_ts) / STEP_TIME))
+                lo = max(0, min(f - search_radius, d_max))
+                hi = max(lo, min(d_max, f + search_radius))
             else:
-                # Keep the next up-to-two committed substeps as runway, then bridge from the LAST
-                # kept substep to traj[f]. keep[-1] is robust when only one is left.
-                keep = [self._robot_q[i] for i in range(min(2, len(self._robot_q)))]
-                target = traj[f]
-                ramp = self._ramp(keep[-1][0], target[0], MAX_JOINT_STEP, target[1])  # bridge -> f
-                new_q = keep + ramp + list(traj[f + 1:])   # ramp ends at traj[f]; replace the rest
+                lo, hi = 0, d_max
+            # Windowed L1 over the (small) candidate range -> best shape alignment.
+            best_d, best_cost = lo, np.inf
+            for d in range(lo, hi + 1):
+                cost = np.abs(old_q[:W] - new_q[d:d + W]).sum()
+                if cost < best_cost:
+                    best_cost, best_d = cost, d
+            # Crossfade old -> new over B substeps from the matched point, then follow the new tail.
+            B = max(1, min(blend_win, M, N - best_d))
+            blended = [((1.0 - (i + 1) / B) * old_q[i] + ((i + 1) / B) * new_q[best_d + i],
+                        traj[best_d + i][1])              # new chunk's gripper
+                       for i in range(B)]
+            new_seq = blended + list(traj[best_d + B:])
             self._robot_q.clear()
-            self._robot_q.extend(self._subdivide_points(new_q))
+            self._robot_q.extend(self._subdivide_points(new_seq))
             qlen = len(self._robot_q)
-            # Advance the IK warm-start seed to the end of this trajectory for continuity.
             self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
-        print(f"[HumanoidEnv] auto-splice(nearest): f={f}/{len(traj)-1}, +{len(ramp)} ramp -> queue {qlen}")
+        print(f"[HumanoidEnv] auto-splice(blend): d={best_d}/{N-1}, W={W}, B={B}, "
+              f"cost={best_cost:.3f} -> queue {qlen}")
 
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
