@@ -39,7 +39,7 @@ def make_png(w: int, h: int, rgb=(127, 127, 127)) -> bytes:
     return sig + _png_chunk(b'IHDR', ihdr) + _png_chunk(b'IDAT', idat) + _png_chunk(b'IEND', b'')
 
 
-def b64png(color=(120, 120, 120), w=84, h=84) -> str:
+def b64png(color=(120, 120, 120), w=320, h=240) -> str:
     return base64.b64encode(make_png(w, h, color)).decode('ascii')
 
 

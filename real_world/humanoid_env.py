@@ -938,6 +938,10 @@ class HumanoidEnv:
         traj, ok, reason = self._validate_chunk(action_chunk, seed, fast=True)
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
+        with open("traj.jsonl", "a") as f:
+            f.write(json.dumps({"obs_ts": float(obs_ts),
+                                "traj": [[np.asarray(q7).tolist(), float(grip)]
+                                         for q7, grip in traj]}) + "\n")
         self._auto_splice_nearest(traj, obs_ts)
         return True, ""
 

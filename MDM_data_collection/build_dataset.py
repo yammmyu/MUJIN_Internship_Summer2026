@@ -4,9 +4,9 @@ diffusion_policy/config/task/left_arm_ee_image.yaml.
 
 Left arm only.
 
-Output Zarr schema:
-  data/agentview_image              (N, 84, 84, 3)  uint8    — head camera (RGB)
-  data/robot0_eye_in_hand_image     (N, 84, 84, 3)  uint8    — hand_left camera (RGB)
+Output Zarr schema (H x W = 240 x 320, matching task/left_arm_ee_image_320.yaml):
+  data/agentview_image              (N, 240, 320, 3)  uint8  — head camera (RGB)
+  data/robot0_eye_in_hand_image     (N, 240, 320, 3)  uint8  — hand_left camera (RGB)
   data/robot0_eef_pos               (N, 3)          float32  — EE position (metres)
   data/robot0_eef_quat              (N, 4)          float32  — EE quaternion [qx,qy,qz,qw]
   data/robot0_left_joint            (N, 8)          float32  — 7 left arm joint angles (rad) + 1 left gripper
@@ -28,7 +28,10 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation as R
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-IMG_SIZE      = 84
+# Image dimensions MUST match the train config's shape_meta. left_arm_ee_image_320.yaml
+# uses image_shape [C, H, W] = [3, 240, 320] (the native head/hand_left camera resolution).
+IMG_H         = 240   # rows
+IMG_W         = 320   # cols
 CHUNK_T       = 100
 COMPRESSOR    = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
 SMOOTH_SIGMA  = 1.7   # Gaussian sigma in frames; set to 0 to disable smoothing
@@ -72,10 +75,39 @@ def _sign_fix_and_smooth_quat(quat: np.ndarray, sigma: float) -> np.ndarray:
 
 # ─── Video loading ────────────────────────────────────────────────────────────
 
-def read_video(path: pathlib.Path, size: int = IMG_SIZE) -> np.ndarray:
-    """Returns (N, size, size, 3) uint8 RGB, or empty array if file missing."""
+# The head camera is recorded at its native 1280x800 (16:10); the hand_left camera
+# at 320x240 (4:3 == the target). A plain resize of the head frame to 320x240 would
+# squish it horizontally, so the head frame is CENTER-CROPPED to the target aspect
+# ratio first, then downsized. AGENT_CROP_ZOOM > 1.0 crops tighter (zooms in).
+# IMPORTANT: the inference server (inference_left_server.py) MUST apply the identical
+# crop to the live head frame, or training and deployment observations won't match.
+AGENT_CROP_ZOOM = 1.0   # 1.0 = minimal crop (aspect fix only); >1.0 = tighter centre crop
+
+
+def center_crop_to_aspect(frame: np.ndarray, target_w: int, target_h: int,
+                          zoom: float = 1.0) -> np.ndarray:
+    """Center-crop `frame` to the target aspect ratio (target_w / target_h),
+    optionally zooming in by `zoom` (>1 -> tighter crop). Returns a cropped view."""
+    h, w = frame.shape[:2]
+    target_ar = target_w / target_h
+    if w / h > target_ar:        # source too wide -> limited by height
+        crop_h, crop_w = h, int(round(h * target_ar))
+    else:                        # source too tall -> limited by width
+        crop_w, crop_h = w, int(round(w / target_ar))
+    crop_w = min(w, int(round(crop_w / zoom)))
+    crop_h = min(h, int(round(crop_h / zoom)))
+    x0, y0 = (w - crop_w) // 2, (h - crop_h) // 2
+    return frame[y0:y0 + crop_h, x0:x0 + crop_w]
+
+
+def read_video(path: pathlib.Path, h: int = IMG_H, w: int = IMG_W,
+               center_crop: bool = False, zoom: float = 1.0) -> np.ndarray:
+    """Returns (N, h, w, 3) uint8 RGB, or empty array if file missing.
+
+    center_crop=True center-crops each frame to the (w, h) aspect ratio before
+    downsizing (used for the head camera, whose native aspect != target)."""
     if not path.exists():
-        return np.empty((0, size, size, 3), dtype=np.uint8)
+        return np.empty((0, h, w, 3), dtype=np.uint8)
     cap    = cv2.VideoCapture(str(path))
     frames = []
     while True:
@@ -83,10 +115,13 @@ def read_video(path: pathlib.Path, size: int = IMG_SIZE) -> np.ndarray:
         if not ok:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (size, size))
+        if center_crop:
+            frame = center_crop_to_aspect(frame, w, h, zoom)
+        # INTER_AREA is the right filter for downscaling (matches the inference server)
+        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)  # (width, height)
         frames.append(frame.astype(np.uint8))
     cap.release()
-    return np.stack(frames) if frames else np.empty((0, size, size, 3), dtype=np.uint8)
+    return np.stack(frames) if frames else np.empty((0, h, w, 3), dtype=np.uint8)
 
 
 # ─── Zarr helpers ─────────────────────────────────────────────────────────────
@@ -109,8 +144,8 @@ def init_zarr(out_path: pathlib.Path) -> tuple[zarr.Group, dict]:
         )
 
     arrays = {
-        'agentview_image':          arr('agentview_image',          IMG_SIZE, IMG_SIZE, 3, dtype='u1'),
-        'robot0_eye_in_hand_image': arr('robot0_eye_in_hand_image', IMG_SIZE, IMG_SIZE, 3, dtype='u1'),
+        'agentview_image':          arr('agentview_image',          IMG_H, IMG_W, 3, dtype='u1'),
+        'robot0_eye_in_hand_image': arr('robot0_eye_in_hand_image', IMG_H, IMG_W, 3, dtype='u1'),
         'robot0_eef_pos':           arr('robot0_eef_pos',           3),
         'robot0_eef_quat':          arr('robot0_eef_quat',          4),
         'robot0_left_joint':        arr('robot0_left_joint',        8),
@@ -149,8 +184,11 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         n      = len(states['timestamps'])
 
         # ── Images ──────────────────────────────────────────────────────────
-        head_frames = read_video(ep / 'cameras' / 'head.mp4')      # (N, 84, 84, 3)
-        hand_frames = read_video(ep / 'cameras' / 'hand_left.mp4') # (N, 84, 84, 3)
+        # head: native 1280x800 -> centre-crop to 4:3 then downsize (see read_video).
+        # hand_left: already 320x240, so a plain resize is effectively identity.
+        head_frames = read_video(ep / 'cameras' / 'head.mp4',
+                                 center_crop=True, zoom=AGENT_CROP_ZOOM)  # (N, 240, 320, 3)
+        hand_frames = read_video(ep / 'cameras' / 'hand_left.mp4')        # (N, 240, 320, 3)
 
         # Guard against minor frame-count drift between video and NPZ
         n = min(n, len(head_frames), len(hand_frames))

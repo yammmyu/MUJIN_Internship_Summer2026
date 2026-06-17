@@ -211,6 +211,8 @@ class InferenceController:
             self._te_buffer.append((ts, action.copy()))
             action = self._temporal_ensemble(ts, action)
         print(f"[InferenceController] ensemble finished | Time elapsed; {time.time()- ts}")
+        with open("chunks.jsonl", "a") as f:
+            f.write(json.dumps({"obs_ts": float(ts), "action": action.tolist()}) + "\n")
         # Publish for robot_info_server / visualisation. left_*_predict_* carry
         # EE-pose data here (see robot_info_server.RobotInfo notes):
         #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
