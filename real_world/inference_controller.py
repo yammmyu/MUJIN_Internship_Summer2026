@@ -30,20 +30,27 @@ import numpy as np
 
 from collections import deque
 
-from real_world.humanoid_env import GRIPPER_CLOSE_THRESH, STEP_TIME
+from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 
 RECORD_HZ = 30
 INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (max overlap for TE)
 
 # --- Temporal ensemble (ACT-style) -------------------------------------------------
 # Chunk-level EE-space smoothing: each new chunk is averaged against recent overlapping
-# chunks before validation. A buffered chunk's row j targets wall-clock ts_obs + j*STEP_TIME;
-# for a query time we take its nearest row and weight it exp(-TE_M * age) (age = inferences old,
-# newest = 0). NOTE: this only smooths once chunks actually OVERLAP in time, i.e. when
-# (horizon * STEP_TIME) > inference_period. Below that it safely passes the newest chunk through.
+# chunks before validation. The policy emits action rows at its record/training rate, so row k of
+# a chunk observed at ts_obs targets wall-clock ts_obs + k*ROW_DT. For each row of the newest chunk
+# we find every buffered chunk's row at the SAME wall-clock (j = round((t_k - ts_i)/ROW_DT)) and
+# take a recency-weighted mean (weight exp(-TE_M * age), age = inferences old, newest = 0). This
+# only smooths once chunks actually OVERLAP in time, i.e. when (horizon * ROW_DT) > inference_period;
+# below that it safely passes the newest chunk through (identity).
 USE_TEMPORAL_ENSEMBLE = True
 TE_M = 0.02            # decay; larger -> trust the newest chunk more (less averaging)
 TE_BUFFER_LEN = 8      # how many recent raw chunks to keep for averaging
+# Wall-clock spacing between consecutive policy action rows = the policy's action timestep (the
+# rate it was trained/recorded at). The env subdivides each row into STEP_TIME substeps for
+# execution, but that doesn't change this nominal per-row spacing — the ensemble aligns rows by it.
+# (If the policy's action rate ever differs from RECORD_HZ, change this one constant.)
+ROW_DT = 1.0 / RECORD_HZ
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -251,23 +258,25 @@ class InferenceController:
     def _temporal_ensemble(self, ts_new, new_action):
         """ACT-style chunk-level temporal ensemble, in EE-pose space.
 
-        Returns an (N,10) chunk: for each row k of the newest chunk (target time
-        t_k = ts_new + k*STEP_TIME) we gather, from every buffered RAW chunk, its row nearest to
-        t_k, weight it w = exp(-TE_M * age) (age = how many inferences old, newest = 0), and take
-        the weighted mean. pos (0:3) and rot6d (3:9) average linearly (rot6d is re-orthonormalised
-        downstream by rot6d_to_quat); gripper (9), already {0,1}, averages then re-thresholds at
-        0.5. With no temporal overlap only the newest chunk contributes -> identity (safe no-op).
-        Assumes the caller has appended the new raw chunk to self._te_buffer already."""
+        Returns an (N,10) chunk: for each row k of the newest chunk (target wall-clock
+        t_k = ts_new + k*ROW_DT) we gather, from every buffered RAW chunk, its row nearest to t_k
+        (j = round((t_k - ts_i)/ROW_DT)), weight it w = exp(-TE_M * age) (age = how many inferences
+        old, newest = 0), and take the weighted mean. pos (0:3) and rot6d (3:9) average linearly
+        (rot6d is re-orthonormalised downstream by rot6d_to_quat); gripper (9), already {0,1},
+        averages then re-thresholds at 0.5. With no temporal overlap only the newest chunk
+        contributes -> identity (safe no-op). Assumes the new raw chunk is already in self._te_buffer.
+
+        ROW_DT (not STEP_TIME) is the unit: the buffer holds RAW chunks whose rows are one policy
+        action timestep apart, BEFORE the env subdivides them into STEP_TIME substeps."""
         N = new_action.shape[0]
         out = new_action.copy()
         buf = list(self._te_buffer)                 # oldest -> newest
         newest_idx = len(buf) - 1
-        print(f"Current TE buffer list{newest_idx}")
         for k in range(N):
-            t_k = ts_new + k * STEP_TIME * 8 #5 is magic number to take into account Subdivided step, real time = num of subdivided steps * STEP_TIME
+            t_k = ts_new + k * ROW_DT
             rows, weights = [], []
             for idx, (ts_i, act_i) in enumerate(buf):
-                j = int(round((t_k - ts_i) / STEP_TIME))
+                j = int(round((t_k - ts_i) / ROW_DT))
                 if 0 <= j < act_i.shape[0]:
                     age = newest_idx - idx              # newest chunk -> 0
                     rows.append(act_i[j])
