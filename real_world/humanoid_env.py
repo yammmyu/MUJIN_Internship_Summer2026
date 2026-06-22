@@ -15,6 +15,50 @@ The caller owns only the inference thread:
 
 Data-collection / streaming logic is copied from
 MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
+
+
+Init glog with processor name:python3.10, pid:555728
+pybullet build time: Jan 29 2025 23:16:28
+[startup] running safety pre-flight (scripts/test_safety_invariants.py)…
+b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
+[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
+[HumanoidEnv] sim-validated 306 points (id 1); 306 substep(s) staged for release.
+[HumanoidEnv] released 306 validated pts (+1 ramp-in) to robot.
+[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
+[HumanoidEnv] sim-validated 217 points (id 2); 523 substep(s) staged for release.
+[HumanoidEnv] released 217 validated pts (+129 ramp-in) to robot.
+[HumanoidEnv] E-STOP: latched; dropped 919 pending/staged cmds; holding pose.
+[HumanoidEnv] release refused: E-stop latched (press 复位 to reset).
+[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).
+[safety] ALL INVARIANTS PASS (C1 C2 C3 C4 C5 H1)
+[startup] safety pre-flight passed.
+
+Traceback (most recent call last):
+  File "/home/mujin/workspaces/humanoid/robot_control_gui.py", line 467, in <module>
+    main()
+  File "/home/mujin/workspaces/humanoid/robot_control_gui.py", line 446, in main
+    app = RobotControlGUI(root, camera_mode)  # 样式由 _setup_styles 统一配置
+  File "/home/mujin/workspaces/humanoid/robot_control_gui.py", line 140, in __init__
+    self.collect_robot_controller = RobotController()
+  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/a2d_sdk/robot.py", line 103, in __init__
+    self._motion_controller = MotionController()
+  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/a2d_sdk/core/motion_control/motion_control.py", line 64, in __init__
+    self.node_ = agibotdds.Node("A2DMotionControl")
+  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 213, in __init__
+    self.node = _AGIBOTDDS.new_PyNode(name)
+SystemError: <built-in function new_PyNode> returned NULL without setting an exception
+Exception ignored in: <function Node.__del__ at 0x73205a1f57e0>
+Traceback (most recent call last):
+  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
+    for publisher in self.list_publisher:
+AttributeError: 'Node' object has no attribute 'list_publisher'
+
 """
 
 import copy
