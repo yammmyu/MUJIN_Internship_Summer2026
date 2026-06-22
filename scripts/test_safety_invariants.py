@@ -73,12 +73,7 @@ class _FakeCtl:
         self.right_touched = False   # set if any action ever addresses the right arm (C4)
 
     def get_motion_status(self):
-        # Include 'frames' so the collect loop's _left_ee_from() works when run_collect=True
-        # (the release path's firmware-safety flag is cached from this read; see _firmware_unsafe).
-        pose = {'position': {'x': 0.0, 'y': 0.0, 'z': 0.0},
-                'orientation': {'quaternion': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0}}}
-        return {'error': {'has_error': False}, 'collisions': [],
-                'frames': {'arm_left_link7': pose, 'arm_right_link7': pose}}
+        return {'error': {'has_error': False}, 'collisions': []}
 
     def trajectory_tracking_control(self, infer_timestamp, robot_states, robot_actions,
                                     robot_link="base_link", trajectory_reference_time=1.0):
@@ -105,11 +100,7 @@ def run(verbose=True):
     robot = env.robot
     ctl = env.robot_controller          # records the commanded waypoints (trajectory_tracking_control)
     actions = _synthetic_actions(env, seed)
-    # Run collect AND exec: the release path's _firmware_unsafe() reads the firmware-safety flag
-    # the collect loop caches (30Hz), so release without collect would fail-closed (E-stop). This
-    # mirrors production, where start() always runs both.
-    env.start(run_collect=True, run_exec=True)
-    time.sleep(0.1)            # let the first collect tick populate the firmware-status cache
+    env.start(run_collect=False, run_exec=True)
     try:
         # C1 — no sim => nothing releasable
         e0 = HumanoidEnv(robot=_FakeRobot(), robot_controller=_FakeCtl(), sim=None,

@@ -15,438 +15,6 @@ The caller owns only the inference thread:
 
 Data-collection / streaming logic is copied from
 MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
-
-
-ee_state from getter: [0.4333822157271961, 0.22934912563618465, 0.804053114109098, 0.02997476662617518, 0.7164543278460258, -0.693627794729823, -0.06837537462164134, 0.0]
-ee_state from getter: [0.4333980332970959, 0.22934921631053573, 0.804034940512214, 0.029915550679544888, 0.7164605546221514, -0.6936249118579754, -0.06836530661144126, 0.0]
-ee_state from getter: [0.43339068226141175, 0.2293468316711725, 0.8040361428977638, 0.029922067022455794, 0.7164587675762865, -0.6936247199854394, -0.06838312725588652, 0.0]
-startThreads creating 1 threads.
-starting thread 0
-started thread 0 
-argc=2
-argv[0] = --unused
-argv[1] = --start_demo_name=Physics Server
-ExampleBrowserThreadFunc started
-X11 functions dynamically loaded using dlopen/dlsym OK!
-X11 functions dynamically loaded using dlopen/dlsym OK!
-Creating context
-Created GL 3.3 context
-Direct GLX rendering context obtained
-Making context current
-GL_VENDOR=Intel
-GL_RENDERER=Mesa Intel(R) UHD Graphics (CML GT2)
-GL_VERSION=4.6 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4
-GL_SHADING_LANGUAGE_VERSION=4.60
-pthread_getconcurrency()=0
-Version = 4.6 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4
-Vendor = Intel
-Renderer = Mesa Intel(R) UHD Graphics (CML GT2)
-b3Printf: Selected demo: Physics Server
-startThreads creating 1 threads.
-starting thread 0
-started thread 0 
-MotionThreadFunc thread started
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-
-b3Printf: No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frame
-b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-
-b3Printf: link-arm
-b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-
-b3Printf: No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frame
-b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-
-b3Printf: gripper_center
-b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-
-b3Printf: No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frame
-b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-
-b3Printf: right_gripper_center
-ven = Intel
-Workaround for some crash in the Intel OpenGL driver on Linux/Ubuntu
-ven = Intel
-Workaround for some crash in the Intel OpenGL driver on Linux/Ubuntu
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[MP] connection error: [Errno 111] Connection refused; retry in 10.0s
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] Starting auto_inference (-> robot) thread...
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] activated camera: head
-processing request for camera hand_left
-[HumanoidEnv] activated camera: hand_left
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-[HumanoidEnv] camera subscribed (ON): head
-[HumanoidEnv] camera subscribed (ON): hand_left
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[HumanoidEnv] Wait for Camera
-[InferenceController] inference pipeline starting
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.045902252197265625
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.1172182559967041
-inference request sent
-POST http://10.12.11.144:9001/predict (607100 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (4832 bytes) in 0.251s
-[InferenceController] response recieved! | Time elapsed; 0.37462949752807617
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.3855869770050049
-Current TE buffer list0
-[InferenceController] ensemble finished | Time elapsed; 0.3891456127166748
-[InferenceController] sending chunk for validation | Time elapsed; 0.3925490379333496
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue 32
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] preping request | Time elapsed; 0.03823089599609375
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.07911491394042969
-inference request sent
-POST http://10.12.11.144:9001/predict (606876 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (4750 bytes) in 0.295s
-[InferenceController] response recieved! | Time elapsed; 0.38118672370910645
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.38313984870910645
-Current TE buffer list1
-[InferenceController] ensemble finished | Time elapsed; 0.3847789764404297
-[InferenceController] sending chunk for validation | Time elapsed; 0.38695788383483887
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): d=6/11, W=6, B=6, cost=1.505 -> queue 14
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.05933737754821777
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.09694981575012207
-inference request sent
-POST http://10.12.11.144:9001/predict (597518 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (4815 bytes) in 0.320s
-[InferenceController] response recieved! | Time elapsed; 0.4258730411529541
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.42792487144470215
-Current TE buffer list2
-[InferenceController] ensemble finished | Time elapsed; 0.4281795024871826
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] sending chunk for validation | Time elapsed; 0.43386387825012207
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue 30
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.07506299018859863
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.10812878608703613
-inference request sent
-POST http://10.12.11.144:9001/predict (613200 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (5012 bytes) in 0.349s
-[InferenceController] response recieved! | Time elapsed; 0.46350598335266113
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.4660210609436035
-Current TE buffer list3
-[InferenceController] ensemble finished | Time elapsed; 0.4699885845184326
-[InferenceController] sending chunk for validation | Time elapsed; 0.47091126441955566
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue 41
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] preping request | Time elapsed; 0.09506034851074219
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.16188549995422363
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-inference request sent
-POST http://10.12.11.144:9001/predict (601392 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (5086 bytes) in 0.281s
-[InferenceController] response recieved! | Time elapsed; 0.4631648063659668
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.4660000801086426
-Current TE buffer list4
-[InferenceController] ensemble finished | Time elapsed; 0.46614742279052734
-[InferenceController] sending chunk for validation | Time elapsed; 0.46643567085266113
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): d=28/47, W=3, B=3, cost=0.512 -> queue 30
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.06814718246459961
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.12164020538330078
-inference request sent
-POST http://10.12.11.144:9001/predict (598915 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (4930 bytes) in 0.247s
-[InferenceController] response recieved! | Time elapsed; 0.38338661193847656
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.38701367378234863
-Current TE buffer list5
-[InferenceController] ensemble finished | Time elapsed; 0.3911008834838867
-[InferenceController] sending chunk for validation | Time elapsed; 0.39569926261901855
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): d=38/40, W=3, B=3, cost=1.110 -> queue 16
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.056714534759521484
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.13239240646362305
-inference request sent
-POST http://10.12.11.144:9001/predict (604184 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (5060 bytes) in 0.255s
-[InferenceController] response recieved! | Time elapsed; 0.39995265007019043
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.4014582633972168
-Current TE buffer list6
-[InferenceController] ensemble finished | Time elapsed; 0.40159130096435547
-[InferenceController] sending chunk for validation | Time elapsed; 0.40407228469848633
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue 34
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.0894317626953125
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] sending request | Time elapsed; 0.13836669921875
-inference request sent
-POST http://10.12.11.144:9001/predict (625201 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (4984 bytes) in 0.317s
-[InferenceController] response recieved! | Time elapsed; 0.47704005241394043
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.4787590503692627
-Current TE buffer list7
-[InferenceController] ensemble finished | Time elapsed; 0.4917032718658447
-[InferenceController] sending chunk for validation | Time elapsed; 0.4985659122467041
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue 20
-[HumanoidEnv] requesting hand and head camera
-processing request for camera head
-[HumanoidEnv] camera: head is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-processing request for camera hand_left
-[HumanoidEnv] camera: hand_left is already active
-current active cameras: <bound method HumanoidEnv.active_cameras of <real_world.humanoid_env.HumanoidEnv object at 0x7f33646daef0>>
-[InferenceController] inference pipeline starting
-[InferenceController] preping request | Time elapsed; 0.0943138599395752
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-input ee_state[[0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0], [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]]
-[InferenceController] Stopping auto_inference thread...
-[InferenceController] sending request | Time elapsed; 0.15552186965942383
-inference request sent
-POST http://10.12.11.144:9001/predict (616050 bytes, timeout=10s)
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-response: HTTP 200 (4945 bytes) in 0.342s
-[InferenceController] response recieved! | Time elapsed; 0.510746955871582
-ee_state from getter: [0.43338619666319117, 0.229348119740793, 0.8040426831510528, 0.02995197286250414, 0.7164578722851391, -0.6936251048009514, -0.06837551134847814, 0.0]
-[InferenceController] sending for temporal ensemble! | Time elapsed; 0.5143332481384277
-Current TE buffer list7
-
 """
 
 import copy
@@ -488,11 +56,6 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # A live observation older than this (no real change in EE pose / camera) is "stale": the
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
-# The release path reads the firmware-safety flag the collect loop caches (one shared 30Hz
-# get_motion_status read) instead of polling get_motion_status itself. A cached flag older than
-# this means the collect loop hung/stopped -> we've lost firmware visibility, so _firmware_unsafe
-# treats the robot as unsafe rather than command blind. Generous vs the ~33ms collect cadence.
-FIRMWARE_STATUS_STALE = 0.2     # seconds
 
 STEP_TIME = 1/90 #each sub step will be executed over 0.05 seconds
 
@@ -659,12 +222,6 @@ class HumanoidEnv:
         self._last_ee_sig = None
         self._last_cam_sig = {}
         self._firmware_has_error = False
-        # Release-path safety, cached from the collect loop's single get_motion_status() read so
-        # _firmware_unsafe() doesn't poll it again (the 2nd 120Hz caller that froze the EE).
-        # _firmware_unsafe_flag = error OR collision OR unreadable; _firmware_status_mono = when it
-        # was last refreshed (staleness guard so a hung collect loop trips E-stop).
-        self._firmware_unsafe_flag = False
-        self._firmware_status_mono = 0.0
 
         # Names a consumer is allowed to request (validation only — not subscribed).
         self.cameras = list(allowed_cameras)
@@ -680,14 +237,6 @@ class HumanoidEnv:
 
         # ---- shared state (replaces robot_info.lock + scattered GUI buffers) ----
         self._lock = threading.Lock()
-        # Serializes the two MotionController SDK callers: the collect loop's get_motion_status()
-        # (30Hz) and the release loop's trajectory_tracking_control() (120Hz). They share one
-        # non-thread-safe MotionController node; overlapping them froze the EE read during auto.
-        # (Data collection never hit this: one in-process get_motion_status caller; VR teleop ran in
-        # a separate process / separate controller.) _firmware_unsafe() no longer adds a third call
-        # — it reuses the collect loop's cached status. This lock keeps the two non-overlapping so
-        # the EE read stays live during auto.
-        self._mc_lock = threading.Lock()
         # Per-camera on/off switch: a camera is SUBSCRIBED (live CosineCamera object
         # in self._cams -> costs bandwidth) only while ACTIVE. It goes active when a
         # consumer request()s it, and is evicted (object closed) after idle_timeout.
@@ -744,7 +293,8 @@ class HumanoidEnv:
                 self._active.add(name)
             else:
                 print(f"[HumanoidEnv] camera: {name} is already active")
-                print(f"current active cameras: {self.active_cameras}")
+                # Inline read (we already hold self._lock; active_cameras() re-locks -> deadlock).
+                print(f"current active cameras: {sorted(self._cams.keys())}")
 
 
     def get_frame(self, name):
@@ -923,18 +473,20 @@ class HumanoidEnv:
             # Open/close CosineCamera objects to match desired (controls bandwidth).
             self._reconcile_cameras(desired)
 
-            # One get_motion_status + one gripper read per tick; both the
-            # inference EE state and the recording rows are derived from them.
+            # get_motion_status (firmware error flag + recording) + gripper + arm joints per tick.
             try:
-                with self._mc_lock:
-                    status = self.robot_controller.get_motion_status()
+                status = self.robot_controller.get_motion_status()
                 grip = self.robot.gripper_states()[0]
-                ee_state = self._left_ee_from(status, grip)
-                print(f"ee_state from getter: {ee_state}")
                 arm14 = self._read_arm14()              # refresh last-good arm read (C4)
+                # obs EE is FK on the LIVE joints, NOT status['frames']['arm_left_link7']: the
+                # firmware parks its EE/FK estimator while an ABS_JOINT trajectory executes
+                # (auto-inference), freezing that frame even though arm_joint_states() stays live.
+                # FK keeps the EE tracking the arm and matches the training EE frame (see _left_ee_fk).
                 # robot0_left_joint obs: 7 LEFT-arm joint angles (rad) + RAW gripper (matches the
-                # training zarr layout). grip is array-like (cf. _left_ee_from's grip[0]); take the
-                # scalar and .tolist() so the row is pure Python floats (JSON-safe, homogeneous).
+                # training zarr layout). grip is array-like; take grip[0] scalar so rows are pure
+                # Python floats (JSON-safe, homogeneous).
+                ee_state = self._left_ee_fk(arm14[:7], float(grip[0])) if arm14 is not None else None
+                print(f"ee_state from getter: {ee_state}")
                 joint_state = (arm14[:7].tolist() + [float(grip[0])]) if arm14 is not None else None
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
@@ -955,19 +507,10 @@ class HumanoidEnv:
                 if sig != self._last_cam_sig.get(n):
                     changed = True
             fw_error = bool(status and status.get('error', {}).get('has_error'))
-            # Release-path safety flag, cached from THIS single get_motion_status() read so the
-            # release loop's _firmware_unsafe() reuses it instead of polling get_motion_status()
-            # again at 120Hz (the 2nd caller that raced this read and froze the EE — see _mc_lock).
-            # Unsafe = firmware error OR active collision OR no readable status this tick.
-            fw_unsafe = (status is None
-                         or bool(status.get('error', {}).get('has_error'))
-                         or bool(status.get('collisions')))
 
             with self._lock:
                 self._obs_timestamp = now
                 self._firmware_has_error = fw_error
-                self._firmware_unsafe_flag = fw_unsafe
-                self._firmware_status_mono = now_mono
                 if ee_sig is not None:
                     self._last_ee_sig = ee_sig
                 self._last_cam_sig.update(cam_sigs)
@@ -1011,17 +554,19 @@ class HumanoidEnv:
             quat['x'], quat['y'], quat['z'], quat['w'],
         )
 
-    def _left_ee_from(self, status, grip):
-        """Left EE pose + gripper -> [pos(3), quat xyzw(4), grip(1)] for inference.
+    def _left_ee_fk(self, arm7, grip):
+        """Left EE [pos(3), quat xyzw(4), grip(1)] via pinocchio FK on the LIVE arm joints.
 
-        Derived from an already-fetched get_motion_status() result and gripper
-        reading so the collect loop does only one SDK read of each per tick.
-        """
-        pose = self._extract_pose(status['frames']['arm_left_link7'])
-        return [
-            *pose,
-            1.0 if grip[0] > 0.5 else 0.0,
-        ]
+        The obs EE comes from FK, NOT status['frames']['arm_left_link7']: the firmware parks its
+        EE/FK estimator while an ABS_JOINT trajectory executes (auto-inference), so that frame
+        FREEZES even though arm_joint_states() stays live. FK from the live joints keeps the EE
+        tracking the arm and matches the training EE frame (~3mm vs firmware FK, calibrated via
+        fk_calibration.json — recordings were collected under EE-space teleop while the firmware
+        FK was live). `grip` is the scalar gripper reading, binarized as in the recordings."""
+        pos, quat = self.solver.m.fk(np.asarray(arm7, dtype=np.float64))
+        return [float(pos[0]), float(pos[1]), float(pos[2]),
+                float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]),
+                grip]
 
     @staticmethod
     def _frame_sig(frame):
@@ -1033,22 +578,23 @@ class HumanoidEnv:
         return a[::64, ::64].tobytes() if a.ndim >= 2 else a.tobytes()
 
     def _firmware_unsafe(self):
-        """Defense-in-depth: True if the firmware reports an error or active collision, or its
-        status has gone stale/unreadable. Triggers E-stop on the release path for hazards the
-        (self-collision-only) sim can't see (e.g. hitting the table).
-
-        Reads the flag the collect loop caches from its single 30Hz get_motion_status() read —
-        NOT a second get_motion_status() call. Polling it again here (120Hz) was the second caller
-        that raced the collect read on the shared MotionController and froze the EE (see _mc_lock).
-        A stale cache (collect loop hung/stopped) -> unsafe, so we never command blind to firmware
-        state."""
-        with self._lock:
-            unsafe = self._firmware_unsafe_flag
-            ts = self._firmware_status_mono
-        if ts == 0.0 or (time.monotonic() - ts) > FIRMWARE_STATUS_STALE:
-            print("[HumanoidEnv] firmware status stale/unavailable -> treating as unsafe.")
+        """Defense-in-depth: True if get_motion_status reports an error or active collisions, or
+        can't be read. Polled on the release path so a firmware-detected fault triggers E-stop
+        even for hazards the (self-collision-only) sim can't see (e.g. hitting the table)."""
+        try:
+            st = self.robot_controller.get_motion_status()
+        except Exception as e:
+            print(f"[HumanoidEnv] get_motion_status failed during release: {e}")
             return True
-        return unsafe
+        if not st:
+            return True
+        if st.get('error', {}).get('has_error'):
+            print(f"[HumanoidEnv] firmware error: {st['error'].get('message')}")
+            return True
+        if st.get('collisions'):
+            print(f"[HumanoidEnv] firmware collision(s): {st['collisions']}")
+            return True
+        return False
 
     def _read_frames(self, active):
         """Latest frame per live camera, kept as a rolling [prev, cur] pair.
@@ -1687,13 +1233,9 @@ class HumanoidEnv:
                 grip_cmd = 1 if grip >= 0.5 else 0
                 self.robot.move_gripper([grip_cmd, 0])
             try:
-                # Serialize with the collect loop's get_motion_status() on the shared
-                # MotionController (see _mc_lock); the lock wraps only the SDK call, never the
-                # STEP_TIME pace below.
-                with self._mc_lock:
-                    self.robot_controller.trajectory_tracking_control(
-                        infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
-                        )
+                self.robot_controller.trajectory_tracking_control(
+                    infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
+                    )
             except Exception as e:
                 print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
                 return False

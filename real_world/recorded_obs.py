@@ -23,10 +23,11 @@ class RecordedObsSource:
     """Replays a recording's obs at the inference rate.
 
     get_obs() returns the same dict shape as HumanoidEnv.get_obs():
-        agent_imgs: [head_{t-1}, head_t]   (RGB, to match encode_image)
-        hand_imgs:  [hand_left_{t-1}, hand_left_t]
-        state:      [s_{t-1}, s_t]   each [pos(3), quat xyzw(4), grip(1)]  (8 dims)
-        timestamp:  float (wall clock; always advances so inference doesn't dedup)
+        agent_imgs:  [head_{t-1}, head_t]   (RGB, to match encode_image)
+        hand_imgs:   [hand_left_{t-1}, hand_left_t]
+        state:       [s_{t-1}, s_t]   each [pos(3), quat xyzw(4), grip(1)]  (8 dims)
+        joint_state: [j_{t-1}, j_t]   each [7 left-arm joints (rad), grip]  (8 dims)
+        timestamp:   float (wall clock; always advances so inference doesn't dedup)
     Returns None and sets `done` once the videos are exhausted.
     """
 
@@ -44,6 +45,10 @@ class RecordedObsSource:
         # policy request, matching the live env's SDK-derived floats.
         self.states = [[float(v) for v in (*left_pos[i], *left_quat[i], grip[i])]
                        for i in range(len(left_pos))]
+        # robot0_left_joint obs: [7 LEFT-arm joints (rad), gripper], mirroring the live env's
+        # joint_state (arm14[:7] + grip). Required by InferenceController (obs['joint_state']).
+        self.joint_states = [[float(v) for v in self.arm_joints[i, :7]] + [float(grip[i])]
+                             for i in range(len(left_pos))]
         self.n = len(self.states)
 
         self.agent_cap = cv2.VideoCapture(os.path.join(rec_dir, "cameras", AGENT_VIDEO))
@@ -85,7 +90,8 @@ class RecordedObsSource:
                 return None
             agent, hand = a, h
             idx += 1
-        cur = (agent, hand, self.states[min(idx - 1, self.n - 1)])
+        si = min(idx - 1, self.n - 1)
+        cur = (agent, hand, self.states[si], self.joint_states[si])
         prev = self._cur if self._cur is not None else cur   # first obs: [s0, s0]
         self._cur = cur
         self.cursor = idx
@@ -93,6 +99,7 @@ class RecordedObsSource:
             'agent_imgs': [prev[0], cur[0]],
             'hand_imgs': [prev[1], cur[1]],
             'state': [prev[2], cur[2]],
+            'joint_state': [prev[3], cur[3]],
             'timestamp': time.time(),
         }
 
