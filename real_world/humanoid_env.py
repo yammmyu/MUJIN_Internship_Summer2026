@@ -15,6 +15,59 @@ The caller owns only the inference thread:
 
 Data-collection / streaming logic is copied from
 MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
+
+
+
+Init glog with processor name:python3.10, pid:554953
+pybullet build time: Jan 29 2025 23:16:28
+[startup] running safety pre-flight (scripts/test_safety_invariants.py)…
+b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
+[HumanoidEnv.stop] collect_robot_controller.shutdown: 'RobotController' object has no attribute 'shutdown'
+
+*** SAFETY PRE-FLIGHT FAILED: SystemError: <built-in function new_PyNode> returned NULL without setting an exception
+*** Refusing to launch the control GUI. Fix the regression, or set
+*** HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (NOT recommended).
+
+Exception ignored in: <function Node.__del__ at 0x78d43a3f57e0>
+Traceback (most recent call last):
+  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
+    for publisher in self.list_publisher:
+AttributeError: 'Node' object has no attribute 'list_publisher'
+^X^X^X^Z[5]   Killed                  MP_HOST=10.42.0.104 python robot_control_gui.py
+
+[6]+  Stopped                 MP_HOST=10.42.0.104 python robot_control_gui.py
+(ros2) mujin@PF3784S4:~/workspaces/humanoid$ pgrep -f 'robot_|wheel_|MDM_' | xargs kill -9
+(ros2) mujin@PF3784S4:~/workspaces/humanoid$ MP_HOST=10.42.0.104 python robot_control_gui.py
+Init glog with processor name:python3.10, pid:555162
+pybullet build time: Jan 29 2025 23:16:28
+[startup] running safety pre-flight (scripts/test_safety_invariants.py)…
+b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
+right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
+
+*** SAFETY PRE-FLIGHT FAILED: SystemError: <built-in function new_PyNode> returned NULL without setting an exception
+*** Refusing to launch the control GUI. Fix the regression, or set
+*** HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (NOT recommended).
+
+Exception ignored in: <function Node.__del__ at 0x7b09819f17e0>
+Traceback (most recent call last):
+  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
+    for publisher in self.list_publisher:
+AttributeError: 'Node' object has no attribute 'list_publisher'
+^C
+[6]+  Killed                  MP_HOST=10.42.0.104 python robot_control_gui.py
+(ros2) mujin@PF3784S4:~/workspaces/humanoid$ ^C
+
 """
 
 import copy
@@ -47,7 +100,7 @@ RECORD_HZ = 30
 # Max per-tick change of any single arm joint on the hardware path (rad). The
 # validation pass subdivides to respect this and the release loop clamps to it,
 # so a step-change target becomes a bounded ramp instead of a snap. (C5)
-MAX_JOINT_STEP = 0.007 #0.02         # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
+MAX_JOINT_STEP = 0.005 #0.02         # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
 # Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
 QUAT_ALPHA = 0.5
 # Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
@@ -57,7 +110,7 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
-STEP_TIME = 1/30 #each sub step will be executed over 0.05 seconds
+STEP_TIME = 1/90 #each sub step will be executed over 0.05 seconds
 
 # Gripper is BINARY open/close. The policy emits a noisy raw [0,~85] gripper signal (transient
 # spikes exist), so at inference we binarize it to {0,1} (see InferenceController): only a
@@ -190,7 +243,7 @@ class HumanoidEnv:
         # Enforced structurally, not by discipline:
         #   * SimEnv.validate (on the sim thread) is the ONLY producer of self._last_sim_traj and
         #     self._staged_release; it cannot run without a live sim, so "no sim" => nothing is
-        #     ever releasable.
+        #     ever releasable.self.robot
         #   * Only the release entry points enqueue onto self._robot_q, and only by copying
         #     freshly sim-validated substeps (E-stop-guarded, C5 ramp-in): release_to_robot()
         #     (one-shot, whole trajectory) and release_n_substeps/ release_remaining_substeps
@@ -410,13 +463,6 @@ class HumanoidEnv:
             except Exception as e:
                 print(f"[HumanoidEnv.stop] camera.close({name}): {e}")
         self._cams.clear()
-        # Shut down the dedicated collect-loop controller iff we created our own (not the shared
-        # one). Best-effort: RobotController may expose no shutdown() — swallow either way.
-        if self._collect_robot_controller is not self.robot_controller:
-            try:
-                self._collect_robot_controller.shutdown()
-            except Exception as e:
-                print(f"[HumanoidEnv.stop] collect_robot_controller.shutdown: {e}")
         if self._owns_robot:
             try:
                 self.robot.shutdown()
