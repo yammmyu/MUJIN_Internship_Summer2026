@@ -264,7 +264,7 @@ class InferenceController:
         newest_idx = len(buf) - 1
         print(f"Current TE buffer list{newest_idx}")
         for k in range(N):
-            t_k = ts_new + k * STEP_TIME * 5 #5 is magic number to take into account Subdivided step, real time = num of subdivided steps * STEP_TIME
+            t_k = ts_new + k * STEP_TIME * 8 #5 is magic number to take into account Subdivided step, real time = num of subdivided steps * STEP_TIME
             rows, weights = [], []
             for idx, (ts_i, act_i) in enumerate(buf):
                 j = int(round((t_k - ts_i) / STEP_TIME))
