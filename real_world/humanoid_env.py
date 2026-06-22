@@ -251,12 +251,6 @@ class HumanoidEnv:
         self._last_two_joint_states = None
         self._obs_timestamp = 0.0
 
-        # Latest both-arm EE poses, refreshed every collect tick (for GUI display).
-        self._latest_left_pos = None       # (x, y, z)
-        self._latest_left_quat = None      # (qx, qy, qz, qw)
-        self._latest_right_pos = None
-        self._latest_right_quat = None
-
         # Recording state — guarded by _rec_lock. _rec holds the in-progress
         # recording session (None when not recording). Ported from RobotDataCollector.
         self._rec_lock = threading.Lock()
@@ -280,24 +274,6 @@ class HumanoidEnv:
                 self._frames.get(n) is not None for n in (AGENT_CAMERA, HAND_CAMERA))
             return frames_ready and self._last_two_ee_states is not None
 
-    # Latest both-arm EE poses for the data-collection GUI display. None until the
-    # collect loop has read at least one motion status.
-    @property
-    def latest_left_pos(self):
-        return self._latest_left_pos
-
-    @property
-    def latest_left_quat(self):
-        return self._latest_left_quat
-
-    @property
-    def latest_right_pos(self):
-        return self._latest_right_pos
-
-    @property
-    def latest_right_quat(self):
-        return self._latest_right_quat
-
     # ===================== consumer-facing camera switch =====================
     def request(self, name):
         """Mark a camera as wanted this cycle and switch it ON.
@@ -320,8 +296,8 @@ class HumanoidEnv:
                 print(f"current active cameras: {self.active_cameras}")
 
 
-    def get_frames(self, name):
-        """request(name) + return a copy of the rolling [prev, cur] pair, or None.
+    def get_frame(self, name):
+        """request(name) + return the latest single frame (copy), or None.
 
         Returns None until the collect loop has fetched the camera at least once
         (it was just switched on, or it is still warming up).
@@ -329,12 +305,7 @@ class HumanoidEnv:
         self.request(name)
         with self._lock:
             pair = self._frames.get(name)
-            return copy.deepcopy(pair) if pair else None
-
-    def get_frame(self, name):
-        """request(name) + return the latest single frame (copy), or None."""
-        pair = self.get_frames(name)
-        return pair[-1] if pair else None
+            return copy.deepcopy(pair[-1]) if pair else None
 
     def active_cameras(self):
         """Names currently SUBSCRIBED (a live CosineCamera object exists -> streaming).
@@ -473,6 +444,16 @@ class HumanoidEnv:
     # ===================== producer: collection loop =====================
     # Pacing + SDK reads copied from RobotDataCollector._stream_loop.
     def _collect_loop(self):
+        """Producer: the SINGLE source of SDK reads for the INFERENCE OBSERVATION (+ recording
+        and freshness/staleness). Once per tick it reads cameras, EE, joints and gripper, stamps
+        them with one timestamp, and publishes the latest-wins buffers get_obs() snapshots.
+
+        Scope is deliberately observation-only. The control path (ramp-in / release / splice)
+        does NOT read from these buffers — it takes its own fresh synchronous reads
+        (_read_arm14 etc.) because it needs the arm's pose AT command time, not a value up to one
+        tick (~33ms) old. So concurrent direct SDK reads from those threads are intentional, not
+        a bypass to consolidate here.
+        """
         next_tick = time.monotonic()
         while not self._stop_event.is_set():
             now = time.time()
@@ -497,7 +478,7 @@ class HumanoidEnv:
                 status = self.robot_controller.get_motion_status()
                 grip = self.robot.gripper_states()[0]
                 ee_state = self._left_ee_from(status, grip)
-                self._update_latest_poses(status)
+                print(f"ee_state from getter: {ee_state}")
                 arm14 = self._read_arm14()              # refresh last-good arm read (C4)
                 # robot0_left_joint obs: 7 LEFT-arm joint angles (rad) + RAW gripper (matches the
                 # training zarr layout). grip is array-like (cf. _left_ee_from's grip[0]); take the
@@ -608,16 +589,6 @@ class HumanoidEnv:
             print(f"[HumanoidEnv] firmware collision(s): {st['collisions']}")
             return True
         return False
-
-    def _update_latest_poses(self, status):
-        """Refresh the cached both-arm EE poses shown by the data-collection GUI."""
-        frames = status['frames']
-        left = self._extract_pose(frames['arm_left_link7'])
-        right = self._extract_pose(frames['arm_right_link7'])
-        self._latest_left_pos = left[:3]
-        self._latest_left_quat = left[3:]
-        self._latest_right_pos = right[:3]
-        self._latest_right_quat = right[3:]
 
     def _read_frames(self, active):
         """Latest frame per live camera, kept as a rolling [prev, cur] pair.
