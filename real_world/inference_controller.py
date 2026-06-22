@@ -42,7 +42,7 @@ INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (ma
 # newest = 0). NOTE: this only smooths once chunks actually OVERLAP in time, i.e. when
 # (horizon * STEP_TIME) > inference_period. Below that it safely passes the newest chunk through.
 USE_TEMPORAL_ENSEMBLE = True
-TE_M = 0.01            # decay; larger -> trust the newest chunk more (less averaging)
+TE_M = 0.02            # decay; larger -> trust the newest chunk more (less averaging)
 TE_BUFFER_LEN = 8      # how many recent raw chunks to keep for averaging
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
@@ -181,6 +181,14 @@ class InferenceController:
             'left_joint': obs['joint_state'],
         }
 
+        # Log the proprioception sent to the policy server, keyed by the same obs_ts that
+        # chunks.jsonl/traj.jsonl use, so a request can be joined to its resulting action.
+        # Images (agent_imgs/hand_imgs) are omitted — large base64 JPEGs, not needed here.
+        with open("requests.jsonl", "a") as f:
+            f.write(json.dumps({"obs_ts": float(ts),
+                                "state": req['state'],
+                                "left_joint": req['left_joint']}) + "\n")
+
         print(f"[InferenceController] sending request | Time elapsed; {time.time()- ts}")
         resp = post_predict(self.host, self.port, req, timeout=10)
 
@@ -211,6 +219,7 @@ class InferenceController:
             self._te_buffer.append((ts, action.copy()))
             action = self._temporal_ensemble(ts, action)
         print(f"[InferenceController] ensemble finished | Time elapsed; {time.time()- ts}")
+
         with open("chunks.jsonl", "a") as f:
             f.write(json.dumps({"obs_ts": float(ts), "action": action.tolist()}) + "\n")
         # Publish for robot_info_server / visualisation. left_*_predict_* carry
