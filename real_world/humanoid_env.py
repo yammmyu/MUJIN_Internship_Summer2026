@@ -15,59 +15,6 @@ The caller owns only the inference thread:
 
 Data-collection / streaming logic is copied from
 MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
-
-
-
-Init glog with processor name:python3.10, pid:554953
-pybullet build time: Jan 29 2025 23:16:28
-[startup] running safety pre-flight (scripts/test_safety_invariants.py)…
-b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
-[HumanoidEnv.stop] collect_robot_controller.shutdown: 'RobotController' object has no attribute 'shutdown'
-
-*** SAFETY PRE-FLIGHT FAILED: SystemError: <built-in function new_PyNode> returned NULL without setting an exception
-*** Refusing to launch the control GUI. Fix the regression, or set
-*** HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (NOT recommended).
-
-Exception ignored in: <function Node.__del__ at 0x78d43a3f57e0>
-Traceback (most recent call last):
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
-    for publisher in self.list_publisher:
-AttributeError: 'Node' object has no attribute 'list_publisher'
-^X^X^X^Z[5]   Killed                  MP_HOST=10.42.0.104 python robot_control_gui.py
-
-[6]+  Stopped                 MP_HOST=10.42.0.104 python robot_control_gui.py
-(ros2) mujin@PF3784S4:~/workspaces/humanoid$ pgrep -f 'robot_|wheel_|MDM_' | xargs kill -9
-(ros2) mujin@PF3784S4:~/workspaces/humanoid$ MP_HOST=10.42.0.104 python robot_control_gui.py
-Init glog with processor name:python3.10, pid:555162
-pybullet build time: Jan 29 2025 23:16:28
-[startup] running safety pre-flight (scripts/test_safety_invariants.py)…
-b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
-
-*** SAFETY PRE-FLIGHT FAILED: SystemError: <built-in function new_PyNode> returned NULL without setting an exception
-*** Refusing to launch the control GUI. Fix the regression, or set
-*** HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (NOT recommended).
-
-Exception ignored in: <function Node.__del__ at 0x7b09819f17e0>
-Traceback (most recent call last):
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
-    for publisher in self.list_publisher:
-AttributeError: 'Node' object has no attribute 'list_publisher'
-^C
-[6]+  Killed                  MP_HOST=10.42.0.104 python robot_control_gui.py
-(ros2) mujin@PF3784S4:~/workspaces/humanoid$ ^C
-
 """
 
 import copy
@@ -207,6 +154,7 @@ class HumanoidEnv:
 
     def __init__(self,
                  robot=None, robot_controller=None,
+                 collect_robot_controller=None,
                  cameras=(),
                  allowed_cameras=KNOWN_CAMERAS,
                  frequency=RECORD_HZ,
@@ -226,13 +174,15 @@ class HumanoidEnv:
         self._owns_robot = robot is None
         self.robot = robot if robot is not None else Robot()
         self.robot_controller = robot_controller if robot_controller is not None else RobotController()
-        # Dedicated RobotController for the collect loop's get_motion_status() read. The EE pose
-        # (get_motion_status) and the 120Hz command stream (trajectory_tracking_control) both live
-        # on RobotController; sharing ONE client, a get_motion_status() on the collect thread
-        # freezes once _release_loop streams commands during auto-inference (contention on the
-        # single client). A separate client for the observation read keeps the EE pose live during
-        # auto. Falls back to the shared controller when the SDK can't build one (sim has no SDK).
-        self._collect_robot_controller = (RobotController() if RobotController is not None
+        # Dedicated RobotController for the collect loop's get_motion_status() read, INJECTED by
+        # the caller (the GUI passes a second real RobotController). get_motion_status and the
+        # 120Hz command stream (trajectory_tracking_control) both live on RobotController; sharing
+        # ONE client, the collect-thread read freezes once _release_loop streams commands during
+        # auto-inference (contention on the single client). A separate client keeps the EE pose
+        # live. Falls back to the shared controller when none is injected — tests/sim inject fakes,
+        # so we must NOT force-create a real DDS node here (that breaks the injection contract).
+        self._collect_robot_controller = (collect_robot_controller
+                                           if collect_robot_controller is not None
                                            else self.robot_controller)
         if self._owns_robot:
             time.sleep(1.0)  # let freshly-created DDS resources come up

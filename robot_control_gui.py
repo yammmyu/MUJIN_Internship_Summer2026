@@ -134,6 +134,10 @@ class RobotControlGUI(
         # 初始化机器人（相机由 HumanoidEnv 持有，见下方 self.env）
         self.robot = Robot()
         self.robot_controller = RobotController()
+        # Second RobotController dedicated to the env's collect loop (obs EE read). Sharing one
+        # controller, get_motion_status() freezes once the 120Hz release stream runs during
+        # auto-inference (contention); a separate client keeps the EE pose live. See HumanoidEnv.
+        self.collect_robot_controller = RobotController()
 
         # Disable cameras during data_collection mode
         if camera_mode == "data":
@@ -187,6 +191,7 @@ class RobotControlGUI(
         self.env = HumanoidEnv(
             robot=self.robot,
             robot_controller=self.robot_controller,
+            collect_robot_controller=self.collect_robot_controller,
             cameras=camera_names,
             frequency=RECORD_HZ,
             real=True,
