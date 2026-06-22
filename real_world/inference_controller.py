@@ -214,13 +214,16 @@ class InferenceController:
         # Temporal ensemble: buffer this RAW chunk, then average it with recent overlapping chunks
         # in EE space. The ensembled chunk is what we publish + validate; the raw one stays only in
         # the buffer for future averaging. No-op (returns the newest chunk) until chunks overlap.
+        with open("chunks.jsonl", "a") as f:
+            f.write(json.dumps({"obs_ts": float(ts), "action": action.tolist()}) + "\n")
+
         print(f"[InferenceController] sending for temporal ensemble! | Time elapsed; {time.time()- ts}")
         if self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10:
             self._te_buffer.append((ts, action.copy()))
             action = self._temporal_ensemble(ts, action)
         print(f"[InferenceController] ensemble finished | Time elapsed; {time.time()- ts}")
 
-        with open("chunks.jsonl", "a") as f:
+        with open("TEchunks.jsonl", "a") as f:
             f.write(json.dumps({"obs_ts": float(ts), "action": action.tolist()}) + "\n")
         # Publish for robot_info_server / visualisation. left_*_predict_* carry
         # EE-pose data here (see robot_info_server.RobotInfo notes):

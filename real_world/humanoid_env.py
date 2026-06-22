@@ -57,7 +57,7 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
-STEP_TIME = 1/120 #each sub step will be executed over 0.05 seconds
+STEP_TIME = 1/30 #each sub step will be executed over 0.05 seconds
 
 # Gripper is BINARY open/close. The policy emits a noisy raw [0,~85] gripper signal (transient
 # spikes exist), so at inference we binarize it to {0,1} (see InferenceController): only a
