@@ -15,50 +15,6 @@ The caller owns only the inference thread:
 
 Data-collection / streaming logic is copied from
 MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
-
-
-Init glog with processor name:python3.10, pid:555728
-pybullet build time: Jan 29 2025 23:16:28
-[startup] running safety pre-flight (scripts/test_safety_invariants.py)…
-b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
-[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
-[HumanoidEnv] sim-validated 306 points (id 1); 306 substep(s) staged for release.
-[HumanoidEnv] released 306 validated pts (+1 ramp-in) to robot.
-[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
-[HumanoidEnv] sim-validated 217 points (id 2); 523 substep(s) staged for release.
-[HumanoidEnv] released 217 validated pts (+129 ramp-in) to robot.
-[HumanoidEnv] E-STOP: latched; dropped 919 pending/staged cmds; holding pose.
-[HumanoidEnv] release refused: E-stop latched (press 复位 to reset).
-[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).
-[safety] ALL INVARIANTS PASS (C1 C2 C3 C4 C5 H1)
-[startup] safety pre-flight passed.
-
-Traceback (most recent call last):
-  File "/home/mujin/workspaces/humanoid/robot_control_gui.py", line 467, in <module>
-    main()
-  File "/home/mujin/workspaces/humanoid/robot_control_gui.py", line 446, in main
-    app = RobotControlGUI(root, camera_mode)  # 样式由 _setup_styles 统一配置
-  File "/home/mujin/workspaces/humanoid/robot_control_gui.py", line 140, in __init__
-    self.collect_robot_controller = RobotController()
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/a2d_sdk/robot.py", line 103, in __init__
-    self._motion_controller = MotionController()
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/a2d_sdk/core/motion_control/motion_control.py", line 64, in __init__
-    self.node_ = agibotdds.Node("A2DMotionControl")
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 213, in __init__
-    self.node = _AGIBOTDDS.new_PyNode(name)
-SystemError: <built-in function new_PyNode> returned NULL without setting an exception
-Exception ignored in: <function Node.__del__ at 0x73205a1f57e0>
-Traceback (most recent call last):
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
-    for publisher in self.list_publisher:
-AttributeError: 'Node' object has no attribute 'list_publisher'
-
 """
 
 import copy
@@ -100,6 +56,11 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # A live observation older than this (no real change in EE pose / camera) is "stale": the
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
+# The release path reads the firmware-safety flag the collect loop caches (one shared 30Hz
+# get_motion_status read) instead of polling get_motion_status itself. A cached flag older than
+# this means the collect loop hung/stopped -> we've lost firmware visibility, so _firmware_unsafe
+# treats the robot as unsafe rather than command blind. Generous vs the ~33ms collect cadence.
+FIRMWARE_STATUS_STALE = 0.2     # seconds
 
 STEP_TIME = 1/90 #each sub step will be executed over 0.05 seconds
 
@@ -198,7 +159,6 @@ class HumanoidEnv:
 
     def __init__(self,
                  robot=None, robot_controller=None,
-                 collect_robot_controller=None,
                  cameras=(),
                  allowed_cameras=KNOWN_CAMERAS,
                  frequency=RECORD_HZ,
@@ -218,16 +178,6 @@ class HumanoidEnv:
         self._owns_robot = robot is None
         self.robot = robot if robot is not None else Robot()
         self.robot_controller = robot_controller if robot_controller is not None else RobotController()
-        # Dedicated RobotController for the collect loop's get_motion_status() read, INJECTED by
-        # the caller (the GUI passes a second real RobotController). get_motion_status and the
-        # 120Hz command stream (trajectory_tracking_control) both live on RobotController; sharing
-        # ONE client, the collect-thread read freezes once _release_loop streams commands during
-        # auto-inference (contention on the single client). A separate client keeps the EE pose
-        # live. Falls back to the shared controller when none is injected — tests/sim inject fakes,
-        # so we must NOT force-create a real DDS node here (that breaks the injection contract).
-        self._collect_robot_controller = (collect_robot_controller
-                                           if collect_robot_controller is not None
-                                           else self.robot_controller)
         if self._owns_robot:
             time.sleep(1.0)  # let freshly-created DDS resources come up
 
@@ -277,6 +227,12 @@ class HumanoidEnv:
         self._last_ee_sig = None
         self._last_cam_sig = {}
         self._firmware_has_error = False
+        # Release-path safety, cached from the collect loop's single get_motion_status() read so
+        # _firmware_unsafe() doesn't poll it again (the 2nd 120Hz caller that froze the EE).
+        # _firmware_unsafe_flag = error OR collision OR unreadable; _firmware_status_mono = when it
+        # was last refreshed (staleness guard so a hung collect loop trips E-stop).
+        self._firmware_unsafe_flag = False
+        self._firmware_status_mono = 0.0
 
         # Names a consumer is allowed to request (validation only — not subscribed).
         self.cameras = list(allowed_cameras)
@@ -292,6 +248,14 @@ class HumanoidEnv:
 
         # ---- shared state (replaces robot_info.lock + scattered GUI buffers) ----
         self._lock = threading.Lock()
+        # Serializes the two MotionController SDK callers: the collect loop's get_motion_status()
+        # (30Hz) and the release loop's trajectory_tracking_control() (120Hz). They share one
+        # non-thread-safe MotionController node; overlapping them froze the EE read during auto.
+        # (Data collection never hit this: one in-process get_motion_status caller; VR teleop ran in
+        # a separate process / separate controller.) _firmware_unsafe() no longer adds a third call
+        # — it reuses the collect loop's cached status. This lock keeps the two non-overlapping so
+        # the EE read stays live during auto.
+        self._mc_lock = threading.Lock()
         # Per-camera on/off switch: a camera is SUBSCRIBED (live CosineCamera object
         # in self._cams -> costs bandwidth) only while ACTIVE. It goes active when a
         # consumer request()s it, and is evicted (object closed) after idle_timeout.
@@ -530,7 +494,8 @@ class HumanoidEnv:
             # One get_motion_status + one gripper read per tick; both the
             # inference EE state and the recording rows are derived from them.
             try:
-                status = self._collect_robot_controller.get_motion_status()
+                with self._mc_lock:
+                    status = self.robot_controller.get_motion_status()
                 grip = self.robot.gripper_states()[0]
                 ee_state = self._left_ee_from(status, grip)
                 print(f"ee_state from getter: {ee_state}")
@@ -558,10 +523,19 @@ class HumanoidEnv:
                 if sig != self._last_cam_sig.get(n):
                     changed = True
             fw_error = bool(status and status.get('error', {}).get('has_error'))
+            # Release-path safety flag, cached from THIS single get_motion_status() read so the
+            # release loop's _firmware_unsafe() reuses it instead of polling get_motion_status()
+            # again at 120Hz (the 2nd caller that raced this read and froze the EE — see _mc_lock).
+            # Unsafe = firmware error OR active collision OR no readable status this tick.
+            fw_unsafe = (status is None
+                         or bool(status.get('error', {}).get('has_error'))
+                         or bool(status.get('collisions')))
 
             with self._lock:
                 self._obs_timestamp = now
                 self._firmware_has_error = fw_error
+                self._firmware_unsafe_flag = fw_unsafe
+                self._firmware_status_mono = now_mono
                 if ee_sig is not None:
                     self._last_ee_sig = ee_sig
                 self._last_cam_sig.update(cam_sigs)
@@ -627,23 +601,22 @@ class HumanoidEnv:
         return a[::64, ::64].tobytes() if a.ndim >= 2 else a.tobytes()
 
     def _firmware_unsafe(self):
-        """Defense-in-depth: True if get_motion_status reports an error or active collisions, or
-        can't be read. Polled on the release path so a firmware-detected fault triggers E-stop
-        even for hazards the (self-collision-only) sim can't see (e.g. hitting the table)."""
-        try:
-            st = self.robot_controller.get_motion_status()
-        except Exception as e:
-            print(f"[HumanoidEnv] get_motion_status failed during release: {e}")
+        """Defense-in-depth: True if the firmware reports an error or active collision, or its
+        status has gone stale/unreadable. Triggers E-stop on the release path for hazards the
+        (self-collision-only) sim can't see (e.g. hitting the table).
+
+        Reads the flag the collect loop caches from its single 30Hz get_motion_status() read —
+        NOT a second get_motion_status() call. Polling it again here (120Hz) was the second caller
+        that raced the collect read on the shared MotionController and froze the EE (see _mc_lock).
+        A stale cache (collect loop hung/stopped) -> unsafe, so we never command blind to firmware
+        state."""
+        with self._lock:
+            unsafe = self._firmware_unsafe_flag
+            ts = self._firmware_status_mono
+        if ts == 0.0 or (time.monotonic() - ts) > FIRMWARE_STATUS_STALE:
+            print("[HumanoidEnv] firmware status stale/unavailable -> treating as unsafe.")
             return True
-        if not st:
-            return True
-        if st.get('error', {}).get('has_error'):
-            print(f"[HumanoidEnv] firmware error: {st['error'].get('message')}")
-            return True
-        if st.get('collisions'):
-            print(f"[HumanoidEnv] firmware collision(s): {st['collisions']}")
-            return True
-        return False
+        return unsafe
 
     def _read_frames(self, active):
         """Latest frame per live camera, kept as a rolling [prev, cur] pair.
@@ -1282,9 +1255,13 @@ class HumanoidEnv:
                 grip_cmd = 1 if grip >= 0.5 else 0
                 self.robot.move_gripper([grip_cmd, 0])
             try:
-                self.robot_controller.trajectory_tracking_control(
-                    infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
-                    )
+                # Serialize with the collect loop's get_motion_status() on the shared
+                # MotionController (see _mc_lock); the lock wraps only the SDK call, never the
+                # STEP_TIME pace below.
+                with self._mc_lock:
+                    self.robot_controller.trajectory_tracking_control(
+                        infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
+                        )
             except Exception as e:
                 print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
                 return False
