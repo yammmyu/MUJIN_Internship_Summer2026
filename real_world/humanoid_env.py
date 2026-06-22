@@ -173,6 +173,14 @@ class HumanoidEnv:
         self._owns_robot = robot is None
         self.robot = robot if robot is not None else Robot()
         self.robot_controller = robot_controller if robot_controller is not None else RobotController()
+        # Dedicated RobotController for the collect loop's get_motion_status() read. The EE pose
+        # (get_motion_status) and the 120Hz command stream (trajectory_tracking_control) both live
+        # on RobotController; sharing ONE client, a get_motion_status() on the collect thread
+        # freezes once _release_loop streams commands during auto-inference (contention on the
+        # single client). A separate client for the observation read keeps the EE pose live during
+        # auto. Falls back to the shared controller when the SDK can't build one (sim has no SDK).
+        self._collect_robot_controller = (RobotController() if RobotController is not None
+                                           else self.robot_controller)
         if self._owns_robot:
             time.sleep(1.0)  # let freshly-created DDS resources come up
 
@@ -402,6 +410,13 @@ class HumanoidEnv:
             except Exception as e:
                 print(f"[HumanoidEnv.stop] camera.close({name}): {e}")
         self._cams.clear()
+        # Shut down the dedicated collect-loop controller iff we created our own (not the shared
+        # one). Best-effort: RobotController may expose no shutdown() — swallow either way.
+        if self._collect_robot_controller is not self.robot_controller:
+            try:
+                self._collect_robot_controller.shutdown()
+            except Exception as e:
+                print(f"[HumanoidEnv.stop] collect_robot_controller.shutdown: {e}")
         if self._owns_robot:
             try:
                 self.robot.shutdown()
@@ -475,7 +490,7 @@ class HumanoidEnv:
             # One get_motion_status + one gripper read per tick; both the
             # inference EE state and the recording rows are derived from them.
             try:
-                status = self.robot_controller.get_motion_status()
+                status = self._collect_robot_controller.get_motion_status()
                 grip = self.robot.gripper_states()[0]
                 ee_state = self._left_ee_from(status, grip)
                 print(f"ee_state from getter: {ee_state}")
