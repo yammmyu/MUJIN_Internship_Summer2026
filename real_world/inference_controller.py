@@ -31,26 +31,23 @@ import numpy as np
 from collections import deque
 
 from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
+from real_world.timing import RECORD_HZ   # single source of timing truth (see timing.py)
 
-RECORD_HZ = 30
 INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (max overlap for TE)
 
 # --- Temporal ensemble (ACT-style) -------------------------------------------------
-# Chunk-level EE-space smoothing: each new chunk is averaged against recent overlapping
-# chunks before validation. The policy emits action rows at its record/training rate, so row k of
-# a chunk observed at ts_obs targets wall-clock ts_obs + k*ROW_DT. For each row of the newest chunk
-# we find every buffered chunk's row at the SAME wall-clock (j = round((t_k - ts_i)/ROW_DT)) and
-# take a recency-weighted mean (weight exp(-TE_M * age), age = inferences old, newest = 0). This
-# only smooths once chunks actually OVERLAP in time, i.e. when (horizon * ROW_DT) > inference_period;
-# below that it safely passes the newest chunk through (identity).
+# Chunk-level EE-space smoothing: each new chunk is averaged against recent overlapping chunks
+# before validation. Every action row carries an absolute MASTER ROW ID (the robot's own execution
+# clock — see real_world/timing.py / HumanoidEnv): row k of a chunk observed at master id S is at
+# id S + k. For each row of the newest chunk we gather every buffered chunk's row with the SAME
+# absolute id (exact integer match) and take a recency-weighted mean (weight exp(-TE_M * age), age
+# = inferences old, newest = 0). This only smooths once chunks actually OVERLAP in id space (when
+# horizon > inferences-worth-of-rows); below that it passes the newest chunk through (identity).
+# Aligning by master id (not wall-clock) tracks the arm's real progress, so the merge can't run
+# ahead of the arm when execution lags real-time (latency / slow-down / control-loop jitter).
 USE_TEMPORAL_ENSEMBLE = True
 TE_M = 0.02            # decay; larger -> trust the newest chunk more (less averaging)
 TE_BUFFER_LEN = 8      # how many recent raw chunks to keep for averaging
-# Wall-clock spacing between consecutive policy action rows = the policy's action timestep (the
-# rate it was trained/recorded at). The env subdivides each row into STEP_TIME substeps for
-# execution, but that doesn't change this nominal per-row spacing — the ensemble aligns rows by it.
-# (If the policy's action rate ever differs from RECORD_HZ, change this one constant.)
-ROW_DT = 1.0 / RECORD_HZ
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -172,8 +169,10 @@ class InferenceController:
                   f"Not predicting from frozen sensor data.")
             return False
         # Skip if we've already inferred on this observation (env publishes a
-        # wall-clock timestamp with every snapshot).
+        # wall-clock timestamp with every snapshot). ts is used ONLY for dedup + logs/staleness;
+        # alignment uses sid (the master row id the obs was anchored to).
         ts = obs['timestamp']
+        sid = obs['step_id']
         if ts - self._last_inference_obs_ts < 1e-4:
             print("[InferenceController] timestamp has not advanced")
             return False
@@ -228,8 +227,8 @@ class InferenceController:
 
         print(f"[InferenceController] sending for temporal ensemble! | Time elapsed; {time.time()- ts}")
         if self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10:
-            self._te_buffer.append((ts, action.copy()))
-            action = self._temporal_ensemble(ts, action)
+            self._te_buffer.append((sid, action.copy()))      # keyed on master row id, not time
+            action = self._temporal_ensemble(sid, action)
         print(f"[InferenceController] ensemble finished | Time elapsed; {time.time()- ts}")
 
         with open("TEchunks.jsonl", "a") as f:
@@ -247,41 +246,68 @@ class InferenceController:
 
         print(f"[InferenceController] sending chunk for validation | Time elapsed; {time.time()- ts}")
         if submit:
-            # AUTO-to-robot: validate this chunk on the preview sim and time-aligned-splice it into
-            # the live robot queue (no manual release). ts is the obs wall-clock used to align the
-            # splice; validation failure just skips this inference (the previous trajectory drains on).
-            ok, reason = env.auto_ingest_chunk(action.tolist(), ts)
+            # AUTO-to-robot: validate this chunk on the preview sim and ramp-ingest it into the live
+            # robot queue (no manual release). sid is the master row id the obs was anchored to; the
+            # env aligns the chunk by it. Validation failure / fully-elapsed chunk just skips this
+            # inference (the previous trajectory drains on).
+            ok, reason = env.auto_ingest_chunk(action.tolist(), sid)
             if not ok:
                 print(f"[InferenceController] auto: chunk skipped — {reason}")
         return True
 
-    def _temporal_ensemble(self, ts_new, new_action):
-        """ACT-style chunk-level temporal ensemble, in EE-pose space.
+    def _temporal_ensemble(self, id_new, new_action):
+        r"""ACT-style chunk-level temporal ensemble, in EE-pose space, aligned by MASTER ROW ID.
 
-        Returns an (N,10) chunk: for each row k of the newest chunk (target wall-clock
-        t_k = ts_new + k*ROW_DT) we gather, from every buffered RAW chunk, its row nearest to t_k
-        (j = round((t_k - ts_i)/ROW_DT)), weight it w = exp(-TE_M * age) (age = how many inferences
-        old, newest = 0), and take the weighted mean. pos (0:3) and rot6d (3:9) average linearly
-        (rot6d is re-orthonormalised downstream by rot6d_to_quat); gripper (9), already {0,1},
-        averages then re-thresholds at 0.5. With no temporal overlap only the newest chunk
-        contributes -> identity (safe no-op). Assumes the new raw chunk is already in self._te_buffer.
+        Every row carries an absolute master id: row j of the chunk observed at master id S is at
+        id S + j (the robot's own execution clock — see real_world/timing.py / HumanoidEnv). So
+        averaging is just "group rows by equal absolute id." For each row k of the newest chunk
+        (absolute id id_new + k) we gather, from every buffered RAW chunk i (anchor id_i), its row
+        j = (id_new + k) - id_i if it exists (0 <= j < N), weight w = exp(-TE_M * age) (age = how
+        many inferences old, newest = 0), and take the weighted mean. The alignment is an EXACT
+        integer (no rounding) because master ids are discrete — and it tracks the arm's REAL progress
+        regardless of inference latency or execution speed, unlike the old wall-clock alignment which
+        assumed one row per ROW_DT of wall-clock and ran ahead whenever the arm lagged.
 
-        ROW_DT (not STEP_TIME) is the unit: the buffer holds RAW chunks whose rows are one policy
-        action timestep apart, BEFORE the env subdivides them into STEP_TIME substeps."""
+        pos (0:3) and rot6d (3:9) average linearly (rot6d is re-orthonormalised downstream by
+        rot6d_to_quat); gripper (9), already {0,1}, averages then re-thresholds at 0.5. With no id
+        overlap only the newest chunk contributes -> identity (safe no-op). Assumes the new raw chunk
+        is already in self._te_buffer.
+
+        self._te_buffer layout — a collections.deque(maxlen=TE_BUFFER_LEN), OLDEST -> NEWEST:
+
+            self._te_buffer = [
+                (id_0, act_0),     # oldest buffered chunk
+                (id_1, act_1),
+                ...
+                (id_m, act_m),     # newest = the chunk being ensembled now (age 0)
+            ]
+
+        each element is a (master_id, chunk) tuple, where id_i is the int master row id the obs was
+        anchored to and act_i is the RAW (pre-ensemble) np.ndarray of shape (N, 10):
+
+            act_i = [
+                [px, py, pz,  c0x, c0y, c0z,  c1x, c1y, c1z,  g],   # row 0   -> master id  id_i + 0
+                [px, py, pz,  c0x, c0y, c0z,  c1x, c1y, c1z,  g],   # row 1   -> master id  id_i + 1
+                ...
+                [px, py, pz,  c0x, c0y, c0z,  c1x, c1y, c1z,  g],   # row N-1 -> master id  id_i + N-1
+            ]    \___ pos(3) ___/  \____ 6D rotation (3:9) ____/  \grip/
+
+        New chunks are append()ed on the RIGHT, so the oldest is auto-evicted once maxlen is
+        exceeded (FIFO by age); a chunk is NEVER removed by being read, only by eviction / clear()."""
         N = new_action.shape[0]
         out = new_action.copy()
         buf = list(self._te_buffer)                 # oldest -> newest
         newest_idx = len(buf) - 1
         for k in range(N):
-            t_k = ts_new + k * ROW_DT
+            target_id = id_new + k                  # absolute master row id of this row
             rows, weights = [], []
-            for idx, (ts_i, act_i) in enumerate(buf):
-                j = int(round((t_k - ts_i) / ROW_DT))
+            for idx, (id_i, act_i) in enumerate(buf):
+                j = target_id - id_i                # exact integer alignment (no rounding)
                 if 0 <= j < act_i.shape[0]:
                     age = newest_idx - idx              # newest chunk -> 0
                     rows.append(act_i[j])
                     weights.append(np.exp(-TE_M * age))
-            if len(rows) <= 1:                          # only the newest covers t_k -> identity
+            if len(rows) <= 1:                          # only the newest covers this id -> identity
                 continue
             w = np.asarray(weights, dtype=np.float64)
             w /= w.sum()

@@ -32,6 +32,7 @@ from real_world.ik import (
     quat_xyzw_to_se3, LEFT_ARM_JOINTS, DEFAULT_URDF, DEFAULT_CALIBRATION,
     load_calibration,
 )
+from real_world.timing import CONTROL_HZ, SUBSTEPS_PER_ROW
 
 RIGHT_ARM_JOINTS = [f"Joint{i}_r" for i in range(1, 8)]
 LEFT_GRIPPER_JOINTS = ([f"left_narrow{i}_joint" for i in (1, 2, 3, 4)] +
@@ -306,8 +307,10 @@ class SimEnv:
         (marshals to the owning thread via submit_job).
 
         For each action: `solve_fn(action, seed) -> (q7|None, grip, reason)` (IK + envelope
-        checks done by the caller); subdivide seed->q7 so every step <= max_joint_step; apply,
-        settle, self-collision check; record the sim-ACHIEVED joints (not raw IK).
+        checks done by the caller); expand each row gap into SUBSTEPS_PER_ROW time-uniform
+        configs (so inter-row wall-clock = ROW_DT, independent of motion size), rejecting a row
+        whose per-substep delta exceeds max_joint_step (the velocity ceiling); apply, settle,
+        self-collision check; record the sim-ACHIEVED joints (not raw IK).
         learn=False (validate): abort (ok=False) on a None q7 or any NEW left-side self-collision.
         learn=True (calibrate): never abort on collision — instead ABSORB every new left-side
         pair into the ignore baseline (used to learn this coarse URDF's inherent overlaps from
@@ -332,7 +335,26 @@ class SimEnv:
                     continue
                 return [], False, f"action {k}: {why}"
             q7 = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
-            for sub in self._subdivide(seed, q7, max_joint_step):
+            # Time-uniform expansion: each row gap becomes a FIXED SUBSTEPS_PER_ROW substeps
+            # (uniform in time), so inter-row wall-clock is always ROW_DT regardless of how far the
+            # joints move and the splice's f=elapsed/STEP_TIME stays exact. Smoothness is set by
+            # CONTROL_HZ (=> SUBSTEPS_PER_ROW), NOT by joint displacement. Row 0 emits a single
+            # config: the seed->row0 transient is the ramp-in, added (content-based, velocity-
+            # bounded) by the release/splice layer, not part of the demo timing.
+            if k == 0:
+                subs = [q7]
+            else:
+                # Safety velocity ceiling (independent of K): per-substep delta = |dq_row|/K. If it
+                # exceeds max_joint_step the demo is faster than CONTROL_HZ*cap can deliver, i.e.
+                # joint velocity > MAX_JOINT_VEL -> reject (caller keeps draining the prior traj).
+                per_sub = float(np.max(np.abs(q7 - seed))) / SUBSTEPS_PER_ROW
+                if not learn and per_sub > max_joint_step + 1e-9:
+                    return [], False, (
+                        f"action {k}: joint-velocity cap exceeded "
+                        f"({np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > "
+                        f"{np.degrees(max_joint_step * CONTROL_HZ):.0f} deg/s)")
+                subs = self._resample_uniform(seed, q7, SUBSTEPS_PER_ROW)
+            for sub in subs:
                 if fast:
                     # Collision-only fast path: KINEMATIC TELEPORT, no physics settle. The preview is
                     # gravity-free position-hold, so resetJointState to `sub` IS the achieved pose,
@@ -360,13 +382,16 @@ class SimEnv:
         return out, True, None
 
     @staticmethod
-    def _subdivide(q_from, q_to, cap):
-        """Configs from q_from->q_to (excl. start, incl. end) with every step <= cap rad."""
+    def _resample_uniform(q_from, q_to, k):
+        """k TIME-uniform configs from q_from->q_to (excl. start, incl. end). Fixed count = k,
+        so one policy-row gap always occupies the same wall-clock (ROW_DT) no matter how far the
+        joints move — the interpolation that preserves the recorded motion speed. Smoothness is
+        set by k = SUBSTEPS_PER_ROW (i.e. CONTROL_HZ), not by joint displacement. The per-substep
+        joint delta is checked against the velocity cap by the caller."""
         q_from = np.asarray(q_from, dtype=np.float64)
         q_to = np.asarray(q_to, dtype=np.float64)
-        n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap)) if cap > 0 else 1
-        n = max(n, 1)
-        return [q_from + (q_to - q_from) * (i / n) for i in range(1, n + 1)]
+        k = max(int(k), 1)
+        return [q_from + (q_to - q_from) * (i / k) for i in range(1, k + 1)]
 
     def _apply_arm(self, q7, grip):
         p.setJointMotorControlArray(self.body, self.arm_idx, p.POSITION_CONTROL,

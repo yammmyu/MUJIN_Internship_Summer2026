@@ -28,6 +28,7 @@ class RecordedObsSource:
         state:       [s_{t-1}, s_t]   each [pos(3), quat xyzw(4), grip(1)]  (8 dims)
         joint_state: [j_{t-1}, j_t]   each [7 left-arm joints (rad), grip]  (8 dims)
         timestamp:   float (wall clock; always advances so inference doesn't dedup)
+        step_id:     int (recording row index — the master-id anchor for ensemble/ingest alignment)
     Returns None and sets `done` once the videos are exhausted.
     """
 
@@ -101,6 +102,10 @@ class RecordedObsSource:
             'state': [prev[2], cur[2]],
             'joint_state': [prev[3], cur[3]],
             'timestamp': time.time(),
+            # Master row id for alignment: the recording row index of this obs (the recorded frames
+            # ARE the policy-row timeline). Replaces wall-clock as the ensemble/ingest anchor. In the
+            # live env this comes from the robot's execution clock; here it's the replay cursor.
+            'step_id': si,
         }
 
     def close(self):

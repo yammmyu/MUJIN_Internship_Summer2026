@@ -10,6 +10,8 @@ import numpy as np
 from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
 
 CAMERA_NAMES = ["hand_left", "hand_right", "head"]
+# MUST match real_world/timing.py:RECORD_HZ — that is the single source of timing truth for the
+# inference/execution path, and recordings made here are replayed/trained at that rate.
 RECORD_HZ    = 30
 
 

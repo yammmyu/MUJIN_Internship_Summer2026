@@ -159,7 +159,7 @@ def run_auto_replay(env, args):
     chunk_len, gap = args.chunk_len, args.auto_gap
     advance = max(1, int(round(gap * RECORD_HZ)))      # window step per 'inference'
     print(f"[sim_infer_eval] auto: {n} recorded frames -> overlapping chunks of {chunk_len} every "
-          f"{gap:.2f}s (advance {advance}) -> validate + splice + release")
+          f"{gap:.2f}s (advance {advance}) -> validate + ramp-ingest + release")
 
     def feeder():
         idx = fed = skipped = 0
@@ -167,7 +167,9 @@ def run_auto_replay(env, args):
             chunk = rows[idx: idx + chunk_len]
             if len(chunk) < 2:
                 break
-            ok, reason = env.auto_ingest_chunk(chunk, time.time())
+            # obs_step_id = the recording row this chunk starts at (its master row id). The sim arm
+            # executes those tagged rows, so its _current_row_id tracks idx — the same origin.
+            ok, reason = env.auto_ingest_chunk(chunk, idx)
             fed += 1
             if not ok:
                 skipped += 1

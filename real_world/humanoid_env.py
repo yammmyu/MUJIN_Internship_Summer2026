@@ -29,6 +29,12 @@ import cv2
 import numpy as np
 
 from real_world.ik import IKQuery, build_solver, rot6d_to_quat as _ik_rot6d_to_quat
+# Timing/rate constants live in ONE place (real_world/timing.py) so RECORD_HZ, the substep rate
+# (CONTROL_HZ/STEP_TIME) and the velocity cap (MAX_JOINT_VEL/MAX_JOINT_STEP) can't drift apart.
+# Re-exported below for back-compat — scripts and tests import these names from humanoid_env.
+from real_world.timing import (
+    RECORD_HZ, ROW_DT, CONTROL_HZ, STEP_TIME, SUBSTEPS_PER_ROW, MAX_JOINT_VEL, MAX_JOINT_STEP,
+)
 
 # a2d_sdk only exists on the robot machine. A sim-only machine (pybullet but no SDK) still
 # needs to import this module for the IK/exec path, so guard the import. The sim runner never
@@ -38,16 +44,14 @@ try:
 except ImportError:
     Robot = Camera = RobotController = None
 
-RECORD_HZ = 30
-
 # ----------------------------------------------------------------------------- #
 #  Safety limits for the real-robot release path (see the safety-review fixes).  #
-#  Conservative defaults for first hardware bring-up; tune up only after runs.   #
 # ----------------------------------------------------------------------------- #
-# Max per-tick change of any single arm joint on the hardware path (rad). The
-# validation pass subdivides to respect this and the release loop clamps to it,
-# so a step-change target becomes a bounded ramp instead of a snap. (C5)
-MAX_JOINT_STEP = 0.005 #0.02         # ~1.8 deg per tick @ RECORD_HZ -> ~54 deg/s ceiling
+# MAX_JOINT_STEP (= MAX_JOINT_VEL / CONTROL_HZ, from timing.py) is the max per-substep change of
+# any single arm joint on the hardware path (rad) — a pure SAFETY velocity ceiling. Validation
+# rejects a policy row whose joint velocity exceeds MAX_JOINT_VEL; the release loop and the
+# ramp/bridge subdivision clamp to MAX_JOINT_STEP so a step-change target becomes a bounded ramp
+# instead of a snap (C5). Motion smoothness is set by CONTROL_HZ, NOT by this cap.
 # Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
 QUAT_ALPHA = 0.5
 # Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
@@ -57,7 +61,9 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
-STEP_TIME = 1/90 #each sub step will be executed over 0.05 seconds
+# STEP_TIME = 1/CONTROL_HZ (imported from timing.py): the release loop streams one sim-validated
+# substep per STEP_TIME, so the arm advances on the same uniform time grid the auto-splice f index
+# (f = round(elapsed / STEP_TIME)) assumes. Each policy row spans SUBSTEPS_PER_ROW such substeps.
 
 # Gripper is BINARY open/close. The policy emits a noisy raw [0,~85] gripper signal (transient
 # spikes exist), so at inference we binarize it to {0,1} (see InferenceController): only a
@@ -250,6 +256,12 @@ class HumanoidEnv:
         # angles (rad) + 1 RAW gripper value (8-dim). Built alongside the EE pair in _collect_loop.
         self._last_two_joint_states = None
         self._obs_timestamp = 0.0
+        # Master row clock (the robot's own execution timeline, in policy-row units, independent of
+        # wall-clock). _release_loop advances _current_row_id as substeps dispatch; _collect_loop
+        # snapshots it into _obs_row_id when it samples an obs, so each prediction is anchored to the
+        # row the arm was actually on. Alignment (ensemble + ramp ingest) is keyed on this, not time.
+        self._current_row_id = 0
+        self._obs_row_id = 0
 
         # Recording state — guarded by _rec_lock. _rec holds the in-progress
         # recording session (None when not recording). Ported from RobotDataCollector.
@@ -486,7 +498,7 @@ class HumanoidEnv:
                 # training zarr layout). grip is array-like; take grip[0] scalar so rows are pure
                 # Python floats (JSON-safe, homogeneous).
                 ee_state = self._left_ee_fk(arm14[:7], float(grip[0])) if arm14 is not None else None
-                print(f"ee_state from getter: {ee_state}")
+                # print(f"ee_state from getter: {ee_state}")
                 joint_state = (arm14[:7].tolist() + [float(grip[0])]) if arm14 is not None else None
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
@@ -510,6 +522,7 @@ class HumanoidEnv:
 
             with self._lock:
                 self._obs_timestamp = now
+                self._obs_row_id = self._current_row_id   # master-ID this obs is anchored to
                 self._firmware_has_error = fw_error
                 if ee_sig is not None:
                     self._last_ee_sig = ee_sig
@@ -648,6 +661,7 @@ class HumanoidEnv:
                 # robot0_left_joint policy input: [j_{t-1}, j_t], each 7 left-arm joints + raw gripper.
                 'joint_state': copy.deepcopy(self._last_two_joint_states),
                 'timestamp': self._obs_timestamp,
+                'step_id': self._obs_row_id,    # master row-ID for alignment (see ensemble/ingest)
                 'age': age,
                 'stale': bool(stale),
                 'firmware_error': bool(self._firmware_has_error),
@@ -895,13 +909,17 @@ class HumanoidEnv:
         print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_substep_remaining} substep(s) still staged).")
         return len(full)
 
-    # ===================== auto-inference: validate + time-aligned splice (no manual accept) =====================
-    def auto_ingest_chunk(self, action_chunk, obs_ts):
+    # ===================== auto-inference: validate + master-ID ramp ingest (no manual accept) =====================
+    def auto_ingest_chunk(self, action_chunk, obs_step_id):
         """Auto-inference entry point: validate a predicted chunk on the preview sim (the SAME
-        sim-before-robot self-collision check the manual path uses) and, on success, splice the
-        sim-achieved substeps into the LIVE _robot_q time-aligned to `obs_ts` — no manual release.
-        Refused while E-stopped / without a sim. On validation FAILURE the previous trajectory keeps
-        draining (we just skip this inference). Returns (ok: bool, reason: str)."""
+        sim-before-robot self-collision check the manual path uses) and, on success, REPLACE the
+        live robot queue with a fresh ramp-in from the arm's current pose to the chunk's still-future
+        rows, ALIGNED by the master row id `obs_step_id` (the row the arm was on when this chunk's
+        obs was sampled). Row j of the chunk targets master id obs_step_id + j; we execute only the
+        rows the arm has NOT yet passed (id >= the current row id), so the part the inference latency
+        already overtook is dropped. No shape-match splice — once alignment is exact (master id), a
+        plain ramp from the live pose is enough. Refused while E-stopped / without a sim. Validation
+        failure or a fully-elapsed chunk just skips this inference. Returns (ok, reason)."""
         if not self._real:
             return False, "env built with real=False"
         if self.sim is None:
@@ -910,123 +928,40 @@ class HumanoidEnv:
             return False, "E-stop latched"
         # Seed validation from a FRESH real left-arm read so the self-collision check and IK plan
         # from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
-        arm14 = self._read_arm14()
+        arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
         seed = arm14[:7] if arm14 is not None else self._last_q
-        traj, ok, reason = self._validate_chunk(action_chunk, seed, fast=True)
+        traj, ok, reason = self._validate_chunk(action_chunk, seed, fast=True)   # substeps, <= cap
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
-        with open("traj.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": float(obs_ts),
-                                "traj": [[np.asarray(q7).tolist(), float(grip)]
-                                         for q7, grip in traj]}) + "\n")
-        self._auto_splice_nearest(traj, obs_ts)
+        # Tag each validated substep with its ABSOLUTE master row id. _validate_impl emits traj[0]
+        # for row 0 and then SUBSTEPS_PER_ROW substeps per subsequent row, so substep s belongs to
+        # row 0 (s==0) else ceil(s / SUBSTEPS_PER_ROW); its master id = obs_step_id + that row.
+        K = SUBSTEPS_PER_ROW
+        tagged = [(np.asarray(q7, dtype=np.float64), float(grip),
+                   int(obs_step_id) + (0 if s == 0 else int(np.ceil(s / K))))
+                  for s, (q7, grip) in enumerate(traj)]
+        with self._lock:
+            cur = self._current_row_id
+            kept = [t for t in tagged if t[2] >= cur]      # drop rows the arm already passed
+            if not kept:
+                return False, (f"chunk fully elapsed (obs_row {obs_step_id}, now {cur})")
+            # Ramp from the live pose to the first future row, then follow the rest. The ramp's
+            # substeps carry that row's id so the clock reads correctly while catching up. Read the
+            # start pose FRESH inside the lock: validation took time during which the release loop
+            # drained substeps, so the arm14 read before it is stale — ramping from it would inject a
+            # >cap jump from where the arm actually is to the ramp's start. Holding the lock keeps the
+            # release loop from advancing between this read and the queue swap.
+            live = self._read_arm14()
+            start = live[:7] if live is not None else kept[0][0]
+            fq, fg, fid = kept[0]
+            ramp = [(q, g, fid) for (q, g) in self._ramp(start, fq, MAX_JOINT_STEP, fg)]
+            self._robot_q.clear()
+            self._robot_q.extend(ramp + kept[1:])          # ramp ends AT kept[0]
+            qlen = len(self._robot_q)
+            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()   # IK warm-start
+        print(f"[HumanoidEnv] auto-ramp: obs_row={obs_step_id}, now={cur}, "
+              f"kept={len(kept)}/{len(tagged)} (+{len(ramp)} ramp) -> queue {qlen}")
         return True, ""
-
-    def _auto_splice(self, traj, obs_ts):
-        """Integrate a freshly validated trajectory into the live _robot_q so consecutive inferences
-        join smoothly. `traj` = sim-achieved [(q7, grip), ...], one element per executed substep
-        (drained at one substep / STEP_TIME), starting from the pose observed at `obs_ts`. The
-        substep that corresponds to "now" is f = round((now - obs_ts)/STEP_TIME) — MEASURED elapsed
-        time, so it auto-adapts to the inference gap.
-
-        RUNWAY: we keep a runway of `keep_n ≈ f` committed substeps (one inference-latency's worth)
-        rather than just 2, so a STALE chunk only rewrites the FUTURE tail, not motion the arm is
-        already committed to. We then splice the new chunk at the TIME-ALIGNED index g = f + keep_n
-        — the substep whose wall-clock matches the END of the runway — and _ramp (bounded <=
-        MAX_JOINT_STEP) from the runway's last point to traj[g], then follow traj[g+1:]. Keeping only
-        2 substeps + splicing at traj[f] was the back-and-forth bug: keep[-1] and traj[f] are the
-        SAME instant but from different (old vs new) plans, so the bridge could run backward. With
-        the shift, keep[-1] and traj[g] refer to the same FUTURE instant -> forward, short bridge,
-        and the chunk is joined where it is still fresh (needs horizon_substeps > ~2f; otherwise g
-        saturates at the end -> clean lurch, no oscillation). When idle/first inference we ramp from
-        the real pose to traj[0] (the whole trajectory plays)."""
-        print(f"world time: {time.time()} | obs time: {obs_ts} | time elapsed:{time.time() - obs_ts}")
-        f = max(0, min(int(round((time.time() - obs_ts) / STEP_TIME)), len(traj) - 1))
-        arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
-        start = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)
-        keep_n, g = 0, f                                  # for logging; set in the merge branch
-        with self._lock:
-            if not self._robot_q:                         # idle / first inference -> fresh ramp-in
-                ramp = self._ramp(start, traj[0][0], MAX_JOINT_STEP, traj[0][1])
-                new_q = ramp + list(traj[1:])             # ramp's last point IS traj[0]
-            else:
-                # Keep ~f substeps of committed runway (capped by what's queued), then bridge from
-                # the runway's last point to the TIME-ALIGNED substep g = f + keep_n and replace the
-                # tail. keep[-1] is robust when fewer than keep_n remain.
-                keep_n = max(1, min(f, len(self._robot_q)))
-                keep = [self._robot_q[i] for i in range(keep_n)]
-                g = min(f + keep_n, len(traj) - 1)
-                ramp = self._ramp(keep[-1][0], traj[g][0], MAX_JOINT_STEP, traj[g][1])  # bridge -> g
-                new_q = keep + ramp + list(traj[g + 1:])   # ramp ends at traj[g]; replace the tail
-            self._robot_q.clear()
-            self._robot_q.extend(self._subdivide_points(new_q))
-            qlen = len(self._robot_q)
-            # Advance the IK warm-start seed to the end of this trajectory for continuity.
-            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
-        print(f"[HumanoidEnv] auto-splice: f={f}/{len(traj)-1}, keep={keep_n}, g={g}, "
-              f"+{len(ramp)} ramp -> queue {qlen}")
-
-    def _auto_splice_nearest(self, traj, obs_ts=None,
-                             match_win=16, blend_win=10, search_radius=30):
-        """Alternative to the time-based _auto_splice: align the new chunk to the in-flight queue by
-        WINDOWED SHAPE-MATCHING, then CROSSFADE old->new (instead of a hard ramp).
-
-        Why windowed: matching a SINGLE pose is ambiguous — many substeps share a joint config, so
-        argmin can latch onto the wrong one (the back-and-forth). Instead we slide a window of the
-        committed queue's front against the new traj and pick the offset d minimizing windowed L1
-        over the curve's SHAPE:  cost(d) = Σ_{i<W} |old_q[i] - new_q[d+i]|₁.
-        Why bounded: when obs_ts is known we restrict d to [f-R, f+R] around the time estimate
-        f=round((now-obs_ts)/STEP_TIME) — time gets the neighbourhood, shape locks on, so a
-        featureless (slow/straight) stretch can't mis-match far away.
-        Merge: crossfade old->new over blend_win substeps (αᵢ: 0->1), then follow traj[d+B:].
-        CAVEAT: the blended segment interpolates two validated paths but is not itself collision-
-        checked (same as the ramp it replaces); _subdivide_points still bounds each step to
-        MAX_JOINT_STEP. Idle/first inference -> plain ramp-in from the real pose."""
-        arm14 = self._read_arm14()                        # DDS I/O, outside the lock
-        live = arm14[:7] if arm14 is not None else np.asarray(traj[0][0], dtype=np.float64)
-        new_q = np.array([t[0] for t in traj], dtype=np.float64)        # (N, 7)
-        N = new_q.shape[0]
-        with self._lock:
-            if not self._robot_q:                         # idle / first inference -> fresh ramp-in
-                ramp = self._ramp(live, traj[0][0], MAX_JOINT_STEP, traj[0][1])
-                self._robot_q.extend(self._subdivide_points(ramp + list(traj[1:])))
-                qlen = len(self._robot_q)
-                self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
-                print(f"[HumanoidEnv] auto-splice(blend): idle ramp-in -> queue {qlen}")
-                return
-            # Snapshot the committed queue's joints (front = next to execute = "now").
-            old_q = np.array([self._robot_q[i][0] for i in range(len(self._robot_q))],
-                             dtype=np.float64)             # (M, 7)
-            M = old_q.shape[0]
-            W = max(1, min(match_win, M, N))
-            d_max = N - W                                  # last valid window start (>=0 since W<=N)
-            # Candidate offsets: bound near the time estimate f if obs_ts known, else the whole traj.
-            # Clamp BOTH ends to [0, d_max] so new_q[d:d+W] is always a full window — when latency
-            # >> horizon, f-search_radius can exceed d_max and an unclamped lo crashes the L1 below.
-            if obs_ts is not None:
-                f = int(round((time.time() - obs_ts) / STEP_TIME))
-                lo = max(0, min(f - search_radius, d_max))
-                hi = max(lo, min(d_max, f + search_radius))
-            else:
-                lo, hi = 0, d_max
-            # Windowed L1 over the (small) candidate range -> best shape alignment.
-            best_d, best_cost = lo, np.inf
-            for d in range(lo, hi + 1):
-                cost = np.abs(old_q[:W] - new_q[d:d + W]).sum()
-                if cost < best_cost:
-                    best_cost, best_d = cost, d
-            # Crossfade old -> new over B substeps from the matched point, then follow the new tail.
-            B = max(1, min(blend_win, M, N - best_d))
-            blended = [((1.0 - (i + 1) / B) * old_q[i] + ((i + 1) / B) * new_q[best_d + i],
-                        traj[best_d + i][1])              # new chunk's gripper
-                       for i in range(B)]
-            new_seq = blended + list(traj[best_d + B:])
-            self._robot_q.clear()
-            self._robot_q.extend(self._subdivide_points(new_seq))
-            qlen = len(self._robot_q)
-            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
-        print(f"[HumanoidEnv] auto-splice(blend): d={best_d}/{N-1}, W={W}, B={B}, "
-              f"cost={best_cost:.3f} -> queue {qlen}")
 
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
@@ -1150,6 +1085,10 @@ class HumanoidEnv:
             if sub is None:
                 self._stop_event.wait(STEP_TIME)
                 continue
+            # Advance the master row clock to the row this substep realizes (auto path tags a row id
+            # as the 3rd element; the manual release path is a 2-tuple and leaves the clock alone).
+            if len(sub) > 2 and sub[2] is not None:
+                self._current_row_id = int(sub[2])
             if self._firmware_unsafe():                        # defense-in-depth: firmware fault
                 self.lock_robot()
                 continue
@@ -1215,7 +1154,8 @@ class HumanoidEnv:
         # Each point is its own single-waypoint ABS_JOINT trajectory (8.2.4 schema, LEFT arm only ->
         # right arm never moves) with reference_time = STEP_TIME; we pace on self._stop_event so a
         # shutdown breaks promptly too.
-        for q7, grip in points:
+        for item in points:
+            q7, grip = item[0], item[1]                  # tolerate (q7, grip) or (q7, grip, row_id)
             # Stop streaming a RELEASE batch the instant an E-stop latches (or on shutdown). The
             # E-stop HOLD itself passes ignore_estop=True so it can re-assert the pose while latched.
             if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
