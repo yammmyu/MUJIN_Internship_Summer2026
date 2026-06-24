@@ -206,8 +206,6 @@ class RobotControlGUI(
         self.start_camera_thread()
         self.start_status_thread()
         self.start_vr_stream_thread()
-        if camera_mode != "data":
-            self.start_motion_planning_thread()
 
     def setup_ui(self):
         """设置用户界面：顶部标题栏 + 左右分栏 + 底部状态栏。"""
