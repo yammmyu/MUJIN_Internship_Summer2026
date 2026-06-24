@@ -329,29 +329,40 @@ class SimEnv:
         self.reset_arm(seed)
         for k in self.grip_idx:
             p.resetJointState(self.body, k, GRIPPER_OPEN_RAD)
+        # Clip every row config up front: the C1 inter-row interpolation (centripetal Catmull-Rom)
+        # sets each waypoint's tangent from its NEIGHBOURING rows, so it needs the whole sequence and
+        # can't expand one gap in isolation like a plain lerp. P[k] = row k's joint target.
+        P = [np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
+             for (q7, _g) in configs]
+        grips = [float(g) for (_q, g) in configs]
         out = []
-        for k, (q7, grip) in enumerate(configs):
-            grip = float(grip)
-            q7 = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
-            # Time-uniform expansion: each row gap becomes a FIXED SUBSTEPS_PER_ROW substeps
-            # (uniform in time), so inter-row wall-clock is always ROW_DT regardless of how far the
-            # joints move and the splice's f=elapsed/STEP_TIME stays exact. Smoothness is set by
-            # CONTROL_HZ (=> SUBSTEPS_PER_ROW), NOT by joint displacement. Row 0 emits a single
-            # config: the seed->row0 transient is the ramp-in, added (content-based, velocity-
-            # bounded) by the release/splice layer, not part of the demo timing.
+        for k in range(len(P)):
+            q7, grip = P[k], grips[k]
+            # Time-uniform expansion: each row gap becomes a FIXED SUBSTEPS_PER_ROW substeps (uniform
+            # in time), so inter-row wall-clock is always ROW_DT regardless of motion size and the
+            # splice's f=elapsed/STEP_TIME stays exact. Smoothness is set by CONTROL_HZ (=>
+            # SUBSTEPS_PER_ROW), NOT by joint displacement. Row 0 emits a single config: the
+            # seed->row0 transient is the ramp-in, added (velocity-bounded) by the release/splice layer.
             if k == 0:
                 subs = [q7]
             else:
-                # Safety velocity ceiling (independent of K): per-substep delta = |dq_row|/K. If it
-                # exceeds max_joint_step the demo is faster than CONTROL_HZ*cap can deliver, i.e.
-                # joint velocity > MAX_JOINT_VEL -> reject (caller keeps draining the prior traj).
-                per_sub = float(np.max(np.abs(q7 - seed))) / SUBSTEPS_PER_ROW
-                if not learn and per_sub > max_joint_step + 1e-9:
-                    return [], False, (
-                        f"action {k}: joint-velocity cap exceeded "
-                        f"({np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > "
-                        f"{np.degrees(max_joint_step * CONTROL_HZ):.0f} deg/s)")
-                subs = self._resample_uniform(seed, q7, SUBSTEPS_PER_ROW)
+                # Centripetal Catmull-Rom through row k-1 -> k, with the rows on either side as
+                # tangent context (duplicated at the chunk ends). Curving through the waypoints with
+                # MATCHED endpoint velocities makes joint velocity continuous across row boundaries
+                # (C1) instead of the lerp's per-row staircase -> the jerk spike at each row is gone.
+                before = P[k - 2] if k >= 2 else P[k - 1]
+                after = P[k + 1] if k + 1 < len(P) else P[k]
+                subs = self._catmull_rom_segment(before, P[k - 1], P[k], after, SUBSTEPS_PER_ROW)
+                # Safety velocity ceiling, checked on the ACTUAL curve: a cubic peaks faster than the
+                # straight-line average, so cap the largest per-substep joint delta ALONG the spline
+                # (incl. the step from the previous row) rather than the |dq_row|/K linear estimate.
+                if not learn:
+                    per_sub = float(np.max(np.abs(np.diff(np.vstack([P[k - 1][None], subs]), axis=0))))
+                    if per_sub > max_joint_step + 1e-9:
+                        return [], False, (
+                            f"action {k}: joint-velocity cap exceeded "
+                            f"({np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > "
+                            f"{np.degrees(max_joint_step * CONTROL_HZ):.0f} deg/s)")
             for sub in subs:
                 if fast:
                     # Collision-only fast path: KINEMATIC TELEPORT, no physics settle. The preview is
@@ -376,20 +387,53 @@ class SimEnv:
                         return [], False, (f"action {k}: self-collision "
                                            f"{self.link_name.get(a, a)} <-> {self.link_name.get(b, b)}")
                 out.append((self._cur_arm_q().copy(), float(grip)))   # sim-ACHIEVED, not raw IK
-            seed = q7
         return out, True, None
 
     @staticmethod
     def _resample_uniform(q_from, q_to, k):
-        """k TIME-uniform configs from q_from->q_to (excl. start, incl. end). Fixed count = k,
-        so one policy-row gap always occupies the same wall-clock (ROW_DT) no matter how far the
-        joints move — the interpolation that preserves the recorded motion speed. Smoothness is
-        set by k = SUBSTEPS_PER_ROW (i.e. CONTROL_HZ), not by joint displacement. The per-substep
-        joint delta is checked against the velocity cap by the caller."""
+        """k TIME-uniform configs from q_from->q_to (excl. start, incl. end), straight line. Fixed
+        count = k, so one policy-row gap always occupies the same wall-clock (ROW_DT) no matter how
+        far the joints move. Superseded on the row path by _catmull_rom_segment (C1); kept as the
+        degenerate/fallback interpolator."""
         q_from = np.asarray(q_from, dtype=np.float64)
         q_to = np.asarray(q_to, dtype=np.float64)
         k = max(int(k), 1)
         return [q_from + (q_to - q_from) * (i / k) for i in range(1, k + 1)]
+
+    @staticmethod
+    def _catmull_rom_segment(p0, p1, p2, p3, k, alpha=0.5):
+        """k configs along the centripetal Catmull-Rom spline on the p1->p2 segment (excl. p1, incl.
+        p2 — same count/endpoints as _resample_uniform, so the row's wall-clock and the f-index are
+        unchanged). p0 and p3 are the neighbouring rows; they only set the endpoint tangents so that
+        adjacent segments share the same velocity at p1/p2 -> C1 across row boundaries.
+
+        Barry-Goldman pyramidal evaluation (no explicit tangent scaling, robust to non-uniform knot
+        spacing). alpha=0.5 (centripetal) gives no cusps/self-intersections and bounded overshoot,
+        unlike uniform CR which can loop. A duplicated neighbour at a chunk end (p0==p1 or p3==p2) is
+        REFLECTED to a one-sided tangent; a zero-length p1->p2 segment returns a constant hold."""
+        p0 = np.asarray(p0, dtype=np.float64); p1 = np.asarray(p1, dtype=np.float64)
+        p2 = np.asarray(p2, dtype=np.float64); p3 = np.asarray(p3, dtype=np.float64)
+        k = max(int(k), 1)
+        if np.linalg.norm(p2 - p1) < 1e-9:                 # stationary row -> hold (avoids div-by-0)
+            return [p2.copy() for _ in range(k)]
+        if np.linalg.norm(p1 - p0) < 1e-9:                 # chunk start / repeated row: mirror p2
+            p0 = 2.0 * p1 - p2
+        if np.linalg.norm(p3 - p2) < 1e-9:                 # chunk end / repeated row: mirror p1
+            p3 = 2.0 * p2 - p1
+        t0 = 0.0
+        t1 = t0 + float(np.linalg.norm(p1 - p0)) ** alpha
+        t2 = t1 + float(np.linalg.norm(p2 - p1)) ** alpha
+        t3 = t2 + float(np.linalg.norm(p3 - p2)) ** alpha
+        out = []
+        for i in range(1, k + 1):
+            t = t1 + (t2 - t1) * (i / k)
+            a1 = (t1 - t) / (t1 - t0) * p0 + (t - t0) / (t1 - t0) * p1
+            a2 = (t2 - t) / (t2 - t1) * p1 + (t - t1) / (t2 - t1) * p2
+            a3 = (t3 - t) / (t3 - t2) * p2 + (t - t2) / (t3 - t2) * p3
+            b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2
+            b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3
+            out.append((t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2)
+        return out
 
     def _apply_arm(self, q7, grip):
         p.setJointMotorControlArray(self.body, self.arm_idx, p.POSITION_CONTROL,

@@ -1197,8 +1197,39 @@ class HumanoidEnv:
                 continue
             # Advance the master row clock to the row this substep realizes (auto path tags a row id
             # as the 3rd element; the manual release path is a 2-tuple and leaves the clock alone).
-            if len(sub) > 2 and sub[2] is not None:
-                self._current_row_id = int(sub[2])
+            row_id = int(sub[2]) if len(sub) > 2 and sub[2] is not None else None
+            if row_id is not None:
+                self._current_row_id = row_id
+
+            # Recorder 1: the exact substep being popped/dispatched this tick — the ABSOLUTE
+            # left-arm joint command (q7, rad) + binary gripper, keyed by master row id. This is
+            # the post-IK joint target actually sent to the robot (vs chunks.jsonl's EE-space chunk).
+            q7_cmd, grip_cmd = sub[0], sub[1]
+            with open("released_substeps.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "step_id": row_id,
+                    "q7": np.asarray(q7_cmd, dtype=np.float64).tolist(),
+                    "grip": (None if grip_cmd is None else float(grip_cmd)),
+                }) + "\n")
+
+            # Recorder 2: the LIVE measured joint angles read from the robot at this same tick,
+            # keyed by the same master row id so the commanded substep can be joined to the actual
+            # arm state when it was dispatched (tracking error / lag analysis).
+            try:
+                live_vals, live_ts = self.robot.arm_joint_states()
+                live_joints = np.asarray(live_vals, dtype=np.float64).tolist()
+            except Exception as e:
+                live_joints, live_ts = None, None
+                print(f"[HumanoidEnv] live joint record read failed: {e}")
+            with open("live_joints.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "step_id": row_id,
+                    "joint_ts": (None if live_ts is None else float(live_ts)),
+                    "joints": live_joints,
+                }) + "\n")
+
             if self._firmware_unsafe():                        # defense-in-depth: firmware fault
                 self.lock_robot()
                 continue
