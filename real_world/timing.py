@@ -55,4 +55,4 @@ SUBSTEPS_PER_ROW = round((CONTROL_HZ / RECORD_HZ)/SPEED_SCALE)   # time-uniform 
 # clears all real motion with margin while rejecting the glitches. A policy row faster than this
 # is refused by validation. This is a SAFETY cap only — it does not set motion smoothness.
 MAX_JOINT_VEL = 4.0                                # rad/s (~344 deg/s).
-MAX_JOINT_STEP = MAX_JOINT_VEL / CONTROL_HZ        # max per-substep joint delta (rad); the C5 cap.
+MAX_JOINT_STEP = min(MAX_JOINT_VEL / CONTROL_HZ, 0.05)       # max per-substep joint delta (rad); the C5 cap.

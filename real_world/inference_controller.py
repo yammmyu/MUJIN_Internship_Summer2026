@@ -246,11 +246,13 @@ class InferenceController:
 
         print(f"[InferenceController] sending chunk for validation | Time elapsed; {time.time()- ts}")
         if submit:
-            # AUTO-to-robot: validate this chunk on the preview sim and ramp-ingest it into the live
-            # robot queue (no manual release). sid is the master row id the obs was anchored to; the
-            # env aligns the chunk by it. Validation failure / fully-elapsed chunk just skips this
-            # inference (the previous trajectory drains on).
-            ok, reason = env.auto_ingest_chunk(action.tolist(), sid)
+            # AUTO-to-robot (streaming): validate this chunk on the preview sim and APPEND only its
+            # still-unqueued rows onto the live robot queue, keeping a small rolling buffer ahead of
+            # the master clock (no clear, no manual release). sid is the master row id the obs was
+            # anchored to; the env tags each appended substep by it and the release loop drains them
+            # one master id at a time, in strict order. A validation failure skips this inference;
+            # "nothing to append" (buffer already full) returns ok and is a normal no-op.
+            ok, reason = env.append_actions(action.tolist(), sid)
             if not ok:
                 print(f"[InferenceController] auto: chunk skipped — {reason}")
         return True
@@ -310,7 +312,7 @@ class InferenceController:
             if len(rows) <= 1:                          # only the newest covers this id -> identity
                 continue
             w = np.asarray(weights, dtype=np.float64)
-            w /= w.sum()
+            w /= w.sum() #normalization
             avg = (w[:, None] * np.asarray(rows, dtype=np.float64)).sum(axis=0)
             out[k, :9] = avg[:9]                         # pos + rot6d (linear)
             out[k, 9] = 1.0 if avg[9] >= 0.5 else 0.0    # gripper re-binarised
@@ -383,10 +385,11 @@ class InferenceController:
     # ------------------------------------------------------------------ #
     def auto_inference(self, stop: bool = False):
         """Continuous auto-inference that DRIVES THE REAL ROBOT. Each inference is validated on the
-        preview sim and time-aligned-spliced into the live robot queue (env.auto_ingest_chunk) — no
-        manual release. The inference cadence is set by the server+validation latency itself (the
-        substep queue absorbs the gap), so there is no fixed inference_hz sleep. Requires the preview
-        sim to be running (validation) and real=True; the GUI launches the sim before starting."""
+        preview sim and its still-unqueued rows are appended to the live robot queue
+        (env.append_actions), which streams them one master id at a time — no manual release. The
+        inference cadence is set by the server+validation latency itself (the substep queue absorbs
+        the gap), so there is no fixed inference_hz sleep. Requires the preview sim to be running
+        (validation) and real=True; the GUI launches the sim before starting."""
         if stop:
             self.is_auto_inference = False
             if self.inference_thread is not None:
@@ -416,7 +419,7 @@ class InferenceController:
                 # Any E-stop source (operator 急停 OR a firmware-triggered lock_robot from
                 # _release_loop) disarms auto: we exit the loop so motion does NOT silently
                 # resume when the E-stop is later reset — the operator must press 启动 again.
-                # (auto_ingest_chunk also refuses while latched, so nothing is spliced even in
+                # (append_actions also refuses while latched, so nothing is queued even in
                 # the brief window before we notice here.)
                 if self.humanoid_env.estopped:
                     print("[InferenceController] E-stop latched — disarming auto-inference.")

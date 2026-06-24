@@ -61,6 +61,14 @@ WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
 
+# Streaming append depth (append_actions): keep at most this many policy ROWS queued ahead of the
+# master clock. Each inference tops the tail up to here with NEW master ids only (never re-queues an
+# id), so the arm executes one row at a time in strict order. Must be large enough that n rows of
+# execution (n * SUBSTEPS_PER_ROW * STEP_TIME seconds) outlasts one inference round-trip, or the
+# queue drains and the arm stalls between appends. Larger -> safer against latency, but the queued
+# rows are older predictions (less reactive). 4 rows is the default starting point — tune to latency.
+APPEND_AHEAD_ROWS = 4
+
 # STEP_TIME = 1/CONTROL_HZ (imported from timing.py): the release loop streams one sim-validated
 # substep per STEP_TIME, so the arm advances on the same uniform time grid the auto-splice f index
 # (f = round(elapsed / STEP_TIME)) assumes. Each policy row spans SUBSTEPS_PER_ROW such substeps.
@@ -262,6 +270,10 @@ class HumanoidEnv:
         # row the arm was actually on. Alignment (ensemble + ramp ingest) is keyed on this, not time.
         self._current_row_id = 0
         self._obs_row_id = 0
+        # Highest master id currently sitting in _robot_q (append_actions' streaming buffer cursor).
+        # -1 = nothing queued; reset to -1 whenever the queue is force-cleared (E-stop) so the next
+        # append re-anchors to the live clock instead of leaving a hole in the id stream.
+        self._queued_through = -1
 
         # Recording state — guarded by _rec_lock. _rec holds the in-progress
         # recording session (None when not recording). Ported from RobotDataCollector.
@@ -378,7 +390,7 @@ class HumanoidEnv:
             self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
             self._collect_thread.start()
         if run_exec:
-            self._exec_thread = threading.Thread(target=self._exec_loop, daemon=True)
+            self._exec_thread = threading.Thread(target=self._sim_loop, daemon=True)
             self._exec_thread.start()
         # The release thread (the ONLY robot-motion driver) runs only when real=True.
         if run_exec and self._real:
@@ -679,24 +691,39 @@ class HumanoidEnv:
         with self._lock:
             return not self._action_queue
 
-    def _make_solve_fn(self):
-        """Build the per-action solve callback the sim validation uses: workspace check (H4) +
-        orientation smoothing (H3) + our IK. Returns (q7|None, grip, reason)."""
-        qprev_box = [None]    # local quat-smoothing state (don't disturb the preview's)
-
-        def solve_fn(action, seed):
+    def _solve_chunk_ik(self, action_chunk, seed_q, skip_unreachable=False):
+        """Solve IK for an ENTIRE chunk up front, OUTSIDE the sim validation job: workspace
+        check (H4) + orientation smoothing (H3) + our IK, chaining each row's warm-start from
+        the previous raw IK solution starting at seed_q (fresh quat-smoothing state per call).
+        Returns (configs, ok, reason) where configs = [(q7, grip), ...] are the raw IK joints
+        the sim then validates kinematically. Pulled out of sim.validate so the (pure-numerical
+        Pinocchio) IK runs on the caller's thread while the sim job only does the substep +
+        self-collision check on already-solved configs.
+        skip_unreachable=True (calibrate path): drop unreachable/out-of-envelope rows and keep
+        going (mirrors the old learn=True behaviour) instead of aborting."""
+        configs = []
+        seed = np.asarray(seed_q, dtype=np.float64).copy()
+        qprev = None    # local quat-smoothing state (don't disturb the preview's)
+        for k, action in enumerate(action_chunk):
             pos, quat, grip = self._decode_ee_action(action)
             pos = np.asarray(pos, dtype=np.float64)
+            grip = float(grip)
             if not self._pos_in_workspace(pos):                                  # H4
-                return None, grip, "target EE pos outside workspace envelope"
-            qprev_box[0] = _smooth_quat_step(qprev_box[0], quat, QUAT_ALPHA)     # H3
-            q7 = self.solver.solve(IKQuery(target_pos=pos, target_quat=qprev_box[0],
+                if skip_unreachable:
+                    continue
+                return [], False, f"action {k}: target EE pos outside workspace envelope"
+            qprev = _smooth_quat_step(qprev, quat, QUAT_ALPHA)                    # H3
+            q7 = self.solver.solve(IKQuery(target_pos=pos, target_quat=qprev,
                                            current_joints=seed))
             if not self.solver.last_reachable:
-                return None, grip, f"IK unreachable (pos err {self.solver.last_pos_err*1000:.0f} mm)"
-            return q7, grip, None
-
-        return solve_fn
+                if skip_unreachable:
+                    continue
+                return [], False, (f"action {k}: IK unreachable "
+                                   f"(pos err {self.solver.last_pos_err*1000:.0f} mm)")
+            q7 = np.asarray(q7, dtype=np.float64)
+            configs.append((q7, grip))
+            seed = q7
+        return configs, True, None
 
     def calibrate_collisions(self, action_chunk):
         """Learn this coarse URDF's inherent self-collision overlaps from a KNOWN-SAFE action
@@ -705,25 +732,28 @@ class HumanoidEnv:
         recordings before trusting validation, or it will false-positive on normal poses."""
         if self.sim is None:
             return False, "no sim running"
-        self.sim.validate(action_chunk, self._make_solve_fn(), self._last_q, MAX_JOINT_STEP,
-                          learn=True)
+        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q,
+                                                   skip_unreachable=True)
+        if not ok:
+            return False, reason
+        self.sim.validate(configs, self._last_q, MAX_JOINT_STEP, learn=True)
         return True, "collision baseline updated"
 
     # ===================== shared sim-validation core (manual + auto) =====================
-    def _validate_chunk(self, action_chunk, seed_q, fast=False):
-        """Run a chunk through self.sim from seed_q (step + self-collision + joint readback) and
-        return (traj, ok, reason) where traj is the sim-ACHIEVED [(q7, grip), ...]. The single
-        validation primitive shared by the manual validate_and_stage and auto-inference (which
-        validates on the SAME preview sim, then auto-splices instead of waiting for a manual
-        release). A fresh solve_fn per call gives independent quat-smoothing state.
+    def _validate_chunk(self, configs, seed_q, fast=False):
+        """Run PRE-SOLVED joint configs through self.sim from seed_q (substep + self-collision +
+        joint readback) and return (traj, ok, reason) where traj is the sim-ACHIEVED
+        [(q7, grip), ...]. The single validation primitive shared by the manual
+        validate_and_stage and auto-inference. IK is now solved OUTSIDE this call (see
+        _solve_chunk_ik) — `configs` is its [(q7, grip), ...] output, so this is purely the
+        kinematic sim check.
         fast=True (auto path): skip the per-substep real-time sleep — that sleep is just for the
         operator to watch the manual preview and is ~1s of pure latency per auto inference."""
         if self.sim is None:
             return [], False, "no sim running — press 启动仿真预览 first"
-        if not action_chunk:
+        if not configs:
             return [], False, "empty action chunk"
-        return self.sim.validate(action_chunk, self._make_solve_fn(), seed_q, MAX_JOINT_STEP,
-                                 fast=fast)
+        return self.sim.validate(configs, seed_q, MAX_JOINT_STEP, fast=fast)
 
     # ===================== manual: validate a chunk in the sim, then release =====================
     def validate_and_stage(self, action_chunk):
@@ -742,7 +772,11 @@ class HumanoidEnv:
         # staging ahead we keep planning continuously from the prior segment's end (see below).
         self._resync_to_robot_if_idle()
 
-        traj, ok, reason = self._validate_chunk(action_chunk, self._last_q)
+        # Solve IK for the whole chunk first (outside the sim job), then validate the resulting
+        # joint configs kinematically. On an IK/envelope failure there's nothing to validate.
+        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q)
+        traj, ok, reason = (self._validate_chunk(configs, self._last_q)
+                            if ok else ([], False, reason))
         with self._lock:
             if ok and traj:
                 self._last_sim_traj = traj
@@ -926,11 +960,16 @@ class HumanoidEnv:
             return False, "no sim running — launch the preview first"
         if self._estop.is_set():
             return False, "E-stop latched"
-        # Seed validation from a FRESH real left-arm read so the self-collision check and IK plan
-        # from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
+        # Seed IK + validation from a FRESH real left-arm read so the self-collision check and IK
+        # plan from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
         arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
         seed = arm14[:7] if arm14 is not None else self._last_q
-        traj, ok, reason = self._validate_chunk(action_chunk, seed, fast=True)   # substeps, <= cap
+        # Solve IK for the chunk OUTSIDE the sim job (pure Pinocchio, caller's thread), then run
+        # the resulting joint configs through the sim for the kinematic self-collision check.
+        configs, ok, reason = self._solve_chunk_ik(action_chunk, seed)
+        if not ok:
+            return False, reason
+        traj, ok, reason = self._validate_chunk(configs, seed, fast=True)        # substeps, <= cap
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
         # Tag each validated substep with its ABSOLUTE master row id. _validate_impl emits traj[0]
@@ -962,6 +1001,76 @@ class HumanoidEnv:
         print(f"[HumanoidEnv] auto-ramp: obs_row={obs_step_id}, now={cur}, "
               f"kept={len(kept)}/{len(tagged)} (+{len(ramp)} ramp) -> queue {qlen}")
         return True, ""
+    
+    def append_actions(self, action_chunk, obs_step_id, n_rows=APPEND_AHEAD_ROWS):
+        """Streaming auto-inference entry point: keep n_rows policy rows queued ahead of the master
+        clock, appending only the ids not yet queued. _queued_through tracks the highest master id in
+        the queue, so the append window is just [_queued_through+1 .. clock+n_rows]; in the steady
+        state the clock has advanced by one row since the last call and exactly ONE new row is added.
+        Rows are only ever appended (never cleared) and the release loop only ever pops the head, so
+        the arm runs one master id at a time, in order — overlapping chunks can't re-queue or reorder
+        a row. Substeps are tagged with their absolute master id; the release loop advances the clock
+        from the popped tag. Refused while E-stopped / without a sim. ok=True with a no-op reason when
+        the buffer is already full or the chunk doesn't cover the next needed id."""
+        if not self._real:
+            return False, "env built with real=False"
+        if self.sim is None:
+            return False, "no sim running — launch the preview first"
+        if self._estop.is_set():
+            return False, "E-stop latched"
+        with self._lock:
+            cur = self._current_row_id
+            start_id = max(self._queued_through + 1, cur)   # first master id not yet queued
+            # Continuity seed: continue from the queue TAIL (where these rows attach), not the arm's
+            # transient live pose. None -> queue empty, read the live pose below.
+            seed = (np.asarray(self._robot_q[-1][0], dtype=np.float64).copy()
+                    if self._robot_q else None)
+        last_id = cur + n_rows                              # keep n_rows rows queued ahead of clock
+        if start_id > last_id:
+            return True, f"buffer full (queued through {start_id - 1}, clock {cur})"
+        # Slice THIS chunk to the rows covering [start_id, last_id]. A chunk that starts AFTER
+        # start_id can't fill the next needed id without leaving a hole in the id stream -> skip it.
+        lo = start_id - int(obs_step_id)
+        if lo < 0:
+            return True, f"chunk starts at {obs_step_id}, past next needed id {start_id} — skipped"
+        hi = min(last_id - int(obs_step_id), len(action_chunk) - 1)
+        if hi < lo:
+            return True, "chunk does not reach the append window"
+
+        if seed is None:                                    # queue empty -> continue from live pose
+            arm14 = self._read_arm14()
+            seed = arm14[:7] if arm14 is not None else self._last_q
+        configs, ok, reason = self._solve_chunk_ik(action_chunk[lo:hi + 1], seed)
+        if not ok:
+            return False, reason
+        traj, ok, reason = self._validate_chunk(configs, seed, fast=True)        # substeps, <= cap
+        if not ok or not traj:
+            return False, reason or "empty validated trajectory"
+        # Tag substeps with absolute master ids: traj[0] is the slice's first row (start_id), then
+        # SUBSTEPS_PER_ROW substeps per subsequent row.
+        K = SUBSTEPS_PER_ROW
+        tagged = [(np.asarray(q7, dtype=np.float64), float(grip),
+                   start_id + (0 if s == 0 else int(np.ceil(s / K))))
+                  for s, (q7, grip) in enumerate(traj)]
+        with self._lock:
+            cur = self._current_row_id
+            # Validation took time; drop any row the clock has since passed or that's already queued.
+            new = [t for t in tagged if t[2] >= cur and t[2] > self._queued_through]
+            if not new:
+                return True, f"fell behind during validation (clock now {cur})"
+            # Seam ramp: bridge the queue tail (or live pose when idle) to the first new row at
+            # <= MAX_JOINT_STEP per substep (C5), tagged with that row's id. Usually a single point.
+            seam_from = (np.asarray(self._robot_q[-1][0], dtype=np.float64)
+                         if self._robot_q else seed)
+            fq, fg, fid = new[0]
+            ramp = [(q, g, fid) for (q, g) in self._ramp(seam_from, fq, MAX_JOINT_STEP, fg)]
+            self._robot_q.extend(ramp + new[1:])    # ramp ends AT new[0]; queue is NEVER cleared
+            self._queued_through = new[-1][2]
+            qlen = len(self._robot_q)
+            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()   # IK warm-start
+        print(f"[HumanoidEnv] append: obs_row={obs_step_id}, clock={cur}, "
+              f"appended ids {new[0][2]}..{new[-1][2]} (+{len(ramp)} ramp) -> queue {qlen}")
+        return True, ""
 
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
@@ -972,6 +1081,7 @@ class HumanoidEnv:
             dropped = len(self._robot_q) + len(self._staged_release)
             self._robot_q.clear()
             self._staged_release.clear()             # drop un-released substeps too (re-validate after reset)
+            self._queued_through = -1                # queue emptied -> next append re-anchors to clock
         print(f"[HumanoidEnv] E-STOP: latched; dropped {dropped} pending/staged cmds; holding pose.")
         if self._real:
             arm14 = self._read_arm14()
@@ -1037,7 +1147,7 @@ class HumanoidEnv:
         return self._last_good_arm14.copy() if self._last_good_arm14 is not None else None
 
     # ===================== consumer: sim-preview execution loop =====================
-    def _exec_loop(self):
+    def _sim_loop(self):
         """Drain the sim-preview queue (auto-run / replay) -> IK -> SIM only. NEVER touches the
         robot (that is _release_loop). Applies the same workspace + smoothing guards as
         validation so the preview matches what would be validated."""

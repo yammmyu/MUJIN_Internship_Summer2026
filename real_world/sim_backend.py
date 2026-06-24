@@ -302,24 +302,26 @@ class SimEnv:
         return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
 
     # ===================== validation (run on the owning thread) =====================
-    def validate(self, actions, solve_fn, seed_q, max_joint_step, learn=False, fast=False):
-        """Run a chunk through the sim; return (validated_traj, ok, reason). Thread-safe entry
-        (marshals to the owning thread via submit_job).
+    def validate(self, configs, seed_q, max_joint_step, learn=False, fast=False):
+        """Run PRE-SOLVED joint configs through the sim; return (validated_traj, ok, reason).
+        Thread-safe entry (marshals to the owning thread via submit_job).
 
-        For each action: `solve_fn(action, seed) -> (q7|None, grip, reason)` (IK + envelope
-        checks done by the caller); expand each row gap into SUBSTEPS_PER_ROW time-uniform
-        configs (so inter-row wall-clock = ROW_DT, independent of motion size), rejecting a row
-        whose per-substep delta exceeds max_joint_step (the velocity ceiling); apply, settle,
-        self-collision check; record the sim-ACHIEVED joints (not raw IK).
-        learn=False (validate): abort (ok=False) on a None q7 or any NEW left-side self-collision.
+        configs: [(q7, grip), ...] — the raw IK joints + gripper for each chunk row, ALREADY
+        solved by the caller (IK + workspace/orientation checks live OUTSIDE the sim job now,
+        on the caller's thread; see HumanoidEnv._solve_chunk_ik). The sim job is purely the
+        kinematic check: expand each row gap into SUBSTEPS_PER_ROW time-uniform configs (so
+        inter-row wall-clock = ROW_DT, independent of motion size), reject a row whose per-
+        substep delta exceeds max_joint_step (the velocity ceiling), apply, settle, self-
+        collision check, and record the sim-ACHIEVED joints (not raw IK).
+        learn=False (validate): abort (ok=False) on any NEW left-side self-collision.
         learn=True (calibrate): never abort on collision — instead ABSORB every new left-side
         pair into the ignore baseline (used to learn this coarse URDF's inherent overlaps from
         known-SAFE motions). Leaves the arm where it ended.
         fast=True: skip the per-substep real-time sleep (auto-inference latency path)."""
         return self.submit_job(
-            lambda: self._validate_impl(actions, solve_fn, seed_q, max_joint_step, learn, fast))
+            lambda: self._validate_impl(configs, seed_q, max_joint_step, learn, fast))
 
-    def _validate_impl(self, actions, solve_fn, seed_q, max_joint_step, learn=False, fast=False):
+    def _validate_impl(self, configs, seed_q, max_joint_step, learn=False, fast=False):
         seed = np.asarray(seed_q, dtype=np.float64).copy()
         # Deterministic start (so learn & validate see the same path, and repeat runs agree):
         # reset the left arm to the seed AND the gripper to open (GRIPPER_OPEN_RAD, since angle 0
@@ -328,12 +330,8 @@ class SimEnv:
         for k in self.grip_idx:
             p.resetJointState(self.body, k, GRIPPER_OPEN_RAD)
         out = []
-        for k, action in enumerate(actions):
-            q7, grip, why = solve_fn(action, seed)
-            if q7 is None:
-                if learn:                       # skip unreachable while learning; keep going
-                    continue
-                return [], False, f"action {k}: {why}"
+        for k, (q7, grip) in enumerate(configs):
+            grip = float(grip)
             q7 = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
             # Time-uniform expansion: each row gap becomes a FIXED SUBSTEPS_PER_ROW substeps
             # (uniform in time), so inter-row wall-clock is always ROW_DT regardless of how far the
