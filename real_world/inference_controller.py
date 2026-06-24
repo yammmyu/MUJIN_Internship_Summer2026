@@ -191,7 +191,7 @@ class InferenceController:
         # chunks.jsonl/traj.jsonl use, so a request can be joined to its resulting action.
         # Images (agent_imgs/hand_imgs) are omitted — large base64 JPEGs, not needed here.
         with open("requests.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": float(ts),
+            f.write(json.dumps({"obs_ts": sid,
                                 "state": req['state'],
                                 "left_joint": req['left_joint']}) + "\n")
         
@@ -223,7 +223,7 @@ class InferenceController:
         # in EE space. The ensembled chunk is what we publish + validate; the raw one stays only in
         # the buffer for future averaging. No-op (returns the newest chunk) until chunks overlap.
         with open("chunks.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": float(ts), "action": action.tolist()}) + "\n")
+            f.write(json.dumps({"obs_ts": sid, "action": action.tolist()}) + "\n")
 
         print(f"[InferenceController] sending for temporal ensemble! | Time elapsed; {time.time()- ts}")
         if self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10:

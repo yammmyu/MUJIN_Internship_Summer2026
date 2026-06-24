@@ -1207,7 +1207,6 @@ class HumanoidEnv:
             q7_cmd, grip_cmd = sub[0], sub[1]
             with open("released_substeps.jsonl", "a") as f:
                 f.write(json.dumps({
-                    "ts": time.time(),
                     "step_id": row_id,
                     "q7": np.asarray(q7_cmd, dtype=np.float64).tolist(),
                     "grip": (None if grip_cmd is None else float(grip_cmd)),
@@ -1217,16 +1216,14 @@ class HumanoidEnv:
             # keyed by the same master row id so the commanded substep can be joined to the actual
             # arm state when it was dispatched (tracking error / lag analysis).
             try:
-                live_vals, live_ts = self.robot.arm_joint_states()
+                live_vals, _ = self.robot.arm_joint_states()
                 live_joints = np.asarray(live_vals, dtype=np.float64).tolist()
             except Exception as e:
-                live_joints, live_ts = None, None
+                live_joints = None
                 print(f"[HumanoidEnv] live joint record read failed: {e}")
             with open("live_joints.jsonl", "a") as f:
                 f.write(json.dumps({
-                    "ts": time.time(),
                     "step_id": row_id,
-                    "joint_ts": (None if live_ts is None else float(live_ts)),
                     "joints": live_joints,
                 }) + "\n")
 
