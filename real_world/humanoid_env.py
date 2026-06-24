@@ -1111,6 +1111,14 @@ class HumanoidEnv:
         with self._lock:
             return len(self._robot_q)
 
+    def queue_status(self):
+        """(current_row_id, queued_through) read atomically under the lock. The inference
+        controller uses this to split its smoothed buffer into the FROZEN region (id <=
+        queued_through, already committed to the robot) and the MUTABLE region (id >
+        queued_through, still re-smoothable), and to know the live clock for pruning."""
+        with self._lock:
+            return self._current_row_id, self._queued_through
+
     def set_seed(self, q7):
         """Set the IK warm-start seed (e.g. to the robot's current left-arm joints)."""
         self._last_q = np.asarray(q7, dtype=np.float64).copy()

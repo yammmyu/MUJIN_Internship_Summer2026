@@ -48,6 +48,16 @@ INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (ma
 USE_TEMPORAL_ENSEMBLE = True
 TE_M = 0.02            # decay; larger -> trust the newest chunk more (less averaging)
 TE_BUFFER_LEN = 8      # how many recent raw chunks to keep for averaging
+# Neighbor smoothing along the master-id axis (the second smoothing dimension). The smoothed buffer
+# is low-passed by a symmetric Gaussian of half-width TE_RADIUS so the long sequence stays smooth
+# id-to-id, not just averaged per id. TE_RADIUS doubles as how many already-committed ("frozen")
+# rows we RETAIN past the clock as fixed left-context, so the filter window is full right at the
+# seam to the rows already on the robot.
+TE_RADIUS = 2          # Gaussian half-width (ids) == # of frozen rows retained for context
+TE_SIGMA = 1.0         # Gaussian sigma in master-id units
+_te_ks = np.arange(-TE_RADIUS, TE_RADIUS + 1)
+TE_GAUSS = np.exp(-(_te_ks ** 2) / (2.0 * TE_SIGMA ** 2))
+TE_GAUSS = TE_GAUSS / TE_GAUSS.sum()   # normalized symmetric kernel, length 2*TE_RADIUS+1
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -120,6 +130,15 @@ class InferenceController:
         # Always averaged from raw — never re-buffer ensembled output, or smoothing compounds.
         self.use_temporal_ensemble = USE_TEMPORAL_ENSEMBLE
         self._te_buffer = deque(maxlen=TE_BUFFER_LEN)
+        self.te_radius = TE_RADIUS
+        # The long smoothed buffer fed to the robot: master_id -> EE row [pos3, rot6d6, grip1].
+        # Ids <= the env's queued_through are FROZEN (committed, read-only context); ids above it are
+        # MUTABLE and rebuilt every inference. Only the inference thread touches this -> no lock.
+        self._buffer = {}
+        # Last queued_through seen from the env. queued_through only climbs in normal streaming; a
+        # DROP (env re-anchored: E-stop lock_robot resets it to -1) means the live queue was cleared,
+        # so our buffer is stale and must be cleared too before rebuilding.
+        self._last_queued_through = -1
         # Manual step-through cursor: index of the NEXT unexecuted action row in the
         # current chunk. Reset to 0 on every fresh inference; advanced by
         # execute_inference_result. cursor >= chunk length => the chunk is fully consumed
@@ -134,6 +153,8 @@ class InferenceController:
         caller (the GUI starts env before this), so we only reset our cursor."""
         self._last_inference_obs_ts = 0.0
         self._te_buffer.clear()
+        self._buffer.clear()
+        self._last_queued_through = -1
         print("[InferenceController] InferenceController ready (env owned by caller).")
 
     def stop(self):
@@ -219,104 +240,148 @@ class InferenceController:
         # A fresh chunk restarts the manual step-through from the first row.
         self._exec_cursor = 0
 
-        # Temporal ensemble: buffer this RAW chunk, then average it with recent overlapping chunks
-        # in EE space. The ensembled chunk is what we publish + validate; the raw one stays only in
-        # the buffer for future averaging. No-op (returns the newest chunk) until chunks overlap.
+        # Log the RAW chunk (pre-smoothing), keyed by the master id it's anchored to.
         with open("chunks.jsonl", "a") as f:
             f.write(json.dumps({"obs_ts": sid, "action": action.tolist()}) + "\n")
 
-        print(f"[InferenceController] sending for temporal ensemble! | Time elapsed; {time.time()- ts}")
-        if self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10:
-            self._te_buffer.append((sid, action.copy()))      # keyed on master row id, not time
-            action = self._temporal_ensemble(sid, action)
-        print(f"[InferenceController] ensemble finished | Time elapsed; {time.time()- ts}")
+        # Buffer + smoothing (AUTO/streaming only): append this raw chunk, then rebuild the long
+        # smoothed master buffer over its MUTABLE tail (id > queued_through). The BUFFER — not this
+        # chunk — is what feeds the robot, so we maintain one continuous, id-to-id smooth sequence
+        # instead of re-emitting per-inference chunks. queue_status gives the live clock + commit
+        # frontier for the split. Manual one-shots (submit=False) bypass this: they feed the raw
+        # chunk directly and never touch the streaming buffer (which would otherwise grow unbounded
+        # while queued_through sits at -1, and pollute the chunk that manual step-through reads).
+        cur, queued_through = env.queue_status()
+        use_buffer = submit and self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10
+        if use_buffer:
+            if queued_through < self._last_queued_through:     # env re-anchored (E-stop) -> stale
+                self._buffer.clear()
+                self._te_buffer.clear()
+            self._last_queued_through = queued_through
+            self._te_buffer.append((sid, action.copy()))      # raw chunk, keyed on master row id
+            self._rebuild_buffer(queued_through)
+            base_id, buf = self._materialize()
+        else:                                                 # manual / TE off -> raw chunk direct
+            base_id, buf = sid, action
+        print(f"[InferenceController] buffer rebuilt ({buf.shape[0]} rows) | Time elapsed; {time.time()- ts}")
 
-        with open("TEchunks.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": float(ts), "action": action.tolist()}) + "\n")
-        # Publish for robot_info_server / visualisation. left_*_predict_* carry
-        # EE-pose data here (see robot_info_server.RobotInfo notes):
+        # Log the smoothed buffer (contiguous run actually fed to the robot) for offline inspection.
+        with open("buffer.jsonl", "a") as f:
+            f.write(json.dumps({"obs_ts": sid, "base_id": int(base_id),
+                                "clock": int(cur), "queued_through": int(queued_through),
+                                "buffer": buf.tolist()}) + "\n")
+        # Publish for robot_info_server / visualisation. left_*_predict_* carry EE-pose data here:
         #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
-        #   *_action_values = predicted action rows
+        #   *_action_values = the smoothed buffer rows
         # Skipped when robot_info is None (headless sim runner has no GUI to publish to).
         if self.robot_info is not None:
             with self.robot_info.lock:
                 self.robot_info.left_joint_predict_start_values = copy.deepcopy(obs['state'])
-                self.robot_info.left_joint_predict_action_values = action.tolist()
+                self.robot_info.left_joint_predict_action_values = buf.tolist()
                 self.robot_info.inference_timestamp = ts
 
-        print(f"[InferenceController] sending chunk for validation | Time elapsed; {time.time()- ts}")
-        if submit:
-            # AUTO-to-robot (streaming): validate this chunk on the preview sim and APPEND only its
-            # still-unqueued rows onto the live robot queue, keeping a small rolling buffer ahead of
-            # the master clock (no clear, no manual release). sid is the master row id the obs was
-            # anchored to; the env tags each appended substep by it and the release loop drains them
-            # one master id at a time, in strict order. A validation failure skips this inference;
-            # "nothing to append" (buffer already full) returns ok and is a normal no-op.
-            ok, reason = env.append_actions(action.tolist(), sid)
+        print(f"[InferenceController] feeding buffer to robot | Time elapsed; {time.time()- ts}")
+        if submit and buf.size:
+            # AUTO-to-robot (streaming): append_actions reads the live clock + queued_through itself
+            # and pulls the window [queued_through+1 .. clock+n] from this contiguous buffer (base_id
+            # = its first master id), validating + appending only the not-yet-queued ids. Rows are
+            # only ever appended (never cleared); the release loop drains one master id at a time.
+            ok, reason = env.append_actions(buf.tolist(), int(base_id))
             if not ok:
-                print(f"[InferenceController] auto: chunk skipped — {reason}")
+                print(f"[InferenceController] auto: append skipped — {reason}")
         return True
 
-    def _temporal_ensemble(self, id_new, new_action):
-        r"""ACT-style chunk-level temporal ensemble, in EE-pose space, aligned by MASTER ROW ID.
+    def _rebuild_buffer(self, queued_through):
+        r"""Rebuild the long smoothed master buffer (self._buffer: master_id -> EE row
+        [pos3, rot6d6, grip1]) from the recent RAW chunks in self._te_buffer. Two smoothing
+        dimensions, in EE-pose space, all aligned by MASTER ROW ID (row j of a chunk anchored at S
+        is at id S + j — the robot's own execution clock; see real_world/timing.py / HumanoidEnv):
 
-        Every row carries an absolute master id: row j of the chunk observed at master id S is at
-        id S + j (the robot's own execution clock — see real_world/timing.py / HumanoidEnv). So
-        averaging is just "group rows by equal absolute id." For each row k of the newest chunk
-        (absolute id id_new + k) we gather, from every buffered RAW chunk i (anchor id_i), its row
-        j = (id_new + k) - id_i if it exists (0 <= j < N), weight w = exp(-TE_M * age) (age = how
-        many inferences old, newest = 0), and take the weighted mean. The alignment is an EXACT
-        integer (no rounding) because master ids are discrete — and it tracks the arm's REAL progress
-        regardless of inference latency or execution speed, unlike the old wall-clock alignment which
-        assumed one row per ROW_DT of wall-clock and ran ahead whenever the arm lagged.
+          (a) ACROSS CHUNKS (per id): for each mutable id, gather every buffered chunk's row at the
+              SAME absolute id and take a recency-weighted mean (w = exp(-TE_M * age), age = how many
+              inferences old, newest = 0). Exact integer alignment, no rounding — tracks the arm's
+              real progress regardless of inference latency. This is the old ACT temporal ensemble.
+          (b) ALONG THE ID AXIS (neighbors): low-pass the per-id estimate with a symmetric Gaussian
+              of half-width TE_RADIUS so the sequence is smooth id-to-id, not just averaged per id.
 
-        pos (0:3) and rot6d (3:9) average linearly (rot6d is re-orthonormalised downstream by
-        rot6d_to_quat); gripper (9), already {0,1}, averages then re-thresholds at 0.5. With no id
-        overlap only the newest chunk contributes -> identity (safe no-op). Assumes the new raw chunk
-        is already in self._te_buffer.
+        The buffer is split by the env's commit frontier:
+          * FROZEN  (id <= queued_through): already committed to the robot. Kept (the last TE_RADIUS
+            of them) as READ-ONLY left-context for (b) so the seam to the rows already on the arm
+            stays continuous; never recomputed or rewritten.
+          * MUTABLE (id >  queued_through): rebuilt here every inference from passes (a) then (b).
 
-        self._te_buffer layout — a collections.deque(maxlen=TE_BUFFER_LEN), OLDEST -> NEWEST:
+        pos (0:3) and rot6d (3:9) smooth linearly (rot6d is re-orthonormalised downstream by
+        rot6d_to_quat); gripper (9), already {0,1}, is NOT low-passed along id (that would blur
+        open/close timing) — it carries the cross-chunk value, re-thresholded at 0.5. Assumes the new
+        raw chunk is already in self._te_buffer (deque(maxlen=TE_BUFFER_LEN), OLDEST -> NEWEST), each
+        element a (master_id, raw chunk (N,10)) tuple; a chunk leaves only by eviction / clear()."""
+        raw = list(self._te_buffer)                       # oldest -> newest
+        if not raw:
+            return
+        R = self.te_radius
+        newest_idx = len(raw) - 1
+        max_id = max(sid + a.shape[0] - 1 for sid, a in raw)
+        min_sid = min(sid for sid, _ in raw)
+        # First MUTABLE id (everything <= queued_through is frozen). Bounded below by the oldest
+        # buffered chunk: no id below any chunk can have a cross-chunk estimate, so don't iterate
+        # there (after an E-stop re-anchor queued_through+1 would otherwise be ~0 while max_id is the
+        # live clock, spinning over thousands of empty ids).
+        mut_lo = max(queued_through + 1, min_sid)
 
-            self._te_buffer = [
-                (id_0, act_0),     # oldest buffered chunk
-                (id_1, act_1),
-                ...
-                (id_m, act_m),     # newest = the chunk being ensembled now (age 0)
-            ]
-
-        each element is a (master_id, chunk) tuple, where id_i is the int master row id the obs was
-        anchored to and act_i is the RAW (pre-ensemble) np.ndarray of shape (N, 10):
-
-            act_i = [
-                [px, py, pz,  c0x, c0y, c0z,  c1x, c1y, c1z,  g],   # row 0   -> master id  id_i + 0
-                [px, py, pz,  c0x, c0y, c0z,  c1x, c1y, c1z,  g],   # row 1   -> master id  id_i + 1
-                ...
-                [px, py, pz,  c0x, c0y, c0z,  c1x, c1y, c1z,  g],   # row N-1 -> master id  id_i + N-1
-            ]    \___ pos(3) ___/  \____ 6D rotation (3:9) ____/  \grip/
-
-        New chunks are append()ed on the RIGHT, so the oldest is auto-evicted once maxlen is
-        exceeded (FIFO by age); a chunk is NEVER removed by being read, only by eviction / clear()."""
-        N = new_action.shape[0]
-        out = new_action.copy()
-        buf = list(self._te_buffer)                 # oldest -> newest
-        newest_idx = len(buf) - 1
-        for k in range(N):
-            target_id = id_new + k                  # absolute master row id of this row
+        # (a) cross-chunk recency-weighted mean per mutable id (the ACT temporal ensemble).
+        tentative = {}
+        for tid in range(mut_lo, max_id + 1):
             rows, weights = [], []
-            for idx, (id_i, act_i) in enumerate(buf):
-                j = target_id - id_i                # exact integer alignment (no rounding)
-                if 0 <= j < act_i.shape[0]:
-                    age = newest_idx - idx              # newest chunk -> 0
-                    rows.append(act_i[j])
-                    weights.append(np.exp(-TE_M * age))
-            if len(rows) <= 1:                          # only the newest covers this id -> identity
+            for idx, (sid, a) in enumerate(raw):
+                j = tid - sid                             # exact integer alignment (no rounding)
+                if 0 <= j < a.shape[0]:
+                    rows.append(a[j])
+                    weights.append(np.exp(-TE_M * (newest_idx - idx)))   # newest chunk -> age 0
+            if rows:
+                w = np.asarray(weights, dtype=np.float64)
+                w /= w.sum()
+                tentative[tid] = (w[:, None] * np.asarray(rows, dtype=np.float64)).sum(axis=0)
+
+        # (b) symmetric Gaussian along id over the mutable region; frozen rows (<= queued_through)
+        # are fixed left-context. Mutable neighbors read the PRE-smoothing 'tentative' estimate so
+        # this stays a plain symmetric filter (not a recursive/IIR one).
+        for tid in range(mut_lo, max_id + 1):
+            if tid not in tentative:
                 continue
-            w = np.asarray(weights, dtype=np.float64)
-            w /= w.sum() #normalization
-            avg = (w[:, None] * np.asarray(rows, dtype=np.float64)).sum(axis=0)
-            out[k, :9] = avg[:9]                         # pos + rot6d (linear)
-            out[k, 9] = 1.0 if avg[9] >= 0.5 else 0.0    # gripper re-binarised
-        return out
+            acc = np.zeros(9, dtype=np.float64)
+            wsum = 0.0
+            for d in range(-R, R + 1):
+                nid = tid + d
+                ctx = self._buffer.get(nid) if nid <= queued_through else tentative.get(nid)
+                if ctx is None:                           # past the buffer edges -> just skip
+                    continue
+                k = TE_GAUSS[d + R]
+                acc += k * np.asarray(ctx[:9], dtype=np.float64)
+                wsum += k
+            out = tentative[tid].copy()
+            if wsum > 0.0:
+                out[:9] = acc / wsum                      # pos + rot6d (linear) smoothed along id
+            out[9] = 1.0 if out[9] >= 0.5 else 0.0        # gripper re-binarised (not low-passed)
+            self._buffer[tid] = out                       # write MUTABLE ids only; frozen untouched
+
+        # Prune frozen rows older than the retention window (keep the last TE_RADIUS for context).
+        cutoff = queued_through - R + 1
+        for k in [k for k in self._buffer if k < cutoff]:
+            del self._buffer[k]
+
+    def _materialize(self):
+        """The contiguous run of self._buffer starting at its lowest id, stopping at the first gap.
+        Returns (base_id, ndarray(M,10)); (-1, empty) when the buffer is empty. append_actions maps
+        master id -> row by index = id - base_id, so the run handed to it MUST be contiguous."""
+        if not self._buffer:
+            return -1, np.empty((0, 10), dtype=np.float32)
+        lo = min(self._buffer)
+        rows = []
+        i = lo
+        while i in self._buffer:                           # walk forward, stop at first missing id
+            rows.append(self._buffer[i])
+            i += 1
+        return lo, np.asarray(rows, dtype=np.float32)
 
     def inference_once(self) -> bool:
         """Predict + publish only (no execution).
