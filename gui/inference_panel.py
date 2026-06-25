@@ -1,0 +1,549 @@
+"""推理控制面板：左夹爪、策略推理（手动单步 / 自动运行）、仿真预览与真机释放、子步监视。
+
+只保留推理相关结构与左夹爪控制，原抓取/坐标/VR/手动调试已移除。
+"""
+import json
+import pathlib
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+import numpy as np
+
+# Persisted tuning values live next to the app (humanoid/tuning_config.json). Loaded on startup and
+# rewritten whenever the operator changes a knob, so tuning survives a UI restart.
+TUNING_CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "tuning_config.json"
+
+
+def _grip_label(grip):
+    """Binary {0,1} gripper command -> readable label for the substep monitor."""
+    return "闭(1)" if float(grip) >= 0.5 else "开(0)"
+
+
+class InferenceMixin:
+    """策略推理 + 左夹爪 + 仿真验证/真机释放 + 子步监视。"""
+
+    @property
+    def left_arm_joint_values(self):
+        return self.robot.arm_joint_states()[0][:7]
+
+    # ------------------------------------------------------------------ #
+    #  左夹爪                                                              #
+    # ------------------------------------------------------------------ #
+    def move_gripper(self, side, position):
+        """控制夹爪（仅左夹爪在界面暴露；右夹爪保持不动）。"""
+        try:
+            pos = float(np.clip(position, 0.0, 1.0))
+            if side == "left":
+                self.left_gripper_pos = pos
+            else:
+                self.right_gripper_pos = pos
+            self.robot.move_gripper([self.left_gripper_pos, self.right_gripper_pos])
+            self.status_text.set(f"{'左' if side == 'left' else '右'}夹爪 -> {'闭合' if pos >= 0.5 else '张开'}")
+        except Exception as e:
+            self.status_text.set(f"夹爪控制失败: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  手动单步推理                                                        #
+    # ------------------------------------------------------------------ #
+    def _run_inference_once(self):
+        """推理一次, off the Tk thread (the server round-trip can block for seconds). On
+        completion a fresh chunk exists, so re-enable the step-through buttons."""
+        def worker():
+            try:
+                ok = self.inference.inference_once()
+                remaining = self.inference.steps_remaining()
+                msg = (f"✅ 推理完成，共 {remaining} 步" if ok else "❌ 推理失败")
+            except Exception as e:
+                msg = f"❌ 推理异常：{e}"
+            def done():
+                self.status_text.set(msg)
+                self._refresh_validation_buttons()
+                self._set_manual_busy(False)       # idle again -> tuning unlocked (ALWAYS runs)
+            self.root.after(0, done)
+        self.status_text.set("推理中…")
+        self._set_manual_busy(True)                # lock tuning while inferencing
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_validation(self, once=False):
+        """Step the last prediction through the sim off the Tk thread (it can take a few seconds
+        while the sim plays the trajectory) and report the result to the status bar.
+
+        once=True validates+stages the NEXT unexecuted action row; once=False the REMAINING
+        rows. Both become no-ops once the chunk is fully consumed (see _refresh_validation_buttons).
+        """
+        def worker():
+            ok, reason = self.inference.execute_inference_result(once=once)
+            remaining = self.inference.steps_remaining()
+            msg = (f"✅ 仿真验证通过（剩余 {remaining} 步），可释放到真机" if ok
+                   else f"❌ 仿真验证失败：{reason}")
+            def done():
+                self.status_text.set(msg)
+                self._refresh_validation_buttons()
+                self._refresh_release_buttons()    # a successful validate stages new substeps
+                self._set_manual_busy(False)       # idle again -> tuning unlocked
+            self.root.after(0, done)
+        self.status_text.set("仿真验证中…")
+        self._set_manual_busy(True)                # lock tuning while validating
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_validation_buttons(self):
+        """Enable the 单步/整条 buttons only while the current chunk has unexecuted steps; grey
+        them out (and they no-op anyway) once it's consumed or there's no prediction."""
+        try:
+            remaining = self.inference.steps_remaining()
+        except Exception:
+            remaining = 0
+        flag = "!disabled" if remaining > 0 else "disabled"
+        for name in ("_btn_validate_step", "_btn_validate_rest"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.state([flag])
+
+    # ------------------------------------------------------------------ #
+    #  自动运行（推理 -> 仿真验证 -> 真机）                                  #
+    # ------------------------------------------------------------------ #
+    def _start_auto_inference(self):
+        """Begin auto-inference -> robot. Validation runs through the preview sim, so launch it
+        first if needed, then wait (non-blocking) until env.sim is ready before starting the loop."""
+        if getattr(self.env, "sim", None) is None:
+            self.launch_sim()
+        self.status_text.set("⏳ 启动仿真中，准备自动运行…")
+        self._auto_pending = True            # lock tuning from the moment auto-run is requested
+        self._refresh_tuning_state()
+        self._await_sim_then_auto()
+
+    def _await_sim_then_auto(self, tries=0):
+        """Poll (via root.after, non-blocking) for the preview sim to come up, then start auto."""
+        if getattr(self.env, "sim", None) is not None:
+            self.inference.auto_inference()
+            self._auto_pending = False       # is_auto_inference now carries the lock
+            self.status_text.set("⚠ 自动运行中（推理→仿真验证→真机，急停可随时停止）")
+            self._refresh_tuning_state()     # is_auto_inference now True -> stays locked
+        elif tries < 50:                     # ~5s budget for the sim thread to build
+            self.root.after(100, lambda: self._await_sim_then_auto(tries + 1))
+        else:
+            self._auto_pending = False
+            self.status_text.set("⚠ 仿真启动超时，无法开始自动运行")
+            self._refresh_tuning_state()     # auto never started -> unlock
+
+    def _stop_auto_inference(self):
+        """Stop feeding new chunks; the release loop drains whatever is queued (use 急停 to halt)."""
+        self.inference.auto_inference(stop=True)
+        self.status_text.set("■ 已停止自动运行（队列将自然排空；急停可立即停止）")
+        self._refresh_tuning_state()         # idle again -> unlock tuning
+
+    # ------------------------------------------------------------------ #
+    #  真机释放（手动单步路径）                                             #
+    # ------------------------------------------------------------------ #
+    def _run_release_substeps(self, remaining=False, count=1):
+        """释放 staged substeps to the real robot. remaining=True streams ALL staged substeps;
+        otherwise releases the next `count` (1 or 10). Releases whatever is left if fewer remain.
+        No-op (with a status note) when nothing is staged."""
+        if remaining:
+            n = self.env.release_remaining_substeps()
+        else:
+            n = self.env.release_n_substeps(count)
+        staged = self.env.staged_substeps
+        if n > 0:
+            self.status_text.set(f"🚀 已下发 {n} 条指令到真机（剩余待释放 {staged} 子步）")
+        else:
+            self.status_text.set("⚠ 没有待释放的子步（先在仿真中验证）")
+        self._refresh_release_buttons()            # staged buffer shrank (maybe now empty)
+
+    def _refresh_release_buttons(self):
+        """Enable the 释放(单步)/释放(剩余) buttons only while substeps are staged for release;
+        grey them out (and they no-op anyway) once the staged buffer is empty."""
+        try:
+            staged = self.env.staged_substeps
+        except Exception:
+            staged = 0
+        flag = "!disabled" if staged > 0 else "disabled"
+        for name in ("_btn_release_step", "_btn_release_ten", "_btn_release_rest"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.state([flag])
+
+    # ------------------------------------------------------------------ #
+    #  平滑参数（实时可调）                                                 #
+    # ------------------------------------------------------------------ #
+    def _apply_smoothing(self, *_, announce=True):
+        """Read the smoothing widgets (radius/σ/m/buffer) and push them to the inference controller
+        live. Tolerates a partially-typed Spinbox value (TclError) by ignoring that update.
+        Refused while inference is running (announce=True path) — tuning is idle-only."""
+        if announce and self._tuning_locked():
+            return
+        try:
+            radius = int(self._sm_radius_var.get())
+            sigma = float(self._sm_sigma_var.get())
+            m = float(self._sm_m_var.get())
+            buflen = int(self._sm_buflen_var.get())
+        except (tk.TclError, ValueError):
+            return
+        radius, sigma, m = self.inference.set_smoothing(radius=radius, sigma=sigma, m=m)
+        buflen = self.inference.set_buffer_len(buflen)
+        self._sm_readout_var.set(f"当前：radius={radius}  σ={sigma:.2f}  m={m:.3f}  buffer={buflen}")
+        if announce:
+            self.status_text.set(f"平滑参数已更新：radius={radius}  σ={sigma:.2f}  m={m:.3f}  buffer={buflen}")
+            self._save_tuning()
+
+    def _apply_exec_knobs(self, *_, announce=True):
+        """Read the execution widgets (speed_scale / append_ahead) and push them to the env live.
+        Affects only chunks validated after the change. Refused while inference is running."""
+        if announce and self._tuning_locked():
+            return
+        try:
+            speed = float(self._ex_speed_var.get())
+            ahead = int(self._ex_ahead_var.get())
+        except (tk.TclError, ValueError):
+            return
+        speed, sub = self.env.set_speed_scale(speed)
+        self.env.append_ahead_rows = max(1, ahead)
+        self._ex_readout_var.set(
+            f"当前：speed={speed:.2f} (子步/行={sub})  append_ahead={self.env.append_ahead_rows}")
+        if announce:
+            self.status_text.set(
+                f"执行参数已更新：speed={speed:.2f}  子步/行={sub}  append_ahead={self.env.append_ahead_rows}")
+            self._save_tuning()
+
+    # ------------------------------------------------------------------ #
+    #  调参锁（仅空闲时可调）+ 持久化                                        #
+    # ------------------------------------------------------------------ #
+    def _tuning_locked(self):
+        """Tuning is allowed only when NOTHING is inferencing: no auto-inference loop (or one being
+        started), and no manual inference/validation worker in flight."""
+        return bool(getattr(self.inference, "is_auto_inference", False)
+                    or getattr(self, "_manual_busy", False)
+                    or getattr(self, "_auto_pending", False))
+
+    def _refresh_tuning_state(self):
+        """Enable the tuning widgets only while idle; grey them out + show a hint while running."""
+        locked = self._tuning_locked()
+        for w in getattr(self, "_tuning_widgets", []):
+            try:
+                w.state(["disabled"] if locked else ["!disabled"])
+            except tk.TclError:
+                pass
+        if getattr(self, "_tuning_hint_var", None) is not None:
+            self._tuning_hint_var.set("⛔ 运行中：停止推理/自动运行后才能调参" if locked
+                                      else "✅ 空闲：可调参（修改即保存）")
+
+    def _set_manual_busy(self, busy):
+        self._manual_busy = busy
+        self._refresh_tuning_state()
+
+    def _load_and_apply_tuning(self):
+        """Load persisted tuning (if any) and apply it to the controller/env. Called once at startup
+        BEFORE the panel is built, so the widgets initialize from the restored values."""
+        try:
+            cfg = json.loads(TUNING_CONFIG_PATH.read_text())
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            print(f"[tuning] load failed ({e}); using defaults")
+            return
+        try:
+            self.inference.set_smoothing(radius=cfg.get("te_radius"),
+                                         sigma=cfg.get("te_sigma"), m=cfg.get("te_m"))
+            if cfg.get("te_buffer_len") is not None:
+                self.inference.set_buffer_len(cfg["te_buffer_len"])
+            if cfg.get("speed_scale") is not None:
+                self.env.set_speed_scale(cfg["speed_scale"])
+            if cfg.get("append_ahead_rows") is not None:
+                self.env.append_ahead_rows = max(1, int(cfg["append_ahead_rows"]))
+            print(f"[tuning] restored from {TUNING_CONFIG_PATH}")
+        except Exception as e:
+            print(f"[tuning] apply failed: {e}")
+
+    def _save_tuning(self):
+        """Persist the current tuning to disk (called whenever the operator changes a knob)."""
+        cfg = {
+            "_note": ("Live tuning overrides for robot_control_gui. Loaded ONCE at GUI startup; the "
+                      "code constants (TE_* in inference_controller.py, APPEND_AHEAD_ROWS in "
+                      "humanoid_env.py, SPEED_SCALE in timing.py) are only defaults when a key is "
+                      "absent here. Hand-edits take effect on the next launch. Delete this file to "
+                      "reset to code defaults."),
+            "te_radius": self.inference.te_radius,        # id-axis Gaussian half-width / frozen rows
+            "te_sigma": self.inference.te_sigma,          # id-axis Gaussian sigma
+            "te_m": self.inference.te_m,                  # cross-chunk recency decay
+            "te_buffer_len": self.inference.te_buffer_len,  # # recent raw chunks averaged
+            "speed_scale": self.env.speed_scale,          # fraction of demo speed
+            "append_ahead_rows": self.env.append_ahead_rows,  # rows queued ahead of the clock
+        }
+        try:
+            TUNING_CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        except Exception as e:
+            print(f"[tuning] save failed: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  子步监视：实时左臂 7 关节 + 待释放子步滚动表                          #
+    # ------------------------------------------------------------------ #
+    def _update_substep_monitor(self):
+        """Refresh the live joints readout + the rolling next-10 staged-substep table (each cell
+        shows the joint value and its delta vs the previous row / the live pose). Reschedules
+        itself ~5 Hz; the staged buffer draining in real time produces the rolling effect."""
+        try:
+            # --- live actual left-arm joints + gripper (delta reference for substep #0) ---
+            try:
+                actual = list(self.left_arm_joint_values)
+            except Exception:
+                actual = None
+            try:
+                live_grip = float(self.robot.gripper_states()[0][0])  # left gripper {0,1}
+            except Exception:
+                live_grip = None
+            if actual is not None and len(actual) >= 7:
+                txt = "   ".join(f"J{k+1}:{actual[k]:+.3f}" for k in range(7))
+                if live_grip is not None:
+                    txt += f"   夹爪:{_grip_label(live_grip)}"
+                self._monitor_actual_var.set(txt)
+                prev = np.asarray(actual[:7], dtype=np.float64)
+            else:
+                self._monitor_actual_var.set("（无法读取关节）")
+                prev = None
+
+            # --- next up-to-10 staged substeps, with per-joint delta vs the previous row ---
+            try:
+                subs = self.env.staged_preview(self._monitor_rows)
+            except Exception:
+                subs = []
+            for i in range(self._monitor_rows):
+                iid = f"subrow{i}"
+                if i < len(subs):
+                    q, grip = subs[i]
+                    q = np.asarray(q, dtype=np.float64)
+                    if prev is not None and len(prev) >= 7:
+                        d = q - prev
+                        vals = [f"{q[k]:+.3f} (Δ{d[k]:+.3f})" for k in range(7)]
+                    else:
+                        vals = [f"{q[k]:+.3f}" for k in range(7)]
+                    self._monitor_tree.item(iid, values=(i, *vals, _grip_label(grip)))
+                    prev = q
+                else:
+                    self._monitor_tree.item(iid, values=(i, *[""] * 8))
+        except tk.TclError:
+            self._monitor_after_id = None       # widget destroyed (window closed) -> stop
+            return
+        finally:
+            if getattr(self, "_monitor_after_id", None) is not None:
+                self._monitor_after_id = self.root.after(200, self._update_substep_monitor)
+
+    # ------------------------------------------------------------------ #
+    #  面板布局                                                            #
+    # ------------------------------------------------------------------ #
+    def setup_inference_panel(self, parent):
+        """推理控制面板：左夹爪 / 仿真预览 / 自动运行 / 手动单步 / 真机释放 / 子步监视。"""
+        # 用 Canvas+滚动条 包裹，内容多时可滚动
+        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f5f6f8")
+        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # 鼠标滚轮滚动（仅当指针在面板内时生效，避免抢占其他控件）。跨平台：
+        # Windows/macOS 用 <MouseWheel>(event.delta)，X11/Linux 用 <Button-4>/<Button-5>。
+        def _on_wheel(event):
+            delta = 1 if getattr(event, "num", None) == 5 else -1 if getattr(event, "num", None) == 4 \
+                else (-1 if event.delta > 0 else 1)
+            canvas.yview_scroll(delta, "units")
+        def _bind_wheel(_):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+        def _unbind_wheel(_):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        # ===== 左夹爪 =====
+        sec_grip = ttk.LabelFrame(body, text="  🤏  左夹爪  ")
+        sec_grip.pack(fill=tk.X, padx=10, pady=(10, 6))
+        row = ttk.Frame(sec_grip)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="张开", style="Success.TButton",
+                   command=lambda: self.move_gripper("left", 0.0)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="闭合", style="Warn.TButton",
+                   command=lambda: self.move_gripper("left", 1.0)).pack(side=tk.LEFT, padx=6)
+
+        # ===== 仿真预览（自动运行 / 仿真验证都依赖它先启动）=====
+        sec_sim = ttk.LabelFrame(body, text="  🟦  仿真预览（自动运行 / 仿真验证前先启动）  ")
+        sec_sim.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(sec_sim)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="启动仿真预览", style="Primary.TButton",
+                   command=lambda: self.launch_sim()).pack(side=tk.LEFT, padx=(0, 6))
+
+        # ===== 自动运行（推理 -> 仿真验证 -> 真机）=====
+        sec_auto = ttk.LabelFrame(body, text="  ▶  自动运行  ")
+        sec_auto.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(sec_auto)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="⚠ 开始自动运行", style="Danger.TButton",
+                   command=lambda: self._start_auto_inference()).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="■ 停止自动运行", style="Muted.TButton",
+                   command=lambda: self._stop_auto_inference()).pack(side=tk.LEFT, padx=6)
+
+        # ===== 急停（最显眼，始终可用）=====
+        sec_estop = ttk.LabelFrame(body, text="  ⛔  急停  ")
+        sec_estop.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(sec_estop)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        # E-STOP: latched; drops pending + actively holds. Physical E-stop remains primary.
+        # It also clears the staged buffer, so grey out the release buttons.
+        ttk.Button(row, text="⛔ 急停（立即停止并保持）", style="Danger.TButton",
+                   command=lambda: (self.env.lock_robot(), self._refresh_release_buttons())
+                   ).pack(side=tk.LEFT, padx=(0, 6))
+        # Clear the latched E-stop (only after the operator confirms the arm is safe).
+        ttk.Button(row, text="重置急停", style="Muted.TButton",
+                   command=lambda: self.env.reset_estop()).pack(side=tk.LEFT, padx=6)
+
+        # ===== 手动单步（推理一次 -> 仿真验证 -> 释放）=====
+        sec_manual = ttk.LabelFrame(body, text="  🧠  手动单步  ")
+        sec_manual.pack(fill=tk.X, padx=10, pady=6)
+
+        manual_row = ttk.Frame(sec_manual)
+        manual_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(manual_row, text="① 推理:", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(manual_row, text="推理一次", style="Primary.TButton",
+                   command=lambda: self._run_inference_once()).pack(side=tk.LEFT, padx=4)
+        # "仿真验证" = validate-in-sim (step + self-collision + readback); stages the sim-validated
+        # trajectory but does NOT touch the robot. Run off the Tk thread so the GUI doesn't freeze.
+        self._btn_validate_step = ttk.Button(manual_row, text="② 仿真验证(单步)", style="Primary.TButton",
+                   command=lambda: self._run_validation(once=True))
+        self._btn_validate_step.pack(side=tk.LEFT, padx=4)
+        self._btn_validate_rest = ttk.Button(manual_row, text="② 仿真验证(整条)", style="Primary.TButton",
+                   command=lambda: self._run_validation(once=False))
+        self._btn_validate_rest.pack(side=tk.LEFT, padx=4)
+        self._refresh_validation_buttons()       # no prediction yet -> disabled until 推理一次
+
+        release_row = ttk.Frame(sec_manual)
+        release_row.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Label(release_row, text="③ 释放真机:", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_release_step = ttk.Button(release_row, text="🚀 释放(单步)", style="Danger.TButton",
+                   command=lambda: self._run_release_substeps(remaining=False, count=1))
+        self._btn_release_step.pack(side=tk.LEFT, padx=4)
+        self._btn_release_ten = ttk.Button(release_row, text="🚀 释放(10步)", style="Danger.TButton",
+                   command=lambda: self._run_release_substeps(remaining=False, count=10))
+        self._btn_release_ten.pack(side=tk.LEFT, padx=4)
+        self._btn_release_rest = ttk.Button(release_row, text="🚀 释放(剩余)", style="Danger.TButton",
+                   command=lambda: self._run_release_substeps(remaining=True))
+        self._btn_release_rest.pack(side=tk.LEFT, padx=4)
+        self._refresh_release_buttons()          # nothing staged yet -> disabled until 仿真验证
+
+        # 调参锁状态：仅在空闲（无手动/自动推理）时可调；下列控件按状态启用/禁用。
+        self._manual_busy = False
+        self._auto_pending = False
+        self._tuning_widgets = []
+
+        # ===== 平滑参数（仅空闲可调，修改即保存）=====
+        sec_smooth = ttk.LabelFrame(body, text="  🎛  平滑参数（仅空闲可调，修改即保存）  ")
+        sec_smooth.pack(fill=tk.X, padx=10, pady=6)
+        grid = ttk.Frame(sec_smooth)
+        grid.pack(fill=tk.X, padx=8, pady=8)
+        grid.columnconfigure(1, weight=1)
+
+        self._tuning_hint_var = tk.StringVar()
+        ttk.Label(grid, textvariable=self._tuning_hint_var,
+                  style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        # 当前值取自推理控制器/env（已应用持久化的设置），保证界面与运行时一致
+        self._sm_radius_var = tk.IntVar(value=self.inference.te_radius)
+        self._sm_sigma_var = tk.DoubleVar(value=round(self.inference.te_sigma, 2))
+        self._sm_m_var = tk.DoubleVar(value=round(self.inference.te_m, 3))
+
+        # TE 半径：id 轴高斯半宽 = 冻结上下文行数。越大越平滑，但更滞后。
+        ttk.Label(grid, text="TE 半径 (radius):", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
+        self._tuning_widgets.append(ttk.Spinbox(grid, from_=0, to=8, increment=1, width=6,
+                    textvariable=self._sm_radius_var, command=self._apply_smoothing))
+        self._tuning_widgets[-1].grid(row=1, column=2, sticky="e", padx=4)
+
+        # TE σ：窗口内高斯形状。越大窗口内平滑越强（建议 <= radius）。
+        ttk.Label(grid, text="TE σ (sigma):", anchor=tk.W).grid(row=2, column=0, sticky="w", pady=3)
+        self._tuning_widgets.append(ttk.Scale(grid, from_=0.3, to=4.0, orient=tk.HORIZONTAL,
+                  variable=self._sm_sigma_var, command=lambda _v: self._apply_smoothing()))
+        self._tuning_widgets[-1].grid(row=2, column=1, sticky="ew", padx=8)
+
+        # TE 衰减 m：跨 chunk 同 id 均值的时近衰减。越大越信任最新 chunk（更灵敏更糙）。
+        ttk.Label(grid, text="TE 衰减 (m):", anchor=tk.W).grid(row=3, column=0, sticky="w", pady=3)
+        self._tuning_widgets.append(ttk.Scale(grid, from_=0.0, to=0.5, orient=tk.HORIZONTAL,
+                  variable=self._sm_m_var, command=lambda _v: self._apply_smoothing()))
+        self._tuning_widgets[-1].grid(row=3, column=1, sticky="ew", padx=8)
+
+        # TE 缓冲长度：参与跨 chunk 平均的最近 chunk 数（重叠深度）。越大平均越深（更平滑）。
+        ttk.Label(grid, text="TE 缓冲长度 (buffer):", anchor=tk.W).grid(row=4, column=0, sticky="w", pady=3)
+        self._sm_buflen_var = tk.IntVar(value=self.inference.te_buffer_len)
+        self._tuning_widgets.append(ttk.Spinbox(grid, from_=1, to=16, increment=1, width=6,
+                    textvariable=self._sm_buflen_var, command=self._apply_smoothing))
+        self._tuning_widgets[-1].grid(row=4, column=2, sticky="e", padx=4)
+
+        self._sm_readout_var = tk.StringVar()
+        ttk.Label(grid, textvariable=self._sm_readout_var,
+                  style="Value.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        # ===== 执行参数（速度 / 队列提前，作用于后续推理）=====
+        sec_exec = ttk.LabelFrame(body, text="  ⚙  执行参数（仅空闲可调，修改即保存）  ")
+        sec_exec.pack(fill=tk.X, padx=10, pady=6)
+        egrid = ttk.Frame(sec_exec)
+        egrid.pack(fill=tk.X, padx=8, pady=8)
+        egrid.columnconfigure(1, weight=1)
+
+        # 速度：占演示速度的比例。越小越慢、每行子步更多（更平滑），且一个 chunk 持续更久。
+        ttk.Label(egrid, text="速度 (speed_scale):", anchor=tk.W).grid(row=0, column=0, sticky="w", pady=3)
+        self._ex_speed_var = tk.DoubleVar(value=round(self.env.speed_scale, 2))
+        self._tuning_widgets.append(ttk.Scale(egrid, from_=0.05, to=1.0, orient=tk.HORIZONTAL,
+                  variable=self._ex_speed_var, command=lambda _v: self._apply_exec_knobs()))
+        self._tuning_widgets[-1].grid(row=0, column=1, sticky="ew", padx=8)
+
+        # 队列提前：领先主时钟的行数 = 提交距离。越小越晚冻结（提交前平均更充分，更平滑），但缓冲余量更少。
+        ttk.Label(egrid, text="队列提前 (append_ahead):", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
+        self._ex_ahead_var = tk.IntVar(value=self.env.append_ahead_rows)
+        self._tuning_widgets.append(ttk.Spinbox(egrid, from_=1, to=20, increment=1, width=6,
+                    textvariable=self._ex_ahead_var, command=self._apply_exec_knobs))
+        self._tuning_widgets[-1].grid(row=1, column=2, sticky="e", padx=4)
+
+        self._ex_readout_var = tk.StringVar()
+        ttk.Label(egrid, textvariable=self._ex_readout_var,
+                  style="Value.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self._apply_smoothing(announce=False)    # initialize the readout labels (no save/lock-check)
+        self._apply_exec_knobs(announce=False)
+        self._refresh_tuning_state()             # set initial enabled/disabled + hint
+
+        # ===== 子步监视：实时左臂 7 关节 + 待释放子步滚动表（含每关节增量） =====
+        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（左臂 7 关节，单位 rad）  ")
+        sec_monitor.pack(fill=tk.X, padx=10, pady=6)
+
+        live_row = ttk.Frame(sec_monitor)
+        live_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(live_row, text="实时关节:", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self._monitor_actual_var = tk.StringVar(value="（等待数据）")
+        ttk.Label(live_row, textvariable=self._monitor_actual_var,
+                  style="Value.TLabel").pack(side=tk.LEFT)
+
+        ttk.Label(sec_monitor,
+                  text="待释放子步（# 0 = 下一个释放；括号内为相对上一行/实时关节的增量 Δ）",
+                  anchor=tk.W).pack(fill=tk.X, padx=8, pady=(2, 2))
+
+        cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "grip")
+        tree = ttk.Treeview(sec_monitor, columns=cols, show="headings", height=10)
+        tree.heading("idx", text="#")
+        tree.column("idx", width=32, anchor="center", stretch=True)
+        for k, c in enumerate(cols[1:8], start=1):
+            tree.heading(c, text=f"J{k}")
+            tree.column(c, width=120, anchor="center", stretch=True)
+        tree.heading("grip", text="夹爪")
+        tree.column("grip", width=72, anchor="center", stretch=True)
+        tree.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._monitor_tree = tree
+        self._monitor_rows = 10
+        for i in range(self._monitor_rows):
+            tree.insert("", "end", iid=f"subrow{i}", values=(i, *[""] * 8))
+
+        # Start the periodic refresh (idempotent — only schedules once).
+        if getattr(self, "_monitor_after_id", None) is None:
+            self._monitor_after_id = self.root.after(200, self._update_substep_monitor)

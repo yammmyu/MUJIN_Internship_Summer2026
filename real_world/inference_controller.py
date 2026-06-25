@@ -33,7 +33,9 @@ from collections import deque
 from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 from real_world.timing import RECORD_HZ   # single source of timing truth (see timing.py)
 
-INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (max overlap for TE)
+INFERENCE_HZ = 0  # TUNE (Hz): auto-inference cadence cap. <=0 -> run back-to-back = MAX chunk
+                  # overlap, so TE has the most chunks to average (smoother). A positive cap slows
+                  # the loop (less overlap, less smoothing) but cuts policy-server load.
 
 # --- Temporal ensemble (ACT-style) -------------------------------------------------
 # Chunk-level EE-space smoothing: each new chunk is averaged against recent overlapping chunks
@@ -45,19 +47,38 @@ INFERENCE_HZ = 0  # auto-inference cadence cap (Hz); <=0 -> run back-to-back (ma
 # horizon > inferences-worth-of-rows); below that it passes the newest chunk through (identity).
 # Aligning by master id (not wall-clock) tracks the arm's real progress, so the merge can't run
 # ahead of the arm when execution lags real-time (latency / slow-down / control-loop jitter).
-USE_TEMPORAL_ENSEMBLE = True
-TE_M = 0.02            # decay; larger -> trust the newest chunk more (less averaging)
-TE_BUFFER_LEN = 8      # how many recent raw chunks to keep for averaging
+# ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+# │ PERSISTED / LIVE-TUNABLE (tuning_config.json): the four constants below — TE_M, TE_BUFFER_LEN,│
+# │ TE_RADIUS, TE_SIGMA — are only DEFAULT SEEDS. The GUI restores the operator's saved values    │
+# │ from tuning_config.json at startup and tunes them live (InferenceController.set_smoothing /    │
+# │ set_buffer_len). Editing a literal here only changes the fallback used when there is no saved  │
+# │ JSON entry (e.g. a headless run that never loads the file). It is NOT the live runtime value:  │
+# │ that is inference.te_m / .te_buffer_len / .te_radius / .te_sigma.                              │
+# └──────────────────────────────────────────────────────────────────────────────────────────┘
+USE_TEMPORAL_ENSEMBLE = True   # TUNE: master on/off for ALL temporal-ensemble smoothing (bool).
+TE_M = 0.02            # [persisted: tuning_config.json] TUNE [~0.005..0.5]: recency decay of the
+                       # per-id cross-chunk mean. LARGER -> trust the newest chunk more (less
+                       # averaging, more reactive, rougher); SMALLER -> heavier averaging (smoother).
+TE_BUFFER_LEN = 8      # [persisted: tuning_config.json] TUNE [~2..16]: how many recent raw chunks are
+                       # kept = max overlap depth to average over. More -> deeper averaging (smoother).
 # Neighbor smoothing along the master-id axis (the second smoothing dimension). The smoothed buffer
 # is low-passed by a symmetric Gaussian of half-width TE_RADIUS so the long sequence stays smooth
 # id-to-id, not just averaged per id. TE_RADIUS doubles as how many already-committed ("frozen")
 # rows we RETAIN past the clock as fixed left-context, so the filter window is full right at the
 # seam to the rows already on the robot.
-TE_RADIUS = 2          # Gaussian half-width (ids) == # of frozen rows retained for context
-TE_SIGMA = 1.0         # Gaussian sigma in master-id units
+TE_RADIUS = 6          # [persisted: tuning_config.json] TUNE [~1..8]: Gaussian half-width (ids) == #
+                       # of frozen rows retained for context. LARGER -> smoother id-to-id, but more
+                       # lag and blurs sharp intended motion (and widens the frozen-context window).
+TE_SIGMA = 1.5         # [persisted: tuning_config.json] TUNE [~0.5..TE_RADIUS]: Gaussian sigma (id
+                       # units) = in-window shape. LARGER -> stronger smoothing. Keep <= TE_RADIUS or
+                       # the kernel is clipped at the edges. (TE_GAUSS below is derived from this seed.)
 _te_ks = np.arange(-TE_RADIUS, TE_RADIUS + 1)
 TE_GAUSS = np.exp(-(_te_ks ** 2) / (2.0 * TE_SIGMA ** 2))
 TE_GAUSS = TE_GAUSS / TE_GAUSS.sum()   # normalized symmetric kernel, length 2*TE_RADIUS+1
+# Smoothness guard: warn when a per-row position step in the buffer exceeds this (m). The seam
+# between chunks is where roughness shows up, so this catches a bad merge before it reaches the arm.
+SMOOTHNESS_WARN_DPOS = 0.03    # TUNE (m): DIAGNOSTIC threshold only — logs a warning, never clamps.
+                               # Lower to surface smaller seams; not a smoothing knob.
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -130,7 +151,14 @@ class InferenceController:
         # Always averaged from raw — never re-buffer ensembled output, or smoothing compounds.
         self.use_temporal_ensemble = USE_TEMPORAL_ENSEMBLE
         self._te_buffer = deque(maxlen=TE_BUFFER_LEN)
+        # LIVE-TUNABLE smoothing config, held as ONE immutable snapshot (radius, sigma, m, kernel) so
+        # the inference thread reads a consistent set even while the GUI changes it (assignment of the
+        # dict reference is atomic under the GIL). Scalar mirrors (te_radius/te_sigma/te_m) are for
+        # display/readback only. Use set_smoothing() to change at runtime.
         self.te_radius = TE_RADIUS
+        self.te_sigma = TE_SIGMA
+        self.te_m = TE_M
+        self._smooth = self._make_smoothing(TE_RADIUS, TE_SIGMA, TE_M)
         # The long smoothed buffer fed to the robot: master_id -> EE row [pos3, rot6d6, grip1].
         # Ids <= the env's queued_through are FROZEN (committed, read-only context); ids above it are
         # MUTABLE and rebuilt every inference. Only the inference thread touches this -> no lock.
@@ -265,11 +293,28 @@ class InferenceController:
             base_id, buf = sid, action
         print(f"[InferenceController] buffer rebuilt ({buf.shape[0]} rows) | Time elapsed; {time.time()- ts}")
 
+        # Smoothness guard: the buffer feeds the robot, so any id-to-id jump becomes a fast seam.
+        # Measure the executed sequence's roughness in EE space over the STILL-MUTABLE rows (the part
+        # we can still influence; frozen rows are committed). |Δpos| is the per-row position step and
+        # |Δ²pos| the bend (jerk proxy); warn when a step is unusually large so a bad merge surfaces
+        # in the logs. Logged, not clamped — clamping committed EE would fight the env seam ramp.
+        jerk = 0.0
+        if use_buffer and buf.shape[0] >= 3:
+            mut0 = max(0, queued_through + 1 - int(base_id))   # index of first mutable row in buf
+            seg = buf[max(0, mut0 - 1):]                       # include one frozen anchor for the seam
+            if seg.shape[0] >= 3:
+                dpos = np.linalg.norm(np.diff(seg[:, :3], axis=0), axis=1)
+                d2pos = np.linalg.norm(np.diff(seg[:, :3], n=2, axis=0), axis=1)
+                jerk = float(d2pos.max())
+                if dpos.max() > SMOOTHNESS_WARN_DPOS:
+                    print(f"[InferenceController] SMOOTHNESS WARN: buffer |Δpos|max={dpos.max():.4f} "
+                          f"|Δ²pos|max={jerk:.4f} m near seam (clock={cur}, qt={queued_through})")
+
         # Log the smoothed buffer (contiguous run actually fed to the robot) for offline inspection.
         with open("buffer.jsonl", "a") as f:
             f.write(json.dumps({"obs_ts": sid, "base_id": int(base_id),
                                 "clock": int(cur), "queued_through": int(queued_through),
-                                "buffer": buf.tolist()}) + "\n")
+                                "jerk": jerk, "buffer": buf.tolist()}) + "\n")
         # Publish for robot_info_server / visualisation. left_*_predict_* carry EE-pose data here:
         #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
         #   *_action_values = the smoothed buffer rows
@@ -290,6 +335,44 @@ class InferenceController:
             if not ok:
                 print(f"[InferenceController] auto: append skipped — {reason}")
         return True
+
+    @staticmethod
+    def _make_smoothing(radius, sigma, m):
+        """Build an immutable smoothing snapshot {radius, sigma, m, gauss} with the normalized
+        symmetric Gaussian kernel precomputed. radius>=0 int, sigma>0, m>=0."""
+        radius = max(0, int(radius))
+        sigma = max(1e-3, float(sigma))
+        ks = np.arange(-radius, radius + 1)
+        g = np.exp(-(ks ** 2) / (2.0 * sigma ** 2))
+        g = g / g.sum()
+        return {"radius": radius, "sigma": sigma, "m": max(0.0, float(m)), "gauss": g}
+
+    def set_buffer_len(self, n):
+        """LIVE-tunable max number of recent raw chunks averaged (= overlap depth). Rebuilds the
+        deque preserving the most-recent contents. Returns the applied maxlen."""
+        n = max(1, int(n))
+        self._te_buffer = deque(self._te_buffer, maxlen=n)   # keeps newest n (deque drops from left)
+        print(f"[InferenceController] te_buffer_len set: {n}")
+        return n
+
+    @property
+    def te_buffer_len(self):
+        return self._te_buffer.maxlen
+
+    def set_smoothing(self, radius=None, sigma=None, m=None):
+        """LIVE-tunable smoothing update (safe to call from the GUI thread while inference runs).
+        Any arg left None keeps its current value. Rebuilds the kernel and swaps the whole config in
+        one atomic reference assignment, so _rebuild_buffer always reads a consistent (radius, kernel)
+        pair. Returns the applied (radius, sigma, m)."""
+        radius = self.te_radius if radius is None else radius
+        sigma = self.te_sigma if sigma is None else sigma
+        m = self.te_m if m is None else m
+        snap = self._make_smoothing(radius, sigma, m)
+        self._smooth = snap                               # atomic swap (single ref assignment)
+        self.te_radius, self.te_sigma, self.te_m = snap["radius"], snap["sigma"], snap["m"]
+        print(f"[InferenceController] smoothing set: radius={self.te_radius} "
+              f"sigma={self.te_sigma:.2f} m={self.te_m:.3f}")
+        return self.te_radius, self.te_sigma, self.te_m
 
     def _rebuild_buffer(self, queued_through):
         r"""Rebuild the long smoothed master buffer (self._buffer: master_id -> EE row
@@ -318,7 +401,8 @@ class InferenceController:
         raw = list(self._te_buffer)                       # oldest -> newest
         if not raw:
             return
-        R = self.te_radius
+        s = self._smooth                                  # atomic snapshot (live-tunable)
+        R, gauss, te_m = s["radius"], s["gauss"], s["m"]
         newest_idx = len(raw) - 1
         max_id = max(sid + a.shape[0] - 1 for sid, a in raw)
         min_sid = min(sid for sid, _ in raw)
@@ -336,7 +420,7 @@ class InferenceController:
                 j = tid - sid                             # exact integer alignment (no rounding)
                 if 0 <= j < a.shape[0]:
                     rows.append(a[j])
-                    weights.append(np.exp(-TE_M * (newest_idx - idx)))   # newest chunk -> age 0
+                    weights.append(np.exp(-te_m * (newest_idx - idx)))   # newest chunk -> age 0
             if rows:
                 w = np.asarray(weights, dtype=np.float64)
                 w /= w.sum()
@@ -355,7 +439,7 @@ class InferenceController:
                 ctx = self._buffer.get(nid) if nid <= queued_through else tentative.get(nid)
                 if ctx is None:                           # past the buffer edges -> just skip
                     continue
-                k = TE_GAUSS[d + R]
+                k = gauss[d + R]
                 acc += k * np.asarray(ctx[:9], dtype=np.float64)
                 wsum += k
             out = tentative[tid].copy()

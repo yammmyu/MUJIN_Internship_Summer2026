@@ -302,7 +302,7 @@ class SimEnv:
         return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
 
     # ===================== validation (run on the owning thread) =====================
-    def validate(self, configs, seed_q, max_joint_step, learn=False, fast=False):
+    def validate(self, configs, seed_q, max_joint_step, learn=False, fast=False, substeps_per_row=None):
         """Run PRE-SOLVED joint configs through the sim; return (validated_traj, ok, reason).
         Thread-safe entry (marshals to the owning thread via submit_job).
 
@@ -317,11 +317,16 @@ class SimEnv:
         learn=True (calibrate): never abort on collision — instead ABSORB every new left-side
         pair into the ignore baseline (used to learn this coarse URDF's inherent overlaps from
         known-SAFE motions). Leaves the arm where it ended.
-        fast=True: skip the per-substep real-time sleep (auto-inference latency path)."""
+        fast=True: skip the per-substep real-time sleep (auto-inference latency path).
+        substeps_per_row: LIVE override of the per-row substep count (= SPEED_SCALE knob); None ->
+        the module default. The caller (HumanoidEnv) passes its own value so the sim expansion and the
+        env's master-id tagging (K) always use the SAME count, even when SPEED_SCALE changes live."""
         return self.submit_job(
-            lambda: self._validate_impl(configs, seed_q, max_joint_step, learn, fast))
+            lambda: self._validate_impl(configs, seed_q, max_joint_step, learn, fast, substeps_per_row))
 
-    def _validate_impl(self, configs, seed_q, max_joint_step, learn=False, fast=False):
+    def _validate_impl(self, configs, seed_q, max_joint_step, learn=False, fast=False,
+                       substeps_per_row=None):
+        K = int(substeps_per_row) if substeps_per_row else SUBSTEPS_PER_ROW
         seed = np.asarray(seed_q, dtype=np.float64).copy()
         # Deterministic start (so learn & validate see the same path, and repeat runs agree):
         # reset the left arm to the seed AND the gripper to open (GRIPPER_OPEN_RAD, since angle 0
@@ -352,7 +357,7 @@ class SimEnv:
                 # (C1) instead of the lerp's per-row staircase -> the jerk spike at each row is gone.
                 before = P[k - 2] if k >= 2 else P[k - 1]
                 after = P[k + 1] if k + 1 < len(P) else P[k]
-                subs = self._catmull_rom_segment(before, P[k - 1], P[k], after, SUBSTEPS_PER_ROW)
+                subs = self._catmull_rom_segment(before, P[k - 1], P[k], after, K)
                 # Safety velocity ceiling, checked on the ACTUAL curve: a cubic peaks faster than the
                 # straight-line average, so cap the largest per-substep joint delta ALONG the spline
                 # (incl. the step from the previous row) rather than the |dq_row|/K linear estimate.
@@ -408,9 +413,10 @@ class SimEnv:
         adjacent segments share the same velocity at p1/p2 -> C1 across row boundaries.
 
         Barry-Goldman pyramidal evaluation (no explicit tangent scaling, robust to non-uniform knot
-        spacing). alpha=0.5 (centripetal) gives no cusps/self-intersections and bounded overshoot,
-        unlike uniform CR which can loop. A duplicated neighbour at a chunk end (p0==p1 or p3==p2) is
-        REFLECTED to a one-sided tangent; a zero-length p1->p2 segment returns a constant hold."""
+        spacing). TUNE alpha [0..1] = inter-row spline curvature on the robot path: 0 = uniform (C1
+        but OVERSHOOTS the waypoints / can loop), 0.5 = centripetal (no cusps/self-intersections,
+        bounded overshoot — recommended), 1 = chordal. A duplicated neighbour at a chunk end (p0==p1
+        or p3==p2) is REFLECTED to a one-sided tangent; a zero-length p1->p2 segment returns a hold."""
         p0 = np.asarray(p0, dtype=np.float64); p1 = np.asarray(p1, dtype=np.float64)
         p2 = np.asarray(p2, dtype=np.float64); p3 = np.asarray(p3, dtype=np.float64)
         k = max(int(k), 1)

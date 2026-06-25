@@ -32,30 +32,6 @@ class CameraMixin:
             "head_center_fisheye": "头部鱼眼相机",
         }
 
-        # ---- RGBD 工具条 ----
-        toolbar = ttk.Frame(camera_frame)
-        toolbar.pack(fill=tk.X, padx=10, pady=(8, 6))
-
-        self.rgbd_enabled_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar, text="启用 3D 坐标点击",
-                        variable=self.rgbd_enabled_var,
-                        command=self.toggle_rgbd_mode).pack(side=tk.LEFT)
-
-        ttk.Label(toolbar, text="目标相机:").pack(side=tk.LEFT, padx=(16, 4))
-        self.target_camera_var = tk.StringVar(value="head")
-        camera_combo = ttk.Combobox(
-            toolbar, textvariable=self.target_camera_var,
-            values=[n for n in ["head", "head_depth", "hand_left", "hand_right"]
-                    if n in self.available_cameras],
-            state="readonly", width=14)
-        camera_combo.pack(side=tk.LEFT)
-        camera_combo.bind('<<ComboboxSelected>>', self.on_camera_selection_change)
-
-        ttk.Button(toolbar, text="清除坐标记录",
-                   style="Muted.TButton",
-                   command=self.clear_coordinate_records
-                   ).pack(side=tk.RIGHT)
-
         # ---- 相机勾选条：选择要显示的相机 ----
         # 默认全部不勾选：启动时不请求任何相机，env 不订阅，无视频流带宽。
         # 勾选某相机后，显示线程才会向 env 请求该相机（env 随即订阅/开流）。
@@ -123,11 +99,9 @@ class CameraMixin:
         # 同步缓存字典的键：新增的置 None，取消的移除（停止抓取）
         for name in selected:
             self.camera_images.setdefault(name, None)
-            self.camera_intrinsics.setdefault(name, None)
         for name in list(self.camera_images.keys()):
             if name not in selected:
                 self.camera_images.pop(name, None)
-                self.camera_intrinsics.pop(name, None)
 
         # 清空旧控件并重置标签字典
         for child in self.camera_display_area.winfo_children():
@@ -173,10 +147,6 @@ class CameraMixin:
                               background="#222", anchor=tk.CENTER)
             label.pack(fill=tk.BOTH, expand=True)
             self.camera_labels[name] = label
-            self._bind_camera_click(name)
-
-        # 重新应用鼠标样式
-        self.toggle_rgbd_mode()
 
     def _selected_display_cameras(self):
         """当前勾选要显示的相机（按 available_cameras 固定顺序）。"""
@@ -203,8 +173,7 @@ class CameraMixin:
 
         唯一抓取者是 self.env（按需开关、统一 RECORD_HZ 抓取）。本线程对每个勾选
         的相机调用 env.get_frame(name)（即「请求」该相机，使其保活并返回最新帧），
-        渲染到界面，并把帧/内参镜像回 self.camera_images / self.camera_intrinsics，
-        供尚未切换到 env 的消费者（VR/坐标/运动规划）继续读取。
+        渲染到界面，并把最新帧镜像回 self.camera_images 供「保存图片」读取。
         """
         def update_camera_images():
             while True:
@@ -213,18 +182,9 @@ class CameraMixin:
                         # 向 env 请求该相机（保活）并取最新帧；首帧或刚开机时可能为 None
                         image = self.env.get_frame(camera_name)
                         if image is not None:
-                            # 镜像最近两帧（list 结构），供 VR / 保存图片 / 3D 点击消费
-                            prev = self.camera_images.get(camera_name)
-                            if isinstance(prev, list) and len(prev) == 2:
-                                self.camera_images[camera_name] = [prev[-1], image.copy()]
-                            else:
-                                self.camera_images[camera_name] = [image.copy(), image.copy()]
-
+                            # 镜像最近一帧（list 结构），供保存图片消费
+                            self.camera_images[camera_name] = [image.copy(), image.copy()]
                             self.update_camera_display(camera_name, image)
-
-                        # 内参镜像（env 懒加载并缓存，这里取一次填入兼容字典）
-                        if self.camera_intrinsics.get(camera_name) is None:
-                            self.camera_intrinsics[camera_name] = self.env.get_intrinsics(camera_name)
 
                     time.sleep(0.033)  # ~30 Hz, matches recording rate
                 except Exception as e:
@@ -371,83 +331,3 @@ class CameraMixin:
         except tk.TclError:
             # 标签可能在重建显示区时已被销毁，忽略这次延迟回调
             pass
-
-    def get_default_camera_intrinsics(self, camera_name):
-        """获取默认相机内参（当无法从SDK获取时）"""
-        # 基于典型RGBD相机参数的默认值
-        defaults = {
-            "head": {
-                'width': 1280, 'height': 800,
-                'fx': 900.0, 'fy': 900.0,
-                'cx': 640.0, 'cy': 400.0,
-                'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]
-            },
-            "head_depth": {
-                'width': 1280, 'height': 800,
-                'fx': 900.0, 'fy': 900.0,
-                'cx': 640.0, 'cy': 400.0,
-                'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]
-            },
-            "hand_left": {
-                'width': 320, 'height': 240,
-                'fx': 300.0, 'fy': 300.0,
-                'cx': 160.0, 'cy': 120.0,
-                'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]
-            },
-            "hand_right": {
-                'width': 320, 'height': 240,
-                'fx': 300.0, 'fy': 300.0,
-                'cx': 160.0, 'cy': 120.0,
-                'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]
-            },
-            "head_center_fisheye": {
-                'width': 640, 'height': 480,
-                'fx': 400.0, 'fy': 400.0,
-                'cx': 320.0, 'cy': 240.0,
-                'distortion': [0.1, -0.1, 0.0, 0.0, 0.0]
-            }
-        }
-        return defaults.get(camera_name, defaults["head"])
-
-    def _latest_camera_frame(self, camera_name):
-        """从 camera_images 取指定相机的最新一帧。
-
-        camera_images 内所有相机统一为「最近两帧」的 list 结构，
-        此处返回最新一帧（list[-1]）；兼容历史的单帧 ndarray。
-        """
-        # 未来切换到 env 单一数据源（按需开关相机）时改为：
-        # return self.env.get_frame(camera_name)
-        entry = self.camera_images.get(camera_name)
-        if isinstance(entry, (list, tuple)):
-            return entry[-1] if entry else None
-        return entry
-
-    def _bind_camera_click(self, camera_name):
-        """绑定相机图像点击事件"""
-        def on_click(event):
-            if self.rgbd_enabled_var.get():
-                self.handle_image_click(camera_name, event)
-
-        if camera_name in self.camera_labels:
-            self.camera_labels[camera_name].bind('<Button-1>', on_click)
-            # 添加鼠标悬停效果
-            self.camera_labels[camera_name].bind('<Enter>',
-                lambda e: self.camera_labels[camera_name].config(cursor="hand2" if self.rgbd_enabled_var.get() else ""))
-            self.camera_labels[camera_name].bind('<Leave>',
-                lambda e: self.camera_labels[camera_name].config(cursor=""))
-
-    def toggle_rgbd_mode(self):
-        """切换RGBD模式"""
-        enabled = self.rgbd_enabled_var.get()
-        # 更新所有相机的鼠标样式
-        for camera_name in self.camera_labels:
-            cursor = "hand2" if enabled else ""
-            self.camera_labels[camera_name].config(cursor=cursor)
-
-        status = "启用" if enabled else "禁用"
-        print(f"RGBD 3D坐标获取功能已{status}")
-
-    def on_camera_selection_change(self, event=None):
-        """相机选择改变时的处理"""
-        self.current_camera_for_3d = self.target_camera_var.get()
-        print(f"当前目标相机切换为: {self.current_camera_for_3d}")

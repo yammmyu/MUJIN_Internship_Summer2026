@@ -34,11 +34,19 @@ rejected by validation (the previous trajectory keeps draining).
 # period — otherwise the arm drains a chunk faster than the next inference arrives and stutters.
 # Alignment stays correct at any value because it is keyed on the master row-ID (the robot's own
 # execution clock), not wall-clock.
-SPEED_SCALE = 0.2
-RECORD_HZ = 30          # policy action-row cadence (training / recording rate), Hz.
-CONTROL_HZ = 120        # substep streaming rate to the arm controller, Hz. Smoothness knob:
-                        # raise toward the SDK's sustainable ABS_JOINT waypoint rate (verify on
-                        # hardware) for finer motion. MUST be an integer multiple of RECORD_HZ.
+SPEED_SCALE = 0.2       # [persisted: tuning_config.json] DEFAULT SEED ONLY. The GUI restores the saved
+                        # value at startup and tunes it live (HumanoidEnv.set_speed_scale); the live
+                        # runtime value is env.speed_scale (-> env.substeps_per_row / ramp_joint_step).
+                        # Editing this literal only changes the fallback when there is no saved JSON
+                        # entry (e.g. headless). TUNE (0,1+]: fraction of demo speed. LOWER -> more
+                        # substeps/row (smoother + slower, chunk lasts longer so the append buffer
+                        # starves less); >1 = faster. Alignment stays correct at any value (row-id keyed).
+RECORD_HZ = 30          # policy action-row cadence (training / recording rate), Hz. NOT a free knob:
+                        # fixed by how the policy was trained; changing it desyncs row timing.
+CONTROL_HZ = 120        # TUNE: substep streaming rate to the arm controller, Hz. Primary motion-
+                        # RESOLUTION knob: higher -> more substeps/row -> finer motion. Raise toward
+                        # the SDK's sustainable ABS_JOINT waypoint rate (verify on hardware). MUST be
+                        # an integer multiple of RECORD_HZ.
 
 assert CONTROL_HZ % RECORD_HZ == 0, (
     f"CONTROL_HZ ({CONTROL_HZ}) must be an integer multiple of RECORD_HZ ({RECORD_HZ}) so each "
@@ -48,6 +56,8 @@ assert CONTROL_HZ % RECORD_HZ == 0, (
 ROW_DT = 1.0 / RECORD_HZ                          # wall-clock between policy rows (s).
 STEP_TIME = 1.0 / CONTROL_HZ                       # wall-clock per substep (s); release-loop tick.
 SUBSTEPS_PER_ROW = round((CONTROL_HZ / RECORD_HZ)/SPEED_SCALE)   # time-uniform substeps per row gap (= K).
+# ^ DERIVED (do not set directly): motion granularity per row = K. Tune it via CONTROL_HZ (up) or
+#   SPEED_SCALE (down). Higher K -> finer/smoother per-row motion.
 
 # --- derived: safety velocity ceiling --------------------------------------------------------
 # Genuine per-joint velocity ceiling for the LEFT arm. Measured across the recordings: real demo
@@ -56,3 +66,17 @@ SUBSTEPS_PER_ROW = round((CONTROL_HZ / RECORD_HZ)/SPEED_SCALE)   # time-uniform 
 # is refused by validation. This is a SAFETY cap only — it does not set motion smoothness.
 MAX_JOINT_VEL = 4.0                                # rad/s (~344 deg/s).
 MAX_JOINT_STEP = min(MAX_JOINT_VEL / CONTROL_HZ, 0.05)       # max per-substep joint delta (rad); the C5 cap.
+
+# --- derived: ramp cruise speed --------------------------------------------------------------
+# Ramps/bridges (the initial C5 ramp-in AND the per-chunk seam bridge in append_actions) connect
+# the arm's current pose to the next action row. They are NOT trajectory-following motion, so the
+# SPEED_SCALE that is baked into SUBSTEPS_PER_ROW never reaches them: subdividing a ramp by
+# MAX_JOINT_STEP moves it at the full SAFETY-cap velocity — visibly ~1/SPEED_SCALE faster than
+# normal rows. That is the "arm darts fast for one action between chunks, then slows" spike. Scaling
+# the ramp's per-substep delta by SPEED_SCALE makes a bridge cruise at the same speed as ordinary
+# motion. It is <= MAX_JOINT_STEP, so the C5 safety bound is untouched (ramps only ever get SLOWER).
+RAMP_JOINT_STEP = min(MAX_JOINT_STEP, MAX_JOINT_STEP * SPEED_SCALE)   # per-substep joint delta for
+# ramps (rad). Clamped to MAX_JOINT_STEP so SPEED_SCALE > 1 (faster than demo) can never push a ramp
+# ABOVE the C5 safety cap — auto-path ramps go straight to the queue without a _subdivide_points re-clamp.
+# ^ DERIVED: sets how fast the seam bridge cruises (smoothness of the chunk-to-chunk seam). Lower
+#   multiplier -> slower, smoother ramp; always <= MAX_JOINT_STEP so the C5 safety bound is untouched.

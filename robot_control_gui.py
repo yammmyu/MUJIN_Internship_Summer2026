@@ -1,10 +1,13 @@
-"""智元 G1 机器人控制 GUI 主入口。
+"""智元 G1 机器人控制 GUI 主入口（精简版）。
 
-功能按域拆分到 gui/ 包下的多个 Mixin，本文件只负责：
-  - 组装 RobotControlGUI（多继承各 Mixin）
-  - __init__：初始化机器人/相机/服务器与共享状态，搭建界面、启动后台线程
-  - setup_ui：顶层布局
-  - on_closing / main：生命周期与退出清理
+只保留三件事：相机视图、左夹爪开合、以及策略推理（手动单步 / 自动运行 /
+仿真预览 / 真机释放 / 子步监视）。功能拆分到 gui/ 包下的 Mixin：
+
+  - StyleMixin      : ttk 主题
+  - CameraMixin     : 相机视图（纯显示）
+  - InferenceMixin  : 左夹爪 + 推理控制 + 子步监视
+
+本文件负责组装、初始化机器人/相机/环境/推理与共享状态、搭建界面、生命周期清理。
 """
 
 import os
@@ -18,98 +21,48 @@ import argparse
 
 import rclpy
 
-from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
+from a2d_sdk.robot import RobotDds as Robot, RobotController
 from control_wheel_example import WheelController
 from robot_info_server import create_robot_info_http_server, RobotInfo
-from constants import *
-from pico_vr.pico_vr_server.server import DummyServer
 
-from kinematics import RobotCoordinateTransformer
-from gui import (
-    StyleMixin,
-    CameraMixin,
-    StatusMixin,
-    CoordinateMixin,
-    PickPlaceMixin,
-    ManualControlMixin,
-    VRMixin,
-    MotionPlanningMixin,
-)
+from gui import StyleMixin, CameraMixin, InferenceMixin
 from real_world import HumanoidEnv, InferenceController
 from real_world.humanoid_env import RECORD_HZ
 from real_world.sim_backend import SimEnv
 
 
-class RobotControlGUI(
-    StyleMixin,
-    CameraMixin,
-    StatusMixin,
-    CoordinateMixin,
-    PickPlaceMixin,
-    ManualControlMixin,
-    VRMixin,
-    MotionPlanningMixin,
-):
+class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
     def __init__(self, root, camera_mode="all"):
         self.root = root
         self.root.title("智元G1机器人控制界面")
         self.root.geometry("1500x950")
-        self.root.minsize(1200, 800)
+        self.root.minsize(1100, 720)
         self._setup_styles()
 
-        # 初始化机器人（相机由 HumanoidEnv 持有，见下方 self.env）
+        # 机器人（相机由 HumanoidEnv 持有，见下方 self.env）
         self.robot = Robot()
         self.robot_controller = RobotController()
 
-        # Disable cameras during data_collection mode
-        if camera_mode == "data":
-            camera_names = ["hand_left", "hand_right", "head"]
-        else:
-            camera_names = []
+        # data 模式下保持 3 路相机常开，普通模式不订阅任何相机（无视频流带宽）
+        camera_names = ["hand_left", "hand_right", "head"] if camera_mode == "data" else []
         self.camera_mode = camera_mode
 
-        # Slam
+        # rclpy / 轮控后台 spin —— 保持 DDS 关节状态持续刷新
         rclpy.init(args=None)
         self.wheel_controller = WheelController()
-        wheel_thread = threading.Thread(target=rclpy.spin, args=(self.wheel_controller,), daemon=True)
-        wheel_thread.start()
+        threading.Thread(target=rclpy.spin, args=(self.wheel_controller,), daemon=True).start()
+        time.sleep(1.0)             # 等待初始化
 
-        # 等待初始化
-        time.sleep(1.0)
-
-        # 相机图像缓存（兼容镜像）：唯一抓取者是 self.env；显示线程把 env 拉到的帧
-        # 镜像到此处，供尚未切换到 env 的消费者（VR/坐标/运动规划）继续读取。
-        self.camera_images = {
-            # "hand_left": None,  # cache latest two images for inference
-            # "hand_right": None,  # cache latest two images for inference
-            "head": None,
-            # "head_depth": None,  # cache latest one image
-            # "head_center_fisheye": None
-        }
-        self.last_two_left_arm_joint_values = []
-        # 最近两帧左臂末端位姿 state ([pos(3), quat xyzw(4), grip(1)])，供 EE 策略推理
-        self.last_two_left_ee_states = []
+        # 相机帧缓存（显示线程把 env 拉到的帧镜像到此，供「保存图片」读取）
+        self.camera_images = {}
         # 相机显示缩放尺寸（由 _rebuild_camera_display 根据排版动态更新）
         self.camera_tile_size = (320, 240)
 
-        # 相机内参缓存
-        self.camera_intrinsics = {
-            # "hand_left": None,
-            # "hand_right": None,
-            "head": None,
-            # "head_depth": None,
-            # "head_center_fisheye": None
-        }
-
-        # update robot_info
+        # robot_info HTTP 服务（推理预测/可视化）
         self.robot_info = RobotInfo()
         create_robot_info_http_server(self.robot_info)
 
-        # HumanoidEnv：相机的唯一持有者与抓取者。每路相机一个 CosineCamera，按需订阅、
-        # RECORD_HZ 抓取、空闲自动退订（关流）。cameras= 为「常开」相机（数据采集模式用），
-        # GUI 普通模式传 [] -> 启动时不订阅任何相机、无视频流带宽。robot/controller 仍共享。
-        # real=True: enables the release pipeline. Actions always run in the sim preview first;
-        # 仿真验证 accumulates sim-validated substeps, and only 释放(单步)/释放(剩余)
+        # HumanoidEnv：相机的唯一持有者与抓取者；real=True 启用真机释放管线。
         self.env = HumanoidEnv(
             robot=self.robot,
             robot_controller=self.robot_controller,
@@ -118,97 +71,33 @@ class RobotControlGUI(
             real=True,
         )
 
-        # In-process PyBullet preview. Built lazily on its own thread (it owns all p.* calls)
-        # when the user presses "启动仿真预览"; attached to self.env.sim so the exec loop
-        # drives it. None until launched.
+        # In-process PyBullet 预览：用户按「启动仿真预览」时在自有线程上懒加载（所有 p.* 调用
+        # 都在该线程），attach 到 self.env.sim 供执行循环驱动。None 表示未启动。
         self._sim_thread = None
         self._sim_stop = threading.Event()
 
-        # left_arm_ee_image policy inference（使用注入的 env，不再自建）
+        # 策略推理控制器（复用注入的 env）
         self.inference = InferenceController(self.env, self.robot_info)
 
-        # VR 串流：把 camera_images 合成的画面通过 DummyServer 推给客户端
-        self.dummy_server = DummyServer(
-            host="0.0.0.0",
-            port=5555,
-            port2=5556,
-            image_path=None,
-            use_default_image=False,
-            rate_hz=30.0,
-            jpeg_quality=80,
-            on_joints=self._handle_vr_joints,
-        )
-        self.dummy_server.start()
-        self.last_joint_update_timestamp: float = 0.0
-        self.previous_vr_positions = []
-        self.vr_actions = []
-        self.vr_execution_thread = None
-        self.is_vr_control: bool = False
+        # 恢复上次保存的调参（平滑/执行参数），在搭建界面前应用，使控件初值与运行时一致。
+        self._load_and_apply_tuning()
 
-        # auto inference (thread/state now owned by self.inference)
-        self.is_grabbing_target: bool = False
-
-        # MONEY
-        self.coordinates_3d = (0, 0, 0)
-        self.camera_hand_coordinates_3d = (0, 0, 0)
-        self.camera_target_coordinates_3d = (0, 0, 0)
-        self.world_hand_coordinates_3d = (0, 0, 0)
-        self.world_target_coordinates_3d = (0, 0, 0)
-        # pre set
-        head_states = self.robot.head_joint_states()[0]
-        waist_states = self.robot.waist_joint_states()[0]
-        if all(abs(head_states[i] - HEAD[i]) < 0.001 for i in range(len(HEAD))) and all(abs(waist_states[i] - WAIST[i]) < 0.001 for i in range(len(WAIST))):
-            self.camera_hand_coordinates_3d = LEFT_HAND_READY_CAMERA_COORDINATE_3D
-            self.world_hand_coordinates_3d = LEFT_HAND_READY_COORDINATE_3D
-
-        self.delta_coordinates_3d = (0, 0, 0)
-        self.hand_status_text = tk.StringVar()
-        self.hand_status_text.set("null")
-        self.target_status_text = tk.StringVar()
-        self.target_status_text.set("null")
-
-        # RGBD坐标转换相关
-        self.depth_scale = 0.001  # 深度缩放因子（毫米到米）
-        self.click_coordinates = []  # 存储点击的图像坐标
-        self.current_camera_for_3d = "head"  # 默认用于3D坐标获取的相机
-        self.coordinate_display = None  # 坐标显示标签，将在setup_camera_panel中创建
-
-        # 坐标转换处理器
-        self.transformer = RobotCoordinateTransformer()
-
-        # 状态栏相关
-        self.status_text = tk.StringVar()
-        self.status_text.set("就绪")
-        self.status_label = None
-
-        # 控制参数
-        self.waist_lift_pos = 0.0
-        self.waist_pitch_pos = 0.0
-        self.head_yaw_pos = 0.0
-        self.head_pitch_pos = 0.0
+        # 左夹爪状态（move_gripper 读写；右夹爪界面不暴露，保持不动）
         self.left_gripper_pos = 0.0
         self.right_gripper_pos = 0.0
 
-        # 关节名称映射
-        self.joint_names = {
-            'arm': ['左臂关节1', '左臂关节2', '左臂关节3', '左臂关节4',
-                   '左臂关节5', '左臂关节6', '左臂关节7', '右臂关节1',
-                   '右臂关节2', '右臂关节3', '右臂关节4', '右臂关节5',
-                   '右臂关节6', '右臂关节7'],
-            'head': ['头部偏航', '头部俯仰'],
-            'waist': ['腰部俯仰', '腰部升降'],
-            'gripper': ['左夹爪', '右夹爪']
-        }
+        # 状态栏
+        self.status_text = tk.StringVar()
+        self.status_text.set("就绪")
+        self.status_label = None
 
         self.setup_ui()
         self.env.start()           # 启动相机采集 + 执行线程（GUI 持有 env 生命周期）
         self.inference.start()
         self.start_camera_thread()
-        self.start_status_thread()
-        self.start_vr_stream_thread()
 
     def setup_ui(self):
-        """设置用户界面：顶部标题栏 + 左右分栏 + 底部状态栏。"""
+        """顶部标题栏 + 左右分栏（左相机 / 右推理控制）+ 底部状态栏。"""
         # ===== 顶部标题栏 =====
         header = ttk.Frame(self.root)
         header.pack(fill=tk.X, padx=16, pady=(12, 4))
@@ -224,8 +113,7 @@ class RobotControlGUI(
             status_bar, textvariable=self.status_text,
             style="Status.TLabel", anchor=tk.W)
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(status_bar, text="清除",
-                   style="Muted.TButton",
+        ttk.Button(status_bar, text="清除", style="Muted.TButton",
                    command=lambda: self.status_text.set("就绪")
                    ).pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -236,22 +124,11 @@ class RobotControlGUI(
         left_frame = ttk.Frame(body)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
-        right_frame = ttk.Frame(body)
+        right_frame = ttk.LabelFrame(body, text="  🧠  推理控制  ")
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
-        # 左侧：相机画面
-        self.setup_camera_panel(left_frame)
-
-        # 右侧：单一统一 Notebook 包含 [关节状态 / 抓取任务 / 手动调试]
-        right_notebook = ttk.Notebook(right_frame)
-        right_notebook.pack(fill=tk.BOTH, expand=True)
-
-        status_tab = ttk.Frame(right_notebook)
-        right_notebook.add(status_tab, text="📊  关节状态")
-        self.setup_status_panel(status_tab)
-
-        self.setup_pick_and_place_panel(right_notebook)
-        self.setup_control_panel(right_notebook)
+        self.setup_camera_panel(left_frame)         # 左：相机视图
+        self.setup_inference_panel(right_frame)     # 右：左夹爪 + 推理控制 + 子步监视
 
     # ===================== sim preview (in-process PyBullet) =====================
     def launch_sim(self):
@@ -277,8 +154,7 @@ class RobotControlGUI(
             arm14 = self.robot.arm_joint_states()[0]            # both arms (rad)
             grip = self.robot.gripper_states()[0]               # [left, right] in [0,1]
             body_pitch = self.robot.waist_joint_states()[0][0]  # waist pitch (rad)
-            # Match the sim to the physical robot on load: both arms, both grippers, torso
-            # pitch. (URDF has no head/waist-lift joints, so those aren't mirrored.)
+            # Match the sim to the physical robot on load: both arms, both grippers, torso pitch.
             sim.reset_full(arm14=arm14, body_pitch=body_pitch, gripper_lr=grip)
             self.env.set_seed(arm14[:7])    # IK warm-starts from where the real left arm is
         except Exception as e:
@@ -297,19 +173,16 @@ class RobotControlGUI(
             self._sim_thread.join(timeout=3.0)
 
     def on_closing(self):
-        """窗口关闭时的处理：依次释放各资源，最后强制退出进程。
+        """窗口关闭时依次释放各资源，最后强制退出进程。
 
         每个资源单独 try/except，避免前一个清理失败阻断后续；
         最后用 os._exit() 兜底，绕过被 DDS/rclpy 原生线程卡住的解释器退出。
         """
-        # 防止重复进入（信号 + 窗口关闭可能同时触发）
-        if getattr(self, "_is_closing", False):
+        if getattr(self, "_is_closing", False):     # 信号 + 窗口关闭可能同时触发
             return
         self._is_closing = True
 
         for label, fn in [
-            ("Motion Planning TCP", self.stop_motion_planning),
-            ("VR 串流服务器", self.dummy_server.stop),
             ("推理控制器", self.inference.stop),
             ("仿真预览", self._stop_sim),     # 先停仿真步进线程，再关 env
             ("HumanoidEnv", self.env.stop),   # 先停采集/执行线程，再关其持有的相机
@@ -354,7 +227,6 @@ def _safety_preflight():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", action="store_true")
-
     args = parser.parse_args()
 
     camera_mode = "data" if args.data else "all"
@@ -362,7 +234,7 @@ def main():
     _safety_preflight()    # block launch if the safety invariants regressed
 
     root = tk.Tk()
-    app = RobotControlGUI(root, camera_mode)  # 样式由 _setup_styles 统一配置
+    app = RobotControlGUI(root, camera_mode)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
 
     # Ctrl+C：注册 SIGINT 处理器，转交主线程的 on_closing
@@ -381,6 +253,4 @@ def main():
 
 
 if __name__ == "__main__":
-
-
     main()
