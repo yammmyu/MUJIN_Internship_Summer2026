@@ -150,9 +150,13 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
                    command=lambda: self.status_text.set("就绪")
                    ).pack(side=tk.RIGHT, padx=(8, 0))
 
-        # ===== 主分栏 =====
-        body = ttk.Frame(self.root)
-        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        # ===== 主区：顶层 Notebook（控制台 / VR 遥操 两个标签页）=====
+        tabs = ttk.Notebook(self.root)
+        tabs.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        # ---- 标签页 1：控制台（相机视图 + 推理控制左右分栏）----
+        body = ttk.Frame(tabs)
+        tabs.add(body, text="  🧠  控制台  ")
 
         left_frame = ttk.Frame(body)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
@@ -163,13 +167,13 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
         right_frame = ttk.LabelFrame(body, text="  🧠  推理控制  ")
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
 
-        # VR 遥操面板：包到推理面板左侧（side=RIGHT 后入栈者更靠左）。
-        vr_frame = ttk.LabelFrame(body, text="  🎮  VR 遥操  ")
-        vr_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
-
         self.setup_camera_panel(left_frame)         # 左：相机视图
-        self.setup_vr_panel(vr_frame)               # 中：VR 开关 + 灵敏度参数
         self.setup_inference_panel(right_frame)     # 右：左夹爪 + 推理控制 + 子步监视
+
+        # ---- 标签页 2：VR 遥操（开关 + 灵敏度参数）----
+        vr_tab = ttk.Frame(tabs)
+        tabs.add(vr_tab, text="  🎮  VR 遥操  ")
+        self.setup_vr_panel(vr_tab)
 
     def setup_vr_panel(self, parent):
         """VR 遥操控制：启动/停止开关 + 灵敏度参数标签页。
