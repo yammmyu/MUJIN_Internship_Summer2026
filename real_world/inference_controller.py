@@ -83,8 +83,44 @@ PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
 
-def encode_image(rgb_image):
-    """RGB frame -> base64 JPEG string (matches the training/recording encode)."""
+# Client-side image preprocessing — MUST stay identical to MDM_data_collection/build_dataset.py
+# (training) and the policy server's decode. Doing the crop+resize HERE, BEFORE the JPEG encode,
+# shrinks the head frame from native (e.g. 1280x800) to IMG_W x IMG_H first, so imencode runs on
+# ~25x fewer pixels (the old ~0.2s encode was dominated by JPEG-ing two full-res head frames).
+# NOTE: with AGENT_CROP_ZOOM == 1.0 the server's own crop+resize become no-ops on an already-
+# target-size frame (aspect matches, zoom 1, shape == target -> resize skipped), so NO server
+# change is needed. If AGENT_CROP_ZOOM is ever raised > 1, the server MUST disable its center-crop
+# or the head frame gets zoomed twice.
+IMG_H = 180             # target rows  (build_dataset.IMG_H)
+IMG_W = 240             # target cols  (build_dataset.IMG_W)
+AGENT_CROP_ZOOM = 1.0   # head center-crop zoom (build_dataset.AGENT_CROP_ZOOM); keep in sync
+
+
+def center_crop_to_aspect(frame, target_w, target_h, zoom=1.0):
+    """Center-crop `frame` to the target aspect ratio (target_w/target_h), optionally zooming in.
+    Identical to build_dataset.center_crop_to_aspect / the server's crop. Returns a cropped view."""
+    h, w = frame.shape[:2]
+    target_ar = target_w / target_h
+    if w / h > target_ar:        # source too wide -> limited by height
+        crop_h, crop_w = h, int(round(h * target_ar))
+    else:                        # source too tall -> limited by width
+        crop_w, crop_h = w, int(round(w / target_ar))
+    crop_w = min(w, int(round(crop_w / zoom)))
+    crop_h = min(h, int(round(crop_h / zoom)))
+    x0, y0 = (w - crop_w) // 2, (h - crop_h) // 2
+    return frame[y0:y0 + crop_h, x0:x0 + crop_w]
+
+
+def encode_image(rgb_image, center_crop=False):
+    """RGB frame -> base64 JPEG string (matches the training/recording encode).
+
+    Applies the SAME preprocessing as training/server BEFORE encoding: head (center_crop=True) is
+    center-cropped to the target aspect (+AGENT_CROP_ZOOM); both cameras are then INTER_AREA-resized
+    to (IMG_W, IMG_H). Encoding the small frame is what makes this fast."""
+    if center_crop:
+        rgb_image = center_crop_to_aspect(rgb_image, IMG_W, IMG_H, AGENT_CROP_ZOOM)
+    if rgb_image.shape[:2] != (IMG_H, IMG_W):
+        rgb_image = cv2.resize(rgb_image, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
     rgb_image_cv2 = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
     _, buffer = cv2.imencode('.jpg', rgb_image_cv2, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return base64.b64encode(buffer).decode('utf-8')
@@ -228,8 +264,9 @@ class InferenceController:
 
         print(f"[InferenceController] preping request | Time elapsed; {time.time()- ts}")
         req = {
-            'agent_imgs': [encode_image(img) for img in obs['agent_imgs']],
-            'hand_imgs': [encode_image(img) for img in obs['hand_imgs']],
+            # head (agent) is center-cropped to the target aspect like training; hand is resize-only.
+            'agent_imgs': [encode_image(img, center_crop=True) for img in obs['agent_imgs']],
+            'hand_imgs': [encode_image(img, center_crop=False) for img in obs['hand_imgs']],
             'state': obs['state'],
             # robot0_left_joint policy input: [j_{t-1}, j_t], each = 7 left-arm joints (rad) + raw
             # gripper. Server must map this to robot0_left_joint (see train config shape_meta).
@@ -240,7 +277,7 @@ class InferenceController:
         # chunks.jsonl/traj.jsonl use, so a request can be joined to its resulting action.
         # Images (agent_imgs/hand_imgs) are omitted — large base64 JPEGs, not needed here.
         with open("requests.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": sid,
+            f.write(json.dumps({"obs_ts": sid, 
                                 "state": req['state'],
                                 "left_joint": req['left_joint']}) + "\n")
         
