@@ -79,8 +79,9 @@ class CameraMixin:
             win_w = 1500
         if win_h < 100:
             win_h = 950
-        # 左侧相机面板约占窗口一半宽；高度扣除标题/工具条/状态栏
-        panel_w = max(360, win_w // 2 - 60)
+        # 左侧相机面板 = 窗口宽减去右侧固定宽的推理控制面板（约 880px）与边距；
+        # 高度扣除标题/工具条/状态栏。
+        panel_w = max(360, win_w - 950)
         panel_h = max(360, win_h - 220)
         # 每格扣除标题栏(~44)与内边距
         cell_w = max(160, panel_w // ncols - 16)

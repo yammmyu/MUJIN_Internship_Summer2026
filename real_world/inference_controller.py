@@ -22,6 +22,8 @@ import base64
 import copy
 import http.client
 import json
+import logging
+import os
 import threading
 import time
 
@@ -32,6 +34,14 @@ from collections import deque
 
 from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 from real_world.timing import RECORD_HZ   # single source of timing truth (see timing.py)
+
+log = logging.getLogger(__name__)
+
+# Per-inference JSONL traces (requests/chunks/buffer) are debug aids only and sit on the
+# real-time inference thread, so they are OFF by default and gated behind this flag. The
+# buffer dump in particular re-serialises the whole smoothed run every cycle; enable only
+# when diagnosing offline. Set HUMANOID_INFER_TRACE=1 to turn on.
+TRACE_JSONL = os.environ.get("HUMANOID_INFER_TRACE", "") not in ("", "0", "false", "False")
 
 INFERENCE_HZ = 0  # TUNE (Hz): auto-inference cadence cap. <=0 -> run back-to-back = MAX chunk
                   # overlap, so TE has the most chunks to average (smoother). A positive cap slows
@@ -128,9 +138,8 @@ def encode_image(rgb_image, center_crop=False):
 
 def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict:
     """POST an obs dict to the policy server's /predict and return the JSON reply."""
-    print(f"inference request sent")
     body = json.dumps(req).encode('utf-8')
-    print(f"POST http://{host}:{port}/predict ({len(body)} bytes, timeout={timeout}s)")
+    log.debug("POST http://%s:%s/predict (%d bytes, timeout=%ss)", host, port, len(body), timeout)
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     start = time.monotonic()
     try:
@@ -142,22 +151,22 @@ def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict
             })
         resp = conn.getresponse()
         resp_body = resp.read()
-        elapsed = time.monotonic() - start
-        print(f"response: HTTP {resp.status} ({len(resp_body)} bytes) in {elapsed:.3f}s")
+        log.debug("response: HTTP %d (%d bytes) in %.3fs",
+                  resp.status, len(resp_body), time.monotonic() - start)
         try:
             resp_obj = json.loads(resp_body.decode('utf-8')) if resp_body else {}
         except Exception as e:
-            print(f"failed to parse JSON response: {e!r} (status={resp.status})")
+            log.warning("failed to parse JSON response: %r (status=%d)", e, resp.status)
             return {'error': f'failed to parse JSON response: {e!r} '
                              f'(status={resp.status})'}
         if resp.status != 200:
-            print(f"non-200 response: HTTP {resp.status}: {resp_obj!r}")
+            log.warning("non-200 response: HTTP %d: %r", resp.status, resp_obj)
             if isinstance(resp_obj, dict) and 'error' in resp_obj:
                 return resp_obj
             return {'error': f'HTTP {resp.status}: {resp_obj!r}'}
         return resp_obj
     except Exception as e:
-        print(f"request failed after {time.monotonic() - start:.3f}s: {e!r}")
+        log.warning("request failed after %.3fs: %r", time.monotonic() - start, e)
         raise
     finally:
         conn.close()
@@ -208,6 +217,18 @@ class InferenceController:
         # execute_inference_result. cursor >= chunk length => the chunk is fully consumed
         # and the manual validate buttons become no-ops (see steps_remaining).
         self._exec_cursor = 0
+        # Open trace-file handles, kept open for the controller's life so the hot loop never
+        # re-opens per inference. Empty (and every _trace call a no-op) unless TRACE_JSONL is set.
+        self._trace_files = {}
+        if TRACE_JSONL:
+            self._trace_files = {name: open(f"{name}.jsonl", "a")
+                                 for name in ("requests", "chunks", "buffer")}
+
+    def _trace(self, name, obj):
+        """Append one JSON line to the named trace file (no-op unless TRACE_JSONL is set)."""
+        f = self._trace_files.get(name)
+        if f is not None:
+            f.write(json.dumps(obj) + "\n")
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: the env is owned by the caller; we only reset our state #
@@ -219,11 +240,13 @@ class InferenceController:
         self._te_buffer.clear()
         self._buffer.clear()
         self._last_queued_through = -1
-        print("[InferenceController] InferenceController ready (env owned by caller).")
+        log.info("InferenceController ready (env owned by caller).")
 
     def stop(self):
         """Stop auto inference. Does NOT tear down the env (caller owns it)."""
         self.auto_inference(stop=True)
+        for f in self._trace_files.values():               # persist any buffered trace lines
+            f.flush()
 
     # ------------------------------------------------------------------ #
     #  One inference: predict -> publish to robot_info (-> optional submit) #
@@ -234,24 +257,21 @@ class InferenceController:
         submit=True also hands the predicted chunk to the env's execution queue.
         Returns True if a fresh inference was produced.
         """
-
-      
         env = self.humanoid_env
         if env is None:
-            print("[InferenceController] humanoid_env not accessible")
+            log.warning("humanoid_env not accessible")
             return False
 
         obs = self.obs_source.get_obs()
-        print(f"[InferenceController] inference pipeline starting")
         if obs is None:
             return False
         # Refuse to predict from stale/frozen sensors or under a firmware error (H2). A frozen
         # camera/EE feed still has an advancing wall-clock timestamp, so the timestamp check
         # below is NOT sufficient — `stale` reflects whether the data actually changed.
         if obs.get('stale'):
-            print(f"[InferenceController] ABORT: observations are stale "
-                  f"(age={obs.get('age'):.2f}s, firmware_error={obs.get('firmware_error')}). "
-                  f"Not predicting from frozen sensor data.")
+            log.warning("ABORT: observations are stale (age=%.2fs, firmware_error=%s). "
+                        "Not predicting from frozen sensor data.",
+                        obs.get('age'), obs.get('firmware_error'))
             return False
         # Skip if we've already inferred on this observation (env publishes a
         # wall-clock timestamp with every snapshot). ts is used ONLY for dedup + logs/staleness;
@@ -259,10 +279,9 @@ class InferenceController:
         ts = obs['timestamp']
         sid = obs['step_id']
         if ts - self._last_inference_obs_ts < 1e-4:
-            print("[InferenceController] timestamp has not advanced")
+            log.debug("timestamp has not advanced")
             return False
 
-        print(f"[InferenceController] preping request | Time elapsed; {time.time()- ts}")
         req = {
             # head (agent) is center-cropped to the target aspect like training; hand is resize-only.
             'agent_imgs': [encode_image(img, center_crop=True) for img in obs['agent_imgs']],
@@ -276,24 +295,16 @@ class InferenceController:
         # Log the proprioception sent to the policy server, keyed by the same obs_ts that
         # chunks.jsonl/traj.jsonl use, so a request can be joined to its resulting action.
         # Images (agent_imgs/hand_imgs) are omitted — large base64 JPEGs, not needed here.
-        with open("requests.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": sid, 
-                                "state": req['state'],
-                                "left_joint": req['left_joint']}) + "\n")
-        
-        print(f"input ee_state{req['state']}")
+        self._trace("requests", {"obs_ts": sid, "state": req['state'], "left_joint": req['left_joint']})
 
-        print(f"[InferenceController] sending request | Time elapsed; {time.time()- ts}")
         resp = post_predict(self.host, self.port, req, timeout=10)
-
         if 'error' in resp:
-            print(f'[InferenceController] \nServer error: {resp["error"]}')
+            log.warning("server error: %s", resp["error"])
             return False
 
         # action rows: [eef_pos(3), 6D_rot(6), gripper(1)]
         action = np.asarray(resp['action'], dtype=np.float32)
-        #print(f"[InferenceController] response recieved! | Time elapsed; {time.time()- ts} | Details:{action}")   # raw (incl. raw gripper)
-        print(f"[InferenceController] response recieved! | Time elapsed; {time.time()- ts}")   # raw (incl. raw gripper)
+        log.debug("response received in %.3fs", time.time() - ts)
         # Binarize the gripper column (idx 9) HERE, as soon as the chunk arrives: the raw [0,~85]
         # gripper signal is noisy (transient spikes), so only a (near-)fully-closed reading
         # (>= GRIPPER_CLOSE_THRESH) becomes closed=1, else open=0. Everything downstream — sim
@@ -306,8 +317,8 @@ class InferenceController:
         self._exec_cursor = 0
 
         # Log the RAW chunk (pre-smoothing), keyed by the master id it's anchored to.
-        with open("chunks.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": sid, "action": action.tolist()}) + "\n")
+        if self._trace_files:
+            self._trace("chunks", {"obs_ts": sid, "action": action.tolist()})
 
         # Buffer + smoothing (AUTO/streaming only): append this raw chunk, then rebuild the long
         # smoothed master buffer over its MUTABLE tail (id > queued_through). The BUFFER — not this
@@ -328,7 +339,6 @@ class InferenceController:
             base_id, buf = self._materialize()
         else:                                                 # manual / TE off -> raw chunk direct
             base_id, buf = sid, action
-        print(f"[InferenceController] buffer rebuilt ({buf.shape[0]} rows) | Time elapsed; {time.time()- ts}")
 
         # Smoothness guard: the buffer feeds the robot, so any id-to-id jump becomes a fast seam.
         # Measure the executed sequence's roughness in EE space over the STILL-MUTABLE rows (the part
@@ -341,17 +351,20 @@ class InferenceController:
             seg = buf[max(0, mut0 - 1):]                       # include one frozen anchor for the seam
             if seg.shape[0] >= 3:
                 dpos = np.linalg.norm(np.diff(seg[:, :3], axis=0), axis=1)
-                d2pos = np.linalg.norm(np.diff(seg[:, :3], n=2, axis=0), axis=1)
-                jerk = float(d2pos.max())
+                jerk = float(np.linalg.norm(np.diff(seg[:, :3], n=2, axis=0), axis=1).max())
                 if dpos.max() > SMOOTHNESS_WARN_DPOS:
-                    print(f"[InferenceController] SMOOTHNESS WARN: buffer |Δpos|max={dpos.max():.4f} "
-                          f"|Δ²pos|max={jerk:.4f} m near seam (clock={cur}, qt={queued_through})")
+                    log.warning("SMOOTHNESS WARN: buffer |Δpos|max=%.4f |Δ²pos|max=%.4f m "
+                                "near seam (clock=%s, qt=%s)", dpos.max(), jerk, cur, queued_through)
+
+        # The robot-facing buffer as a plain list, computed ONCE and reused by the trace, the
+        # robot_info publish, and append_actions (buf.tolist() is the single biggest per-cycle
+        # allocation, so it must not be repeated).
+        buf_list = buf.tolist()
 
         # Log the smoothed buffer (contiguous run actually fed to the robot) for offline inspection.
-        with open("buffer.jsonl", "a") as f:
-            f.write(json.dumps({"obs_ts": sid, "base_id": int(base_id),
-                                "clock": int(cur), "queued_through": int(queued_through),
-                                "jerk": jerk, "buffer": buf.tolist()}) + "\n")
+        self._trace("buffer", {"obs_ts": sid, "base_id": int(base_id),
+                               "clock": int(cur), "queued_through": int(queued_through),
+                               "jerk": jerk, "buffer": buf_list})
         # Publish for robot_info_server / visualisation. left_*_predict_* carry EE-pose data here:
         #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
         #   *_action_values = the smoothed buffer rows
@@ -359,18 +372,17 @@ class InferenceController:
         if self.robot_info is not None:
             with self.robot_info.lock:
                 self.robot_info.left_joint_predict_start_values = copy.deepcopy(obs['state'])
-                self.robot_info.left_joint_predict_action_values = buf.tolist()
+                self.robot_info.left_joint_predict_action_values = buf_list
                 self.robot_info.inference_timestamp = ts
 
-        print(f"[InferenceController] feeding buffer to robot | Time elapsed; {time.time()- ts}")
         if submit and buf.size:
             # AUTO-to-robot (streaming): append_actions reads the live clock + queued_through itself
             # and pulls the window [queued_through+1 .. clock+n] from this contiguous buffer (base_id
             # = its first master id), validating + appending only the not-yet-queued ids. Rows are
             # only ever appended (never cleared); the release loop drains one master id at a time.
-            ok, reason = env.append_actions(buf.tolist(), int(base_id))
+            ok, reason = env.append_actions(buf_list, int(base_id))
             if not ok:
-                print(f"[InferenceController] auto: append skipped — {reason}")
+                log.info("auto: append skipped — %s", reason)
         return True
 
     @staticmethod
@@ -389,7 +401,7 @@ class InferenceController:
         deque preserving the most-recent contents. Returns the applied maxlen."""
         n = max(1, int(n))
         self._te_buffer = deque(self._te_buffer, maxlen=n)   # keeps newest n (deque drops from left)
-        print(f"[InferenceController] te_buffer_len set: {n}")
+        log.info("te_buffer_len set: %d", n)
         return n
 
     @property
@@ -407,8 +419,8 @@ class InferenceController:
         snap = self._make_smoothing(radius, sigma, m)
         self._smooth = snap                               # atomic swap (single ref assignment)
         self.te_radius, self.te_sigma, self.te_m = snap["radius"], snap["sigma"], snap["m"]
-        print(f"[InferenceController] smoothing set: radius={self.te_radius} "
-              f"sigma={self.te_sigma:.2f} m={self.te_m:.3f}")
+        log.info("smoothing set: radius=%d sigma=%.2f m=%.3f",
+                 self.te_radius, self.te_sigma, self.te_m)
         return self.te_radius, self.te_sigma, self.te_m
 
     def _rebuild_buffer(self, queued_through):
@@ -448,44 +460,57 @@ class InferenceController:
         # there (after an E-stop re-anchor queued_through+1 would otherwise be ~0 while max_id is the
         # live clock, spinning over thousands of empty ids).
         mut_lo = max(queued_through + 1, min_sid)
+        n_ids = max_id - mut_lo + 1                        # mutable id i <-> master id (mut_lo + i)
+        if n_ids <= 0:                                     # whole buffer already committed/frozen
+            self._prune_frozen(queued_through, R)         # nothing mutable to rebuild; just prune
+            return
 
         # (a) cross-chunk recency-weighted mean per mutable id (the ACT temporal ensemble).
-        tentative = {}
-        for tid in range(mut_lo, max_id + 1):
-            rows, weights = [], []
-            for idx, (sid, a) in enumerate(raw):
-                j = tid - sid                             # exact integer alignment (no rounding)
-                if 0 <= j < a.shape[0]:
-                    rows.append(a[j])
-                    weights.append(np.exp(-te_m * (newest_idx - idx)))   # newest chunk -> age 0
-            if rows:
-                w = np.asarray(weights, dtype=np.float64)
-                w /= w.sum()
-                tentative[tid] = (w[:, None] * np.asarray(rows, dtype=np.float64)).sum(axis=0)
+        # Each chunk overlaps a CONTIGUOUS span of mutable ids, so it scatter-adds in one vectorised
+        # slice (w*rows) instead of an id-by-id Python loop; per-id weight = sum of contributors.
+        acc = np.zeros((n_ids, 10), dtype=np.float64)
+        wsum = np.zeros(n_ids, dtype=np.float64)
+        for idx, (sid, a) in enumerate(raw):
+            lo, hi = max(mut_lo, sid), min(max_id, sid + a.shape[0] - 1)
+            if lo > hi:                                    # chunk doesn't reach the mutable region
+                continue
+            wc = np.exp(-te_m * (newest_idx - idx))        # newest chunk -> age 0
+            acc[lo - mut_lo:hi - mut_lo + 1] += wc * a[lo - sid:hi - sid + 1]
+            wsum[lo - mut_lo:hi - mut_lo + 1] += wc
+        present = wsum > 0.0                               # ids that any chunk covered
+        tent = acc / np.where(present, wsum, 1.0)[:, None]  # normalized weighted mean (== old w/w.sum)
 
         # (b) symmetric Gaussian along id over the mutable region; frozen rows (<= queued_through)
-        # are fixed left-context. Mutable neighbors read the PRE-smoothing 'tentative' estimate so
-        # this stays a plain symmetric filter (not a recursive/IIR one).
-        for tid in range(mut_lo, max_id + 1):
-            if tid not in tentative:
-                continue
-            acc = np.zeros(9, dtype=np.float64)
-            wsum = 0.0
-            for d in range(-R, R + 1):
-                nid = tid + d
-                ctx = self._buffer.get(nid) if nid <= queued_through else tentative.get(nid)
-                if ctx is None:                           # past the buffer edges -> just skip
-                    continue
-                k = gauss[d + R]
-                acc += k * np.asarray(ctx[:9], dtype=np.float64)
-                wsum += k
-            out = tentative[tid].copy()
-            if wsum > 0.0:
-                out[:9] = acc / wsum                      # pos + rot6d (linear) smoothed along id
-            out[9] = 1.0 if out[9] >= 0.5 else 0.0        # gripper re-binarised (not low-passed)
-            self._buffer[tid] = out                       # write MUTABLE ids only; frozen untouched
+        # are fixed left-context. Read from a dense padded context array (2R wider than the mutable
+        # span) so the convolution is 2R+1 vectorised shifted adds, not an id*kernel Python loop.
+        ext = n_ids + 2 * R
+        ctxv = np.zeros((ext, 9), dtype=np.float64)        # neighbor values, id (mut_lo-R) .. (max_id+R)
+        pres = np.zeros(ext, dtype=np.float64)             # 1 where that neighbor exists
+        ctxv[R:R + n_ids] = tent[:, :9]                    # mutable estimates (pre-smoothing)
+        pres[R:R + n_ids] = present
+        for nid in range(mut_lo - R, mut_lo):              # frozen left-context (<= queued_through)
+            v = self._buffer.get(nid) if nid <= queued_through else None
+            if v is not None:
+                ctxv[nid - (mut_lo - R)] = v[:9]
+                pres[nid - (mut_lo - R)] = 1.0
+        num = np.zeros((n_ids, 9), dtype=np.float64)
+        den = np.zeros(n_ids, dtype=np.float64)
+        for d in range(-R, R + 1):                         # neighbor offset; ext idx of id i is R+i+d
+            k = gauss[d + R]
+            sl = slice(R + d, R + d + n_ids)
+            num += k * ctxv[sl] * pres[sl][:, None]
+            den += k * pres[sl]
+        out = tent.copy()                                  # carries gripper (col 9) + the (a) fallback
+        good = den > 0.0
+        out[good, :9] = num[good] / den[good][:, None]     # pos + rot6d (linear) smoothed along id
+        out[:, 9] = (out[:, 9] >= 0.5)                     # gripper re-binarised (not low-passed)
+        for i in np.nonzero(present)[0]:                   # write MUTABLE ids only; frozen untouched
+            self._buffer[mut_lo + int(i)] = out[i]
 
-        # Prune frozen rows older than the retention window (keep the last TE_RADIUS for context).
+        self._prune_frozen(queued_through, R)
+
+    def _prune_frozen(self, queued_through, R):
+        """Drop frozen rows older than the retention window (keep the last TE_RADIUS for context)."""
         cutoff = queued_through - R + 1
         for k in [k for k in self._buffer if k < cutoff]:
             del self._buffer[k]
@@ -513,7 +538,7 @@ class InferenceController:
         """
         env = self.humanoid_env
         if env is None:
-            print("[InferenceController] humanoid_env not accessible")
+            log.warning("humanoid_env not accessible")
             return False
         deadline = time.monotonic() + 0.3
         while not self.obs_source.inf_ready and time.monotonic() < deadline:
@@ -579,7 +604,7 @@ class InferenceController:
         if stop:
             self.is_auto_inference = False
             if self.inference_thread is not None:
-                print("[InferenceController] Stopping auto_inference thread...")
+                log.info("Stopping auto_inference thread...")
                 self.inference_thread.join()
                 self.inference_thread = None
             # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
@@ -588,8 +613,8 @@ class InferenceController:
 
         env = self.humanoid_env
         if env is None or getattr(env, "sim", None) is None:
-            print("[InferenceController] auto refused: launch the simulation preview first "
-                  "(validation runs through it).")
+            log.warning("auto refused: launch the simulation preview first "
+                        "(validation runs through it).")
             return
 
         self.is_auto_inference = True
@@ -608,7 +633,7 @@ class InferenceController:
                 # (append_actions also refuses while latched, so nothing is queued even in
                 # the brief window before we notice here.)
                 if self.humanoid_env.estopped:
-                    print("[InferenceController] E-stop latched — disarming auto-inference.")
+                    log.warning("E-stop latched — disarming auto-inference.")
                     self.is_auto_inference = False
                     break
                 # submit=True -> validate + splice onto the robot. On a skipped inference (stale
@@ -631,5 +656,5 @@ class InferenceController:
 
         if self.inference_thread is None:
             self.inference_thread = threading.Thread(target=_run_auto_inference, daemon=True)
-            print("[InferenceController] Starting auto_inference (-> robot) thread...")
+            log.info("Starting auto_inference (-> robot) thread...")
             self.inference_thread.start()

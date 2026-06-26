@@ -81,6 +81,19 @@ class StyleMixin:
         _color_button("Muted.TButton", MUTED, MUTED_HOVER)
         _color_button("Accent.TButton", PRIMARY, PRIMARY_HOVER)  # 兼容旧引用
 
+        # ---- 子步监视表（Treeview）----
+        style.configure("Monitor.Treeview",
+                        background=CARD_BG, fieldbackground=CARD_BG, foreground=TEXT,
+                        font=("Consolas", 9), rowheight=23, borderwidth=0)
+        style.configure("Monitor.Treeview.Heading",
+                        background="#e8eaf0", foreground=TEXT,
+                        font=("Microsoft YaHei", 9, "bold"),
+                        padding=(2, 5), relief="flat")
+        style.map("Monitor.Treeview.Heading", background=[("active", "#dfe3ec")])
+        style.map("Monitor.Treeview",
+                  background=[("selected", "#c5cae9")],
+                  foreground=[("selected", TEXT)])
+
         # 复选框
         style.configure("TCheckbutton",
                         background=BG, foreground=TEXT,

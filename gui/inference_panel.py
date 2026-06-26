@@ -283,7 +283,8 @@ class InferenceMixin:
         shows the joint value and its delta vs the previous row / the live pose). Reschedules
         itself ~5 Hz; the staged buffer draining in real time produces the rolling effect."""
         try:
-            # --- live actual left-arm joints + gripper (delta reference for substep #0) ---
+            # --- live actual left-arm joints + gripper -> the pinned top "实时" row, which also
+            #     serves as the delta reference for substep #0 ---
             try:
                 actual = list(self.left_arm_joint_values)
             except Exception:
@@ -293,20 +294,28 @@ class InferenceMixin:
             except Exception:
                 live_grip = None
             if actual is not None and len(actual) >= 7:
-                txt = "   ".join(f"J{k+1}:{actual[k]:+.3f}" for k in range(7))
-                if live_grip is not None:
-                    txt += f"   夹爪:{_grip_label(live_grip)}"
-                self._monitor_actual_var.set(txt)
+                vals = [f"{actual[k]:+.3f}" for k in range(7)]
+                grip_txt = _grip_label(live_grip) if live_grip is not None else "—"
+                self._monitor_tree.item("live", values=("实时", *vals, grip_txt))
                 prev = np.asarray(actual[:7], dtype=np.float64)
             else:
-                self._monitor_actual_var.set("（无法读取关节）")
+                self._monitor_tree.item("live", values=("实时", *["—"] * 8))
                 prev = None
 
-            # --- next up-to-10 staged substeps, with per-joint delta vs the previous row ---
+            # --- upcoming robot commands, with per-joint delta vs the previous row ---
+            # Manual path stages into _staged_release (shown pre-release); the AUTO path appends
+            # straight onto _robot_q and never stages, so fall back to robot_q_preview when nothing
+            # is staged. Either way these are absolute q7 targets, so the same delta logic applies.
             try:
                 subs = self.env.staged_preview(self._monitor_rows)
+                source = "待释放（手动验证）"
+                if not subs:
+                    subs = self.env.robot_q_preview(self._monitor_rows)
+                    source = "真机队列（自动 / 已释放）"
             except Exception:
                 subs = []
+                source = "—"
+            self._monitor_src_var.set(f"队列来源：{source}")
             for i in range(self._monitor_rows):
                 iid = f"subrow{i}"
                 if i < len(subs):
@@ -314,10 +323,11 @@ class InferenceMixin:
                     q = np.asarray(q, dtype=np.float64)
                     if prev is not None and len(prev) >= 7:
                         d = q - prev
-                        vals = [f"{q[k]:+.3f} (Δ{d[k]:+.3f})" for k in range(7)]
+                        vals = [f"{q[k]:+.3f} Δ{d[k]:+.3f}" for k in range(7)]
                     else:
                         vals = [f"{q[k]:+.3f}" for k in range(7)]
-                    self._monitor_tree.item(iid, values=(i, *vals, _grip_label(grip)))
+                    grip_txt = _grip_label(grip) if grip is not None else "—"
+                    self._monitor_tree.item(iid, values=(i, *vals, grip_txt))
                     prev = q
                 else:
                     self._monitor_tree.item(iid, values=(i, *[""] * 8))
@@ -333,12 +343,18 @@ class InferenceMixin:
     # ------------------------------------------------------------------ #
     def setup_inference_panel(self, parent):
         """推理控制面板：左夹爪 / 仿真预览 / 自动运行 / 手动单步 / 真机释放 / 子步监视。"""
-        # 用 Canvas+滚动条 包裹，内容多时可滚动
-        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f5f6f8")
+        # 用 Canvas+滚动条 包裹，内容多时可滚动。
+        # width= 预留足够横向空间，使整面板（含较宽的子步监视表）在默认窗口尺寸下即可完整显示；
+        # 下面的 <Configure> 绑定再把内层 frame 钉到 canvas 视口宽度，窗口变窄时内容自适应回流
+        # （纵向溢出交给竖直滚动条），而不是被裁切到右边缘之外、只能靠放大整窗才能看到。
+        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f5f6f8", width=850)
         sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         body = ttk.Frame(canvas)
         body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=body, anchor="nw")
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        # 内层 frame 始终与 canvas 视口同宽：不再横向裁切；内容用 fill=X / grid 权重 / 可拉伸列
+        # 回流到给定宽度。
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_window, width=e.width))
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -515,34 +531,44 @@ class InferenceMixin:
         self._refresh_tuning_state()             # set initial enabled/disabled + hint
 
         # ===== 子步监视：实时左臂 7 关节 + 待释放子步滚动表（含每关节增量） =====
-        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（左臂 7 关节，单位 rad）  ")
+        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（左臂 7 关节 · rad）  ")
         sec_monitor.pack(fill=tk.X, padx=10, pady=6)
 
-        live_row = ttk.Frame(sec_monitor)
-        live_row.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ttk.Label(live_row, text="实时关节:", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        self._monitor_actual_var = tk.StringVar(value="（等待数据）")
-        ttk.Label(live_row, textvariable=self._monitor_actual_var,
-                  style="Value.TLabel").pack(side=tk.LEFT)
-
-        ttk.Label(sec_monitor,
-                  text="待释放子步（# 0 = 下一个释放；括号内为相对上一行/实时关节的增量 Δ）",
-                  anchor=tk.W).pack(fill=tk.X, padx=8, pady=(2, 2))
+        # 实时关节作为表内置顶高亮行（#＝实时），其下为接下来要下发到真机的子步；统一在同一组
+        # J1~J7 列里读，便于把“当前位姿 → 接下来要执行的子步”连起来看。括号内 Δ＝相对上一行增量。
+        # 子步来源：手动验证时取待释放缓冲（_staged_release）；自动运行/已释放时取真机队列
+        # （_robot_q，即 append_actions 直接喂入的实时指令）。
+        cap_row = ttk.Frame(sec_monitor)
+        cap_row.pack(fill=tk.X, padx=8, pady=(6, 4))
+        ttk.Label(cap_row,
+                  text="置顶行＝实时关节；其下 #0 = 下一个下发的子步，Δ＝相对上一行增量",
+                  style="Subtitle.TLabel", anchor=tk.W).pack(side=tk.LEFT)
+        self._monitor_src_var = tk.StringVar(value="队列来源：—")
+        ttk.Label(cap_row, textvariable=self._monitor_src_var,
+                  style="Value.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
 
         cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "grip")
-        tree = ttk.Treeview(sec_monitor, columns=cols, show="headings", height=10)
+        tree = ttk.Treeview(sec_monitor, columns=cols, show="headings",
+                            height=11, style="Monitor.Treeview")
         tree.heading("idx", text="#")
-        tree.column("idx", width=32, anchor="center", stretch=True)
+        tree.column("idx", width=44, anchor="center", stretch=False)
         for k, c in enumerate(cols[1:8], start=1):
             tree.heading(c, text=f"J{k}")
-            tree.column(c, width=120, anchor="center", stretch=True)
+            tree.column(c, width=96, minwidth=72, anchor="center", stretch=True)
         tree.heading("grip", text="夹爪")
-        tree.column("grip", width=72, anchor="center", stretch=True)
+        tree.column("grip", width=62, anchor="center", stretch=False)
+        # 行样式：置顶实时行高亮；子步行斑马纹交替，便于逐行对照。
+        tree.tag_configure("live", background="#e3f2fd", foreground="#0d47a1",
+                           font=("Consolas", 9, "bold"))
+        tree.tag_configure("odd", background="#ffffff")
+        tree.tag_configure("even", background="#f3f5f9")
         tree.pack(fill=tk.X, padx=8, pady=(0, 8))
         self._monitor_tree = tree
         self._monitor_rows = 10
+        tree.insert("", "end", iid="live", tags=("live",), values=("实时", *["—"] * 8))
         for i in range(self._monitor_rows):
-            tree.insert("", "end", iid=f"subrow{i}", values=(i, *[""] * 8))
+            tree.insert("", "end", iid=f"subrow{i}",
+                        tags=("even" if i % 2 else "odd",), values=(i, *[""] * 8))
 
         # Start the periodic refresh (idempotent — only schedules once).
         if getattr(self, "_monitor_after_id", None) is None:

@@ -11,6 +11,7 @@
 """
 
 import os
+import logging
 import signal
 import sys
 import threading
@@ -35,8 +36,8 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
     def __init__(self, root, camera_mode="all"):
         self.root = root
         self.root.title("智元G1机器人控制界面")
-        self.root.geometry("1500x950")
-        self.root.minsize(1100, 720)
+        self.root.geometry("1600x950")
+        self.root.minsize(1180, 720)
         self._setup_styles()
 
         # 机器人（相机由 HumanoidEnv 持有，见下方 self.env）
@@ -124,8 +125,11 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
         left_frame = ttk.Frame(body)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
+        # 右侧推理控制为固定宽面板（其内部 canvas 已按需预留宽度），左侧相机视图占据剩余空间并随
+        # 窗口伸缩。此前右侧也是 expand=True，两栏按 50/50 平分宽度，而推理面板的 canvas 内容比默认
+        # 窗口的一半还宽，于是右半被裁切。
         right_frame = ttk.LabelFrame(body, text="  🧠  推理控制  ")
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
 
         self.setup_camera_panel(left_frame)         # 左：相机视图
         self.setup_inference_panel(right_frame)     # 右：左夹爪 + 推理控制 + 子步监视
@@ -225,6 +229,16 @@ def _safety_preflight():
 
 
 def main():
+    # Configure the logging that the controllers (e.g. real_world.inference_controller) emit on,
+    # so their INFO/WARNING messages actually reach the console. Without this only a bare
+    # last-resort WARNING handler exists and INFO/DEBUG are dropped. Level is overridable via
+    # HUMANOID_LOG_LEVEL (e.g. DEBUG to surface the per-inference hot-path traces).
+    logging.basicConfig(
+        level=os.environ.get("HUMANOID_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", action="store_true")
     args = parser.parse_args()

@@ -899,6 +899,18 @@ class HumanoidEnv:
             items = list(self._staged_release)[:n]
         return [(np.asarray(q, dtype=np.float64).copy(), float(grip)) for (q, grip) in items]
 
+    def robot_q_preview(self, n=10):
+        """The next up-to-n commands queued for the robot (_robot_q) as (7-joint array, grip)
+        pairs (copies), in execution order. This is the buffer the AUTO-inference path appends to
+        (append_actions) and the release loop drains, so it reflects upcoming real motion in BOTH
+        manual-release and auto-inference modes — unlike staged_preview, which only sees the manual
+        pre-release buffer. _robot_q items are (q7, grip[, row_id]); grip may be None on a ramp
+        substep, passed through as None for the caller to render. Cheap snapshot under the lock."""
+        with self._lock:
+            items = list(self._robot_q)[:n]
+        return [(np.asarray(sub[0], dtype=np.float64).copy(),
+                 (None if sub[1] is None else float(sub[1]))) for sub in items]
+
     def release_n_substeps(self, n):
         """Release up to N staged substeps to the robot: pops the next n from the ready-to-release
         buffer onto _robot_q (which _release_loop hands to the trajectory controller). Releases
