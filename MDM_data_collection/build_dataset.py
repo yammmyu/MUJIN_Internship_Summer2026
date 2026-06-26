@@ -30,8 +30,8 @@ from scipy.spatial.transform import Rotation as R
 # ─── Configuration ────────────────────────────────────────────────────────────
 # Image dimensions MUST match the train config's shape_meta. left_arm_ee_image_320.yaml
 # uses image_shape [C, H, W] = [3, 240, 320] (the native head/hand_left camera resolution).
-IMG_H         = 240   # rows
-IMG_W         = 320   # cols
+IMG_H         = 180   # rows
+IMG_W         = 240   # cols
 CHUNK_T       = 100
 COMPRESSOR    = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
 SMOOTH_SIGMA  = 1.7   # Gaussian sigma in frames; set to 0 to disable smoothing
