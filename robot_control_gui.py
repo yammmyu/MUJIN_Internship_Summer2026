@@ -22,17 +22,18 @@ import argparse
 
 import rclpy
 
-from a2d_sdk.robot import RobotDds as Robot, RobotController
+from a2d_sdk.robot import RobotDds as Robot, RobotController, Slam
 from control_wheel_example import WheelController
 from robot_info_server import create_robot_info_http_server, RobotInfo
 
-from gui import StyleMixin, CameraMixin, InferenceMixin
+from gui import StyleMixin, CameraMixin, InferenceMixin, VRMixin
+from pico_vr.pico_vr_server.server import DummyServer
 from real_world import HumanoidEnv, InferenceController
 from real_world.humanoid_env import RECORD_HZ
 from real_world.sim_backend import SimEnv
 
 
-class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
+class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
     def __init__(self, root, camera_mode="all"):
         self.root = root
         self.root.title("智元G1机器人控制界面")
@@ -43,6 +44,16 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
         # 机器人（相机由 HumanoidEnv 持有，见下方 self.env）
         self.robot = Robot()
         self.robot_controller = RobotController()
+
+        # Slam 必须在进程内实例化，否则 arm/head/waist 的 joint_states 会一直冻结，
+        # 而 VR 执行线程每拍都读取这三者（并 assert 非空）。此处仅创建以解冻关节状态，
+        # 不切换底盘导航模式，避免遥操过程中底盘被自动导航带动。
+        try:
+            self.slam = Slam()
+            print("SLAM 模块初始化成功（已解冻关节状态）")
+        except Exception as e:
+            self.slam = None
+            print(f"⚠️ SLAM 初始化失败，VR 遥操所需关节状态可能不可用: {e}")
 
         # data 模式下保持 3 路相机常开，普通模式不订阅任何相机（无视频流带宽）
         camera_names = ["hand_left", "hand_right", "head"] if camera_mode == "data" else []
@@ -87,6 +98,15 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
         self.left_gripper_pos = 0.0
         self.right_gripper_pos = 0.0
 
+        # ---- VR 遥操共享状态（_handle_vr_joints / 执行线程读写）----
+        # is_vr_control 是总开关：False 时回调照常解析手柄姿态但不下发任何机器人动作。
+        self.is_vr_control = False
+        self.vr_execution_thread = None
+        self.vr_actions = []
+        self.previous_vr_positions = []
+        self.last_joint_update_timestamp = 0.0
+        self.vr_buttons_pressed = set()
+
         # 状态栏
         self.status_text = tk.StringVar()
         self.status_text.set("就绪")
@@ -96,6 +116,18 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
         self.env.start()           # 启动相机采集 + 执行线程（GUI 持有 env 生命周期）
         self.inference.start()
         self.start_camera_thread()
+
+        # ---- VR 遥操数据通道 ----
+        # 上行(:5556)：头显客户端把 HMD+手柄 21 维姿态回传 → on_joints=_handle_vr_joints。
+        #              这是把头显动作接到机器人的唯一连接点。
+        # 下行(:5555)：start_vr_stream_thread 把相机画面合成后 set_image 推给头显。
+        # use_default_image=False：不发内置占位图，等真实相机帧。
+        self.dummy_server = DummyServer(
+            on_joints=self._handle_vr_joints,
+            use_default_image=False,
+        )
+        self.dummy_server.start()
+        self.start_vr_stream_thread()
 
     def setup_ui(self):
         """顶部标题栏 + 左右分栏（左相机 / 右推理控制）+ 底部状态栏。"""
@@ -131,8 +163,43 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
         right_frame = ttk.LabelFrame(body, text="  🧠  推理控制  ")
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
 
+        # VR 遥操面板：包到推理面板左侧（side=RIGHT 后入栈者更靠左）。
+        vr_frame = ttk.LabelFrame(body, text="  🎮  VR 遥操  ")
+        vr_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
+
         self.setup_camera_panel(left_frame)         # 左：相机视图
+        self.setup_vr_panel(vr_frame)               # 中：VR 开关 + 灵敏度参数
         self.setup_inference_panel(right_frame)     # 右：左夹爪 + 推理控制 + 子步监视
+
+    def setup_vr_panel(self, parent):
+        """VR 遥操控制：启动/停止开关 + 灵敏度参数标签页。
+
+        头显客户端连上 :5556 后即把手柄姿态喂给 _handle_vr_joints；但只有按下
+        「启动」把 is_vr_control 置 True，回调才会真正下发机器人动作。执行线程在
+        回调内按 is_vr_control 懒创建/回收，故开关本身即可驱动整条管线。
+        """
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, padx=8, pady=8)
+        self.vr_toggle_btn = ttk.Button(
+            top, text="启动 VR 遥操", style="Primary.TButton",
+            command=self._toggle_vr,
+        )
+        self.vr_toggle_btn.pack(side=tk.LEFT)
+
+        # 灵敏度参数面板需要一个 Notebook 容器（setup_vr_params_panel 调 parent.add）。
+        nb = ttk.Notebook(parent)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self.setup_vr_params_panel(nb)
+
+    def _toggle_vr(self):
+        """翻转 VR 遥操总开关并同步按钮/状态栏文案。"""
+        self.is_vr_control = not self.is_vr_control
+        if self.is_vr_control:
+            self.vr_toggle_btn.config(text="停止 VR 遥操")
+            self.status_text.set("VR 遥操：开（按住 L_Y / R_B 移动手臂）")
+        else:
+            self.vr_toggle_btn.config(text="启动 VR 遥操")
+            self.status_text.set("VR 遥操：关")
 
     # ===================== sim preview (in-process PyBullet) =====================
     def launch_sim(self):
@@ -186,8 +253,12 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin):
             return
         self._is_closing = True
 
+        # VR 总开关先置 False，让执行线程自然退出，再关闭网络服务。
+        self.is_vr_control = False
+
         for label, fn in [
             ("推理控制器", self.inference.stop),
+            ("VR 服务", self.dummy_server.stop),
             ("仿真预览", self._stop_sim),     # 先停仿真步进线程，再关 env
             ("HumanoidEnv", self.env.stop),   # 先停采集/执行线程，再关其持有的相机
             ("机器人", self.robot.shutdown),

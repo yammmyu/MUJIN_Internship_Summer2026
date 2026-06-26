@@ -8,9 +8,11 @@ self.inference / self.camera_images / 各 Tk 变量等）。相机统一经 self
 from gui.styles import StyleMixin
 from gui.camera_panel import CameraMixin
 from gui.inference_panel import InferenceMixin
+from gui.vr_control import VRMixin
 
 __all__ = [
     "StyleMixin",
     "CameraMixin",
     "InferenceMixin",
+    "VRMixin",
 ]
