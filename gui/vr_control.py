@@ -745,16 +745,21 @@ class VRMixin:
 
         # head, left, right, left gripper, right gripper
         action = [None, None, None, None, None]
+        # 夹爪开合 = 点按 L_Y / R_B（边沿触发切换）；按住扳机(trigger) = 该臂随手运动。
+        # 注意 L_Y / R_B 仍是 DataCollectionMixin 的录制闸门（vr_buttons_pressed 不变）。
+        l_gripper_btn = "L_Y" in buttons
+        r_gripper_btn = "R_B" in buttons
         if self.previous_vr_positions and self.is_vr_control:
-            if "L_Y" in buttons:
+            # 按住扳机 = hold-to-operate：仅在按住时手部位姿增量驱动该臂。
+            if left_grab:
                 action[1] = left_hand_position.get_action_delta(self.previous_vr_positions[1])
-            if "R_B" in buttons:
+            if right_grab:
                 action[2] = right_hand_position.get_action_delta(self.previous_vr_positions[2])
-            # TODO: gripper
-            if left_grab and left_grab != self.previous_vr_positions[3]:
+            # 点按 L_Y / R_B 切换对应侧夹爪开合（按下瞬间翻转，松开不动）。
+            if l_gripper_btn and l_gripper_btn != self.previous_vr_positions[3]:
                 self.left_gripper_pos = 0.0 if self.left_gripper_pos > 0.5 else 1.0
                 action[3] = self.left_gripper_pos > 0.5
-            if right_grab and right_grab != self.previous_vr_positions[4]:
+            if r_gripper_btn and r_gripper_btn != self.previous_vr_positions[4]:
                 self.right_gripper_pos = 0.0 if self.right_gripper_pos > 0.5 else 1.0
                 action[4] = self.right_gripper_pos > 0.5
         if any(act is not None for act in action):
@@ -766,7 +771,9 @@ class VRMixin:
             # clear all pending move action when buttons released
             self.vr_actions = []
 
-        self.previous_vr_positions = [head_position, left_hand_position, right_hand_position, left_grab, right_grab]
+        # 槽 3/4 存上一拍的夹爪按钮(L_Y/R_B)状态，供下一拍做边沿检测。
+        self.previous_vr_positions = [head_position, left_hand_position, right_hand_position,
+                                      l_gripper_btn, r_gripper_btn]
 
         if not hasattr(self, 'vr_info'):
             self.vr_info = [now, 0]
