@@ -154,9 +154,9 @@ class VRParameters:
     # ===================== One-Euro 滤波：位置通道 (px, py, pz) =====================
     # mincutoff: 手部静止时的低通截止频率 (Hz)。越低 → 静止越稳，但慢动作越钝/越滞后。
     #            1.0Hz 足以压住 4-12Hz 的生理性手抖。
-    pos_mincutoff: float = 1.0
+    pos_mincutoff: float = 0.3
     # beta: 速度自适应增益。越大 → 动作越快时截止频率放得越开 → 越跟手，但也放进更多抖动。
-    pos_beta: float = 8.0
+    pos_beta: float = 20.0
     # dcutoff: 对「速度估计值」本身的低通截止 (Hz)，通常固定 1.0，无需调。
     pos_dcutoff: float = 1.0
 
@@ -169,17 +169,17 @@ class VRParameters:
     # ===================== 单拍增量计算 (Position.get_action_delta) =====================
     # pose_mult: 平移整体增益（线性缩放手→臂的位移）。1.0 = 1:1 跟手；<1 更迟钝、更稳。
     pose_mult: float = 1.0
-    # qut_mult: 旋转整体增益（线性缩放手→臂的转动）。0.5 = 手腕转动量的一半映射到机械臂。
+    # qut_mult: 旋转整体增益（线性缩放手→臂的转动）。1.0 = 1:1 跟手；0.5 = 手腕转动量的一半映射到机械臂。
     #           想整体提高/降低旋转灵敏度优先调这个。
-    qut_mult: float = 0.5
-    # pos_deadzone: 位置软死区 (m)。单拍位移模长 < 2mm 视为抖动 → 清零。
-    pos_deadzone: float = 0.002
-    # pos_max_delta: 单拍最大位移 (m)，超出按模长钳回(保方向)。0.02m@50Hz ≈ 1.0 m/s 速度上限。
-    pos_max_delta: float = 0.02
+    qut_mult: float = 1.0
+    # pos_deadzone: 位置软死区 (m)。单拍位移模长 < 1mm 视为抖动 → 清零。
+    pos_deadzone: float = 0.001
+    # pos_max_delta: 单拍最大位移 (m)，超出按模长钳回(保方向)。0.04m@50Hz ≈ 2.0 m/s 速度上限。
+    pos_max_delta: float = 0.04
     # quat_deadzone: 姿态软死区 (rad)。单拍旋转模长 < 0.005rad(≈0.3°) 视为抖动 → 清零。
     quat_deadzone: float = 0.005
-    # quat_max_delta: 单拍最大旋转 (rad)，超出按模长钳回。0.02rad@50Hz ≈ 57°/s 速度上限。
-    quat_max_delta: float = 0.02
+    # quat_max_delta: 单拍最大旋转 (rad)，超出按模长钳回。0.04rad@50Hz ≈ 114°/s 速度上限。
+    quat_max_delta: float = 0.04
     # pitch_gain: 手腕「俯仰 (pitch)」轴的额外放大倍数（在通用 qut_mult 之上单独加成）。
     #             1.0 = 不额外放大。注意：此增益施加在「单拍计算」阶段，若 > 1，多数情况下
     #             仍会被下游 merge_rot_clamp 的合并模长钳位抵消 → 想真正提升 pitch 灵敏度，
@@ -189,8 +189,8 @@ class VRParameters:
     # ===================== 队列合并后再钳位 (_rebuild_arm_action) =====================
     # 一个执行周期内可能累加了多拍回调动作，合并后再按模长钳一次，防止积压越界。
     # 这是作用于机械臂的**最终速度上限**，通常应 >= 上面的单拍 *_max_delta。
-    merge_pos_clamp: float = 0.02   # 合并后位移模长上限 (m)
-    merge_rot_clamp: float = 0.02   # 合并后旋转模长上限 (rad)
+    merge_pos_clamp: float = 0.06   # 合并后位移模长上限 (m)
+    merge_rot_clamp: float = 0.04   # 合并后旋转模长上限 (rad)
 
     # ===================== 头部绝对目标限幅 =====================
     # 头部按「绝对目标角」下发（非增量）；以下为偏航/俯仰的行程上下限，保护舵机。
@@ -272,6 +272,83 @@ _VRP_FILTER_ATTRS = frozenset({
     "pos_mincutoff", "pos_beta", "pos_dcutoff",
     "quat_mincutoff", "quat_beta", "quat_dcutoff",
 })
+
+# VR 心跳超过此值(秒)未刷新 → 面板视为「未连接」。与 DataCollectionMixin
+# 的 DC_VR_STALE_TIMEOUT_S 取同一量级:手柄一旦掉线很快就反映为未连接。
+VRC_CONN_TIMEOUT_S = 1.0
+
+# 预设移动的执行参数:get_smooth_paths 的单关节单步上限(rad) + run_trajectory
+# 每航点执行时间(s)。越小越慢越稳。
+VRC_PRESET_SMOOTH_STEP = 0.005
+VRC_PRESET_DT = 0.01
+
+# ---------------------------------------------------------------------- #
+# 单臂「一键回到」预设位姿。**每条 = 面板上一个按钮**;后续要加预设,直接往
+# 这个列表追加字典即可,面板会自动按 side 分组生成按钮,无需改 UI 代码。
+#   label   : 按钮文字
+#   side    : "left" / "right"
+#   joints  : 7 个绝对轴值 (rad) —— 目标关节角
+#   gripper : "open" / "close" / None —— 到位后顺带开/合该侧夹爪;None=不动
+# ---------------------------------------------------------------------- #
+VR_ARM_PRESETS = [
+    {
+        "label": "↩ 左手初始位",
+        "side": "left",
+        "joints": [0.9738845229148865, 0.5554335117340088, -0.6520541310310364,
+                   -1.832319736480713, 0.8602326512336731, 0.7369483709335327,
+                   1.0203189849853516],
+        "gripper": "open",
+    },
+    {
+        "label": "↩ 左手预备位",
+        "side": "left",
+        "joints": [0.7920729517936707, -0.7327778339385986, -0.7821090221405029,
+                   -0.7740122079849243, 0.12358089536428452, 1.321889877319336,
+                   0.3455798029899597],
+        "gripper": "open",
+    },
+    {
+        "label": "↩ 右手初始位",
+        "side": "right",
+        "joints": [-0.8415611982345581, -0.6472030878067017, 0.4974645972251892,
+                   1.8316916227340698, -0.825088381767273, -0.700041651725769,
+                   -1.101060152053833],
+        "gripper": "open",
+    },
+    {
+        "label": "↩ 右手预备位",
+        "side": "right",
+        "joints": [-0.9775315523147583, 0.5038163661956787, 0.9730992317199707,
+                   0.6804278492927551, -0.08786074817180634, -1.4976462125778198,
+                   0.9541834592819214],
+        "gripper": "open",
+    },
+    # 在此追加更多预设(示例):
+    # {"label": "举起左手", "side": "left",
+    #  "joints": [..7 个轴值..], "gripper": None},
+]
+
+# 头部 / 腰部预设的安全上下限(到这里钳一刀,保护舵机)。
+# 头部俯仰放到 ±35° 以容纳 30° 的初始位预设(手动控制里 UI 限幅是 ±0.5rad)。
+VRC_HEAD_YAW_LIMIT = math.radians(60)      # 偏航 ±60°
+VRC_HEAD_PITCH_LIMIT = math.radians(35)    # 俯仰 ±35°
+VRC_WAIST_PITCH_LIMIT = math.radians(45)   # 腰部俯仰 ±45°
+VRC_WAIST_HEIGHT_MIN = 0.0                 # 腰部升降下限 (cm)
+VRC_WAIST_HEIGHT_MAX = 100.0               # 腰部升降上限 (cm)
+
+# 头部「一键回到」预设。**每条 = 一个按钮**,后续直接追加字典即可。
+#   label / yaw_deg(偏航°) / pitch_deg(俯仰°,+ 为下俯)
+# 头部按绝对目标角下发: robot.move_head([yaw_rad, pitch_rad])。
+VR_HEAD_PRESETS = [
+    {"label": "↩ 头部初始位", "yaw_deg": 0.0, "pitch_deg": 30.0},
+]
+
+# 腰部「一键回到」预设。**每条 = 一个按钮**,后续直接追加字典即可。
+#   label / pitch_deg(俯仰°,+ 为前倾) / height_cm(升降高度 cm)
+# 腰部按绝对目标下发: robot.move_waist([pitch_rad, height_cm])。
+VR_WAIST_PRESETS = [
+    {"label": "↩ 腰部初始位", "pitch_deg": 40.0, "height_cm": 2.0},
+]
 
 
 class VRMixin:
