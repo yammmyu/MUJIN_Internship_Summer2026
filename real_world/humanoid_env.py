@@ -29,6 +29,9 @@ import cv2
 import numpy as np
 
 from real_world.ik import IKQuery, build_solver, rot6d_to_quat as _ik_rot6d_to_quat
+# Per-frame proprioception rows (EE pose / grippers) are packed in the training zarr layout
+# by build_data so the live env and the offline replay source share one definition.
+from real_world.build_data import build_ee_pose_row, build_grip_row
 # Timing/rate constants live in ONE place (real_world/timing.py) so RECORD_HZ, the substep rate
 # (CONTROL_HZ/STEP_TIME) and the velocity cap (MAX_JOINT_VEL/MAX_JOINT_STEP) can't drift apart.
 # Re-exported below for back-compat — scripts and tests import these names from humanoid_env.
@@ -93,10 +96,12 @@ RECORD_CAMERAS = ["hand_left", "hand_right", "head"]
 # A camera auto-switches OFF if no consumer has requested it within this window.
 CAMERA_IDLE_TIMEOUT = 5.0
 
-# Camera roles for the left_arm_ee_image policy obs.
-AGENT_CAMERA = "head"        # -> agentview_image
-HAND_CAMERA = "hand_left"    # -> robot0_eye_in_hand_image
-INFERENCE_CAMERAS = [AGENT_CAMERA, HAND_CAMERA]
+# Camera roles for the dual_arm_ee_image policy obs.
+AGENT_CAMERA = "head"               # -> agentview_image
+HAND_CAMERA_LEFT = "hand_left"      # -> robotl_eye_in_hand_image
+HAND_CAMERA_RIGHT = "hand_right"    # -> robotr_eye_in_hand_image
+HAND_CAMERA = HAND_CAMERA_LEFT      # back-compat alias (left wrist)
+INFERENCE_CAMERAS = [AGENT_CAMERA, HAND_CAMERA_LEFT, HAND_CAMERA_RIGHT]
 
 # Every camera name the SDK knows about. A camera is only SUBSCRIBED (i.e. costs
 # DDS bandwidth) while we hold a live CosineCamera object for it — see the
@@ -268,10 +273,13 @@ class HumanoidEnv:
         self._cams = {}                                        # name -> CosineCamera([name]) (live subscription)
         self._frames = {}                                      # name -> rolling [prev, cur]
         self._intrinsics = {}                                  # name -> intrinsics dict (lazy)
-        self._last_two_ee_states = None                        # [s_{t-1}, s_t]
-        # robot0_left_joint obs (policy input): rolling [j_{t-1}, j_t], each = 7 LEFT-arm joint
-        # angles (rad) + 1 RAW gripper value (8-dim). Built alongside the EE pair in _collect_loop.
-        self._last_two_joint_states = None
+        # Dual-arm EE-pose obs (policy input), rolling [row_{t-1}, row_t], each row 9-dim
+        # [pos(3) + rot6d(6)] in the training robot*_eef_pos layout. Built in _collect_loop:
+        # left from calibrated FK on the live joints, right from the firmware status frame.
+        self._last_two_robotl_eef = None
+        self._last_two_robotr_eef = None
+        # robot0_grip obs: rolling [g_{t-1}, g_t], each = [left, right] RAW gripper (2-dim).
+        self._last_two_grip = None
         self._obs_timestamp = 0.0
         # Master row clock (the robot's own execution timeline, in policy-row units, independent of
         # wall-clock). _release_loop advances _current_row_id as substeps dispatch; _collect_loop
@@ -311,11 +319,12 @@ class HumanoidEnv:
     # ===================== lifecycle (RealEnv.start/stop/__enter__) =====================
     @property
     def inf_ready(self):
-        """Ready for inference once the two policy cameras + EE state are populated."""
+        """Ready for inference once the three policy cameras + both EE states are populated."""
         with self._lock:
             frames_ready = all(
-                self._frames.get(n) is not None for n in (AGENT_CAMERA, HAND_CAMERA))
-            return frames_ready and self._last_two_ee_states is not None
+                self._frames.get(n) is not None for n in INFERENCE_CAMERAS)
+            return frames_ready and self._last_two_robotl_eef is not None \
+                and self._last_two_robotr_eef is not None
 
     # ===================== consumer-facing camera switch =====================
     def request(self, name):
@@ -519,21 +528,27 @@ class HumanoidEnv:
             # get_motion_status (firmware error flag + recording) + gripper + arm joints per tick.
             try:
                 status = self.robot_controller.get_motion_status()
-                grip = self.robot.gripper_states()[0]
-                arm14 = self._read_arm14()              # refresh last-good arm read (C4)
-                # obs EE is FK on the LIVE joints, NOT status['frames']['arm_left_link7']: the
+                grip = self.robot.gripper_states()[0]     # array-like [left, right] RAW gripper
+                arm14 = self._read_arm14()                # refresh last-good arm read (C4)
+                # LEFT EE obs is FK on the LIVE joints, NOT status['frames']['arm_left_link7']: the
                 # firmware parks its EE/FK estimator while an ABS_JOINT trajectory executes
                 # (auto-inference), freezing that frame even though arm_joint_states() stays live.
                 # FK keeps the EE tracking the arm and matches the training EE frame (see _left_ee_fk).
-                # robot0_left_joint obs: 7 LEFT-arm joint angles (rad) + RAW gripper (matches the
-                # training zarr layout). grip is array-like; take grip[0] scalar so rows are pure
-                # Python floats (JSON-safe, homogeneous).
-                ee_state = self._left_ee_fk(arm14[:7], float(grip[0])) if arm14 is not None else None
-                # print(f"ee_state from getter: {ee_state}")
-                joint_state = (arm14[:7].tolist() + [float(grip[0])]) if arm14 is not None else None
+                robotl_eef = self._left_ee_fk(arm14[:7]) if arm14 is not None else None
+                # RIGHT EE obs comes from the firmware status frame arm_right_link7 (same source the
+                # recordings used for right_pos/right_quat). The right arm is NEVER commanded here, so
+                # its FK frame never parks -> the firmware estimate stays valid; no right-arm solver
+                # is needed. Both rows are 9-dim [pos(3) + rot6d(6)] (training robot*_eef_pos layout).
+                if status is not None and 'frames' in status:
+                    rp = self._extract_pose(status['frames']['arm_right_link7'])
+                    robotr_eef = build_ee_pose_row(rp[:3], rp[3:7])
+                else:
+                    robotr_eef = None
+                # robot0_grip obs: [left, right] RAW gripper (matches the training zarr layout).
+                grip_state = build_grip_row(grip[0], grip[1]) if grip is not None else None
             except Exception as e:
                 print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
-                status = grip = ee_state = joint_state = None
+                status = grip = robotl_eef = robotr_eef = grip_state = None
 
             frames = self._read_frames(desired)
 
@@ -541,10 +556,10 @@ class HumanoidEnv:
             # bump _fresh_mono. A frozen feed (stale arm_joint_states / dropped camera) stops
             # advancing _fresh_mono even though `now` keeps moving, so get_obs can flag staleness.
             changed = False
-            ee_sig = tuple(np.round(ee_state, 6)) if ee_state is not None else None
+            ee_sig = tuple(np.round(robotl_eef, 6)) if robotl_eef is not None else None
             if ee_sig is not None and ee_sig != self._last_ee_sig:
                 changed = True
-            cam_sigs = {n: self._frame_sig(frames[n][-1]) for n in (AGENT_CAMERA, HAND_CAMERA)
+            cam_sigs = {n: self._frame_sig(frames[n][-1]) for n in INFERENCE_CAMERAS
                         if n in frames}
             for n, sig in cam_sigs.items():
                 if sig != self._last_cam_sig.get(n):
@@ -562,16 +577,15 @@ class HumanoidEnv:
                     self._fresh_mono = now_mono
                 for name, pair in frames.items():
                     self._frames[name] = pair
-                if ee_state is not None:
-                    if self._last_two_ee_states:
-                        self._last_two_ee_states = [self._last_two_ee_states[-1], ee_state]
-                    else:
-                        self._last_two_ee_states = [ee_state, ee_state]
-                if joint_state is not None:
-                    if self._last_two_joint_states:
-                        self._last_two_joint_states = [self._last_two_joint_states[-1], joint_state]
-                    else:
-                        self._last_two_joint_states = [joint_state, joint_state]
+                if robotl_eef is not None:
+                    self._last_two_robotl_eef = ([self._last_two_robotl_eef[-1], robotl_eef]
+                                                 if self._last_two_robotl_eef else [robotl_eef, robotl_eef])
+                if robotr_eef is not None:
+                    self._last_two_robotr_eef = ([self._last_two_robotr_eef[-1], robotr_eef]
+                                                 if self._last_two_robotr_eef else [robotr_eef, robotr_eef])
+                if grip_state is not None:
+                    self._last_two_grip = ([self._last_two_grip[-1], grip_state]
+                                           if self._last_two_grip else [grip_state, grip_state])
 
             # Append a recording row while a session is active.
             with self._rec_lock:
@@ -598,19 +612,17 @@ class HumanoidEnv:
             quat['x'], quat['y'], quat['z'], quat['w'],
         )
 
-    def _left_ee_fk(self, arm7, grip):
-        """Left EE [pos(3), quat xyzw(4), grip(1)] via pinocchio FK on the LIVE arm joints.
+    def _left_ee_fk(self, arm7):
+        """Left EE obs row [pos(3) + rot6d(6)] (9-dim) via pinocchio FK on the LIVE arm joints.
 
         The obs EE comes from FK, NOT status['frames']['arm_left_link7']: the firmware parks its
         EE/FK estimator while an ABS_JOINT trajectory executes (auto-inference), so that frame
         FREEZES even though arm_joint_states() stays live. FK from the live joints keeps the EE
         tracking the arm and matches the training EE frame (~3mm vs firmware FK, calibrated via
         fk_calibration.json — recordings were collected under EE-space teleop while the firmware
-        FK was live). `grip` is the scalar gripper reading, binarized as in the recordings."""
+        FK was live). The gripper is published separately (robot0_grip), not in this row."""
         pos, quat = self.solver.m.fk(np.asarray(arm7, dtype=np.float64))
-        return [float(pos[0]), float(pos[1]), float(pos[2]),
-                float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]),
-                grip]
+        return build_ee_pose_row(pos, quat)
 
     @staticmethod
     def _frame_sig(frame):
@@ -663,34 +675,38 @@ class HumanoidEnv:
     def get_obs(self):
         """Time-aligned snapshot for one inference, or None if not ready yet.
 
-        Returns dict with role-mapped image pairs + the last two EE states:
-            agent_imgs: [head_{t-1}, head_t]
-            hand_imgs:  [hand_left_{t-1}, hand_left_t]
-            state:      [ee_{t-1}, ee_t]   each [pos(3), quat(4), grip(1)]
+        Returns the dual_arm_ee_image obs (see build_data.build_predict_request):
+            agent_imgs:     [head_{t-1}, head_t]
+            handl_imgs:     [hand_left_{t-1},  hand_left_t]
+            handr_imgs:     [hand_right_{t-1}, hand_right_t]
+            robotl_eef_pos: [row_{t-1}, row_t]   each [pos(3) + rot6d(6)] (9)
+            robotr_eef_pos: [row_{t-1}, row_t]   each [pos(3) + rot6d(6)] (9)
+            robot0_grip:    [g_{t-1}, g_t]       each [left, right] (2)
             timestamp:  float (seconds)
             age:        seconds since the EE pose / cameras last actually changed (H2)
             stale:      True if age > STALE_TIMEOUT or the firmware reports an error
             firmware_error: bool
         """
-        # Keep the two policy cameras warm while inference polls get_obs().
-        print("[HumanoidEnv] requesting hand and head camera")
-        self.request(AGENT_CAMERA)
-        self.request(HAND_CAMERA)
+        # Keep the three policy cameras warm while inference polls get_obs().
+        for cam in INFERENCE_CAMERAS:
+            self.request(cam)
         with self._lock:
-            if self._last_two_ee_states is None or self._last_two_joint_states is None:
-                print("[HumanoidEnv] Waiting for EE / joint states")
+            if (self._last_two_robotl_eef is None or self._last_two_robotr_eef is None
+                    or self._last_two_grip is None):
+                print("[HumanoidEnv] Waiting for EE / gripper states")
                 return None
-            if any(self._frames.get(n) is None for n in (AGENT_CAMERA, HAND_CAMERA)):
+            if any(self._frames.get(n) is None for n in INFERENCE_CAMERAS):
                 print("[HumanoidEnv] Wait for Camera")
                 return None
             age = (time.monotonic() - self._fresh_mono) if self._fresh_mono else float('inf')
             stale = age > STALE_TIMEOUT or self._firmware_has_error
             return {
                 'agent_imgs': copy.deepcopy(self._frames[AGENT_CAMERA]),
-                'hand_imgs': copy.deepcopy(self._frames[HAND_CAMERA]),
-                'state': copy.deepcopy(self._last_two_ee_states),
-                # robot0_left_joint policy input: [j_{t-1}, j_t], each 7 left-arm joints + raw gripper.
-                'joint_state': copy.deepcopy(self._last_two_joint_states),
+                'handl_imgs': copy.deepcopy(self._frames[HAND_CAMERA_LEFT]),
+                'handr_imgs': copy.deepcopy(self._frames[HAND_CAMERA_RIGHT]),
+                'robotl_eef_pos': copy.deepcopy(self._last_two_robotl_eef),
+                'robotr_eef_pos': copy.deepcopy(self._last_two_robotr_eef),
+                'robot0_grip': copy.deepcopy(self._last_two_grip),
                 'timestamp': self._obs_timestamp,
                 'step_id': self._obs_row_id,    # master row-ID for alignment (see ensemble/ingest)
                 'age': age,

@@ -1,53 +1,56 @@
 """
 Converts filtered robot recordings into a Zarr dataset compatible with
-diffusion_policy/config/task/left_arm_ee_image.yaml.
+diffusion_policy/config/task/dual_arm_ee_image.yaml.
 
-Left arm only.
+Dual arm (left + right).
 
-Output Zarr schema (H x W = 240 x 320, matching task/left_arm_ee_image_320.yaml):
-  data/agentview_image              (N, 240, 320, 3)  uint8  — head camera (RGB)
-  data/robot0_eye_in_hand_image     (N, 240, 320, 3)  uint8  — hand_left camera (RGB)
-  data/robot0_eef_pos               (N, 3)          float32  — EE position (metres)
-  data/robot0_eef_quat              (N, 4)          float32  — EE quaternion [qx,qy,qz,qw]
-  data/robot0_left_joint            (N, 8)          float32  — 7 left arm joint angles (rad) + 1 left gripper
-  data/action                       (N, 10)         float32  — [pos(3) + rot6d(6) + gripper(1)]
-  meta/episode_ends                 (E,)            int64    — cumulative frame boundaries
+Output Zarr schema (H x W = 180 x 240, matching task/dual_arm_ee_image.yaml's
+image_shape [C, H, W] = [3, 180, 240]):
+  data/agentview_image            (N, 180, 240, 3)  uint8  — head camera (RGB)
+  data/robotl_eye_in_hand_image   (N, 180, 240, 3)  uint8  — hand_left camera (RGB)
+  data/robotr_eye_in_hand_image   (N, 180, 240, 3)  uint8  — hand_right camera (RGB)
+  data/robotl_eef_pos             (N, 9)          float32  — left  EE [pos(3) + rot6d(6)] (raw)
+  data/robotr_eef_pos             (N, 9)          float32  — right EE [pos(3) + rot6d(6)] (raw)
+  data/robot0_grip                (N, 2)          float32  — [left, right] gripper (0=open 1=closed)
+  data/action                     (N, 20)         float32  — L[pos(3)+rot6d(6)+grip(1)] ++ R[pos(3)+rot6d(6)+grip(1)]
+  meta/episode_ends               (E,)            int64    — cumulative frame boundaries
+
+Observations (robot*_eef_pos, robot0_grip) stay RAW so they match the camera
+ground truth. Actions use Gaussian-smoothed EE trajectories to reduce
+teleoperation jerk. Position/rotation layout is pos-first in both obs and action.
 
 Usage:
-    python build_dataset.py                          # recordings_filtered/ → robot_dataset.zarr
+    python build_dataset.py                          # recordings_filtered/ → dual_ee.zarr
     python build_dataset.py --src recordings --out my.zarr
 """
 import argparse
+import os
 import pathlib
+import sys
 
 import cv2
 import numcodecs
 import numpy as np
 import zarr
 from scipy.ndimage import gaussian_filter1d
-from scipy.spatial.transform import Rotation as R
+
+# Single source of truth for the obs/transform pipeline, shared with INFERENCE
+# (real_world/build_data.py). Importing the image crop/resize, the quaternion->6D rotation,
+# the EE-row layout and the IMG_* / AGENT_CROP_ZOOM constants from there GUARANTEES the training
+# data and the deployed observations are built by the exact same code (parity by construction,
+# not by hand-synced copies). The only train/deploy gap left is the image codec (mp4 vs JPEG).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from real_world.build_data import (  # noqa: E402
+    IMG_H, IMG_W, preprocess_frame, quat_to_rot6d, build_ee_pose,
+)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-# Image dimensions MUST match the train config's shape_meta. left_arm_ee_image_320.yaml
-# uses image_shape [C, H, W] = [3, 240, 320] (the native head/hand_left camera resolution).
-IMG_H         = 180   # rows
-IMG_W         = 240   # cols
 CHUNK_T       = 100
 COMPRESSOR    = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
 SMOOTH_SIGMA  = 1.7   # Gaussian sigma in frames; set to 0 to disable smoothing
-FROZEN_JOINT_EPS = 1e-3  # rad; per-episode joint range below this ⇒ frozen arm_joint_states
 
 
-# ─── Rotation conversion ─────────────────────────────────────────────────────
-
-def quat_to_rot6d(quat: np.ndarray) -> np.ndarray:
-    """
-    (N, 4) [qx, qy, qz, qw] → (N, 6) continuous 6D rotation representation.
-    First two columns of the rotation matrix, row-major.
-    """
-    mat = R.from_quat(quat).as_matrix()                          # (N, 3, 3)
-    return np.concatenate([mat[..., 0], mat[..., 1]], axis=-1)   # (N, 6)
-
+# ─── Action smoothing (TRAINING ONLY — obs stays raw, see build_data) ────────
 
 def smooth_pos(pos: np.ndarray, sigma: float) -> np.ndarray:
     """Gaussian smooth (N, 3) position along time axis."""
@@ -73,55 +76,40 @@ def _sign_fix_and_smooth_quat(quat: np.ndarray, sigma: float) -> np.ndarray:
     return q
 
 
+def arm_action(pos: np.ndarray, quat: np.ndarray, grip: np.ndarray,
+               sigma: float) -> np.ndarray:
+    """One arm's action: smoothed [pos(3) + rot6d(6) + grip(1)] → (N,10).
+
+    pos/quat are smoothed; the gripper command is kept raw (≈binary). Training-only: the action
+    target is smoothed, but the OBS (eef_pose via build_data.build_ee_pose) stays raw."""
+    pos_s  = smooth_pos(pos, sigma)
+    quat_s = _sign_fix_and_smooth_quat(quat, sigma)
+    return np.concatenate([pos_s, quat_to_rot6d(quat_s), grip], axis=1)  # (N, 10)
+
+
 # ─── Video loading ────────────────────────────────────────────────────────────
 
-# The head camera is recorded at its native 1280x800 (16:10); the hand_left camera
-# at 320x240 (4:3 == the target). A plain resize of the head frame to 320x240 would
-# squish it horizontally, so the head frame is CENTER-CROPPED to the target aspect
-# ratio first, then downsized. AGENT_CROP_ZOOM > 1.0 crops tighter (zooms in).
-# IMPORTANT: the inference server (inference_left_server.py) MUST apply the identical
-# crop to the live head frame, or training and deployment observations won't match.
-AGENT_CROP_ZOOM = 1.0   # 1.0 = minimal crop (aspect fix only); >1.0 = tighter centre crop
+# The head camera is recorded at its native 1280x800 (16:10); the hand cameras at 320x240
+# (4:3 == the target aspect). The crop+resize itself is build_data.preprocess_frame — THE shared
+# transform used at inference too — so training and deployment pixels match (up to mp4-vs-JPEG).
 
+def read_video(path: pathlib.Path, center_crop: bool = False) -> np.ndarray:
+    """Returns (N, IMG_H, IMG_W, 3) uint8 RGB, or empty array if file missing.
 
-def center_crop_to_aspect(frame: np.ndarray, target_w: int, target_h: int,
-                          zoom: float = 1.0) -> np.ndarray:
-    """Center-crop `frame` to the target aspect ratio (target_w / target_h),
-    optionally zooming in by `zoom` (>1 -> tighter crop). Returns a cropped view."""
-    h, w = frame.shape[:2]
-    target_ar = target_w / target_h
-    if w / h > target_ar:        # source too wide -> limited by height
-        crop_h, crop_w = h, int(round(h * target_ar))
-    else:                        # source too tall -> limited by width
-        crop_w, crop_h = w, int(round(w / target_ar))
-    crop_w = min(w, int(round(crop_w / zoom)))
-    crop_h = min(h, int(round(crop_h / zoom)))
-    x0, y0 = (w - crop_w) // 2, (h - crop_h) // 2
-    return frame[y0:y0 + crop_h, x0:x0 + crop_w]
-
-
-def read_video(path: pathlib.Path, h: int = IMG_H, w: int = IMG_W,
-               center_crop: bool = False, zoom: float = 1.0) -> np.ndarray:
-    """Returns (N, h, w, 3) uint8 RGB, or empty array if file missing.
-
-    center_crop=True center-crops each frame to the (w, h) aspect ratio before
-    downsizing (used for the head camera, whose native aspect != target)."""
+    center_crop=True center-crops each frame to the target aspect before downsizing (used for the
+    head camera, whose native aspect != target). All pixel work is the shared preprocess_frame."""
     if not path.exists():
-        return np.empty((0, h, w, 3), dtype=np.uint8)
+        return np.empty((0, IMG_H, IMG_W, 3), dtype=np.uint8)
     cap    = cv2.VideoCapture(str(path))
     frames = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        if center_crop:
-            frame = center_crop_to_aspect(frame, w, h, zoom)
-        # INTER_AREA is the right filter for downscaling (matches the inference server)
-        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)  # (width, height)
-        frames.append(frame.astype(np.uint8))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(preprocess_frame(rgb, center_crop).astype(np.uint8))
     cap.release()
-    return np.stack(frames) if frames else np.empty((0, h, w, 3), dtype=np.uint8)
+    return np.stack(frames) if frames else np.empty((0, IMG_H, IMG_W, 3), dtype=np.uint8)
 
 
 # ─── Zarr helpers ─────────────────────────────────────────────────────────────
@@ -144,12 +132,13 @@ def init_zarr(out_path: pathlib.Path) -> tuple[zarr.Group, dict]:
         )
 
     arrays = {
-        'agentview_image':          arr('agentview_image',          IMG_H, IMG_W, 3, dtype='u1'),
-        'robot0_eye_in_hand_image': arr('robot0_eye_in_hand_image', IMG_H, IMG_W, 3, dtype='u1'),
-        'robot0_eef_pos':           arr('robot0_eef_pos',           3),
-        'robot0_eef_quat':          arr('robot0_eef_quat',          4),
-        'robot0_left_joint':        arr('robot0_left_joint',        8),
-        'action':                   arr('action',                   10),
+        'agentview_image':           arr('agentview_image',           IMG_H, IMG_W, 3, dtype='u1'),
+        'robotl_eye_in_hand_image':  arr('robotl_eye_in_hand_image',  IMG_H, IMG_W, 3, dtype='u1'),
+        'robotr_eye_in_hand_image':  arr('robotr_eye_in_hand_image',  IMG_H, IMG_W, 3, dtype='u1'),
+        'robotl_eef_pos':            arr('robotl_eef_pos',            9),
+        'robotr_eef_pos':            arr('robotr_eef_pos',            9),
+        'robot0_grip':               arr('robot0_grip',               2),
+        'action':                    arr('action',                    20),
     }
     return store, arrays
 
@@ -164,7 +153,7 @@ def append_to(arr: zarr.Array, data: np.ndarray) -> None:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
-    episodes = sorted(src_dir.glob('recording*'))
+    episodes = sorted(p for p in src_dir.glob('recording*') if p.is_dir())
     if not episodes:
         raise FileNotFoundError(f"No episodes found in {src_dir}")
     print(f"Found {len(episodes)} episodes in {src_dir}\n")
@@ -173,9 +162,11 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
     episode_ends  = []
     total         = 0
 
-    # accumulated for smoothing-comparison NPZ
-    raw_pos_all, raw_quat_all     = [], []
-    smooth_pos_all, smooth_quat_all = [], []
+    # accumulated for the smoothing-comparison NPZ (per arm)
+    raw_pos_all  = {'l': [], 'r': []}
+    raw_quat_all = {'l': [], 'r': []}
+    sm_pos_all   = {'l': [], 'r': []}
+    sm_quat_all  = {'l': [], 'r': []}
 
     for ep in episodes:
         print(f"Processing {ep.name}...")
@@ -184,59 +175,55 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         n      = len(states['timestamps'])
 
         # ── Images ──────────────────────────────────────────────────────────
-        # head: native 1280x800 -> centre-crop to 4:3 then downsize (see read_video).
-        # hand_left: already 320x240, so a plain resize is effectively identity.
-        head_frames = read_video(ep / 'cameras' / 'head.mp4',
-                                 center_crop=True, zoom=AGENT_CROP_ZOOM)  # (N, 240, 320, 3)
-        hand_frames = read_video(ep / 'cameras' / 'hand_left.mp4')        # (N, 240, 320, 3)
+        # head: native 16:10 -> centre-crop to 4:3 then downsize (see read_video).
+        # hand_*: already 4:3, so the resize keeps aspect.
+        head_frames  = read_video(ep / 'cameras' / 'head.mp4', center_crop=True)
+        handl_frames = read_video(ep / 'cameras' / 'hand_left.mp4')
+        handr_frames = read_video(ep / 'cameras' / 'hand_right.mp4')
 
-        # Guard against minor frame-count drift between video and NPZ
-        n = min(n, len(head_frames), len(hand_frames))
+        # Guard against minor frame-count drift between videos and NPZ
+        n = min(n, len(head_frames), len(handl_frames), len(handr_frames))
         if n == 0:
             print(f"  SKIP — no usable frames")
             continue
 
-        head_frames = head_frames[:n]
-        hand_frames = hand_frames[:n]
+        head_frames  = head_frames[:n]
+        handl_frames = handl_frames[:n]
+        handr_frames = handr_frames[:n]
 
-        # ── Left arm state ───────────────────────────────────────────────────
-        left_pos   = states['left_pos'][:n]        # (N, 3)
-        left_quat  = states['left_quat'][:n]       # (N, 4)  [qx,qy,qz,qw]
-        gripper    = states['gripper'][:n, :1]     # (N, 1)  left gripper value
-        left_joint = states['arm_joints'][:n, :7]  # (N, 7)  left arm joint angles (rad)
+        # ── Arm state ─────────────────────────────────────────────────────────
+        left_pos   = states['left_pos'][:n]      # (N, 3)
+        left_quat  = states['left_quat'][:n]     # (N, 4)  [qx,qy,qz,qw]
+        right_pos  = states['right_pos'][:n]     # (N, 3)
+        right_quat = states['right_quat'][:n]    # (N, 4)
+        grip       = states['gripper'][:n, :2]   # (N, 2)  [left, right]
+        left_grip  = grip[:, :1]                 # (N, 1)
+        right_grip = grip[:, 1:2]                # (N, 1)
 
-        # Guard: arm_joint_states() freezes (stale, constant) unless a Slam()
-        # instance was alive in the collection process. A frozen episode yields a
-        # near-constant robot0_left_joint, which is useless as an observation.
-        if n > 1:
-            joint_span = float(np.ptp(left_joint, axis=0).max())
-            if joint_span < FROZEN_JOINT_EPS:
-                print(f"  WARNING — arm_joints look FROZEN "
-                      f"(max range {joint_span:.2e} rad < {FROZEN_JOINT_EPS:.0e}); "
-                      f"was Slam() running during collection?")
+        # ── Observations (RAW) ────────────────────────────────────────────────
+        # build_ee_pose is the SHARED obs layout (real_world/build_data.py) — the live env /
+        # replay build their obs rows from the same function, so train == deploy by construction.
+        robotl_eef_pos = build_ee_pose(left_pos,  left_quat)   # (N, 9)
+        robotr_eef_pos = build_ee_pose(right_pos, right_quat)  # (N, 9)
 
-        # ── Action = [pos(3) + rot6d(6) + gripper(1)] ───────────────────────
-        # Observations stay raw (must match camera ground truth).
-        # Actions use smoothed trajectories to reduce teleoperation jerk.
-        pos_smooth  = smooth_pos(left_pos, SMOOTH_SIGMA)
-        quat_smooth = _sign_fix_and_smooth_quat(left_quat, SMOOTH_SIGMA)
-        rot6d       = quat_to_rot6d(quat_smooth)                            # (N, 6)
-        action      = np.concatenate([pos_smooth, rot6d, gripper], axis=1)  # (N, 10)
+        # ── Action = L[pos+rot6d+grip] ++ R[pos+rot6d+grip] = (N, 20) ─────────
+        action_l = arm_action(left_pos,  left_quat,  left_grip,  SMOOTH_SIGMA)   # (N,10)
+        action_r = arm_action(right_pos, right_quat, right_grip, SMOOTH_SIGMA)   # (N,10)
+        action   = np.concatenate([action_l, action_r], axis=1)                 # (N,20)
 
-        raw_pos_all.append(left_pos)
-        raw_quat_all.append(left_quat)
-        smooth_pos_all.append(pos_smooth)
-        smooth_quat_all.append(quat_smooth)
+        for tag, pos, quat in (('l', left_pos, left_quat), ('r', right_pos, right_quat)):
+            raw_pos_all[tag].append(pos)
+            raw_quat_all[tag].append(quat)
+            sm_pos_all[tag].append(smooth_pos(pos, SMOOTH_SIGMA))
+            sm_quat_all[tag].append(_sign_fix_and_smooth_quat(quat, SMOOTH_SIGMA))
 
-        # left_joint = 7 arm joint angles + 1 gripper, to satisfy config shape [8]
-        robot0_left_joint = np.concatenate([left_joint, gripper], axis=1)  # (N, 8)
-
-        # ── Append ───────────────────────────────────────────────────────────
+        # ── Append ────────────────────────────────────────────────────────────
         append_to(arrays['agentview_image'],          head_frames)
-        append_to(arrays['robot0_eye_in_hand_image'], hand_frames)
-        append_to(arrays['robot0_eef_pos'],           left_pos)
-        append_to(arrays['robot0_eef_quat'],          left_quat)
-        append_to(arrays['robot0_left_joint'],        robot0_left_joint)
+        append_to(arrays['robotl_eye_in_hand_image'], handl_frames)
+        append_to(arrays['robotr_eye_in_hand_image'], handr_frames)
+        append_to(arrays['robotl_eef_pos'],           robotl_eef_pos)
+        append_to(arrays['robotr_eef_pos'],           robotr_eef_pos)
+        append_to(arrays['robot0_grip'],              grip)
         append_to(arrays['action'],                   action)
 
         total += n
@@ -247,11 +234,15 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
     npz_path = out_path.with_suffix('.smooth_debug.npz')
     np.savez(
         npz_path,
-        raw_pos          = np.concatenate(raw_pos_all,    axis=0),
-        raw_quat         = np.concatenate(raw_quat_all,   axis=0),
-        smooth_pos       = np.concatenate(smooth_pos_all, axis=0),
-        smooth_quat      = np.concatenate(smooth_quat_all, axis=0),
-        episode_ends     = np.array(episode_ends, dtype=np.int64),
+        raw_pos_l    = np.concatenate(raw_pos_all['l'],  axis=0),
+        raw_quat_l   = np.concatenate(raw_quat_all['l'], axis=0),
+        smooth_pos_l = np.concatenate(sm_pos_all['l'],   axis=0),
+        smooth_quat_l= np.concatenate(sm_quat_all['l'],  axis=0),
+        raw_pos_r    = np.concatenate(raw_pos_all['r'],  axis=0),
+        raw_quat_r   = np.concatenate(raw_quat_all['r'], axis=0),
+        smooth_pos_r = np.concatenate(sm_pos_all['r'],   axis=0),
+        smooth_quat_r= np.concatenate(sm_quat_all['r'],  axis=0),
+        episode_ends = np.array(episode_ends, dtype=np.int64),
     )
     print(f"  Smoothing debug data → {npz_path}")
 
@@ -277,7 +268,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--src', default='recordings_filtered',
                         help='Source dir (falls back to recordings/ if not found)')
-    parser.add_argument('--out', default='robot_dataset.zarr',
+    parser.add_argument('--out', default='dual_ee.zarr',
                         help='Output Zarr store path')
     parser.add_argument('--sigma', type=float, default=SMOOTH_SIGMA,
                         help='Gaussian sigma (frames) for action smoothing; 0 = disabled')

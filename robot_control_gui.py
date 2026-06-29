@@ -26,14 +26,14 @@ from a2d_sdk.robot import RobotDds as Robot, RobotController, Slam
 from control_wheel_example import WheelController
 from robot_info_server import create_robot_info_http_server, RobotInfo
 
-from gui import StyleMixin, CameraMixin, InferenceMixin, VRMixin
+from gui import StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataCollectionMixin
 from pico_vr.pico_vr_server.server import DummyServer
 from real_world import HumanoidEnv, InferenceController
 from real_world.humanoid_env import RECORD_HZ
 from real_world.sim_backend import SimEnv
 
 
-class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
+class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataCollectionMixin):
     def __init__(self, root, camera_mode="all"):
         self.root = root
         self.root.title("智元G1机器人控制界面")
@@ -106,6 +106,9 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
         self.previous_vr_positions = []
         self.last_joint_update_timestamp = 0.0
         self.vr_buttons_pressed = set()
+        # 最新摇杆轴快照（[L_x, L_y, R_x, R_y]），由 _handle_vr_joints 每拍刷新；
+        # 50Hz 执行线程据此做摇杆腕部滚转（速率控制）。
+        self.vr_axes = []
 
         # 状态栏
         self.status_text = tk.StringVar()
@@ -176,13 +179,20 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
         self.setup_vr_panel(vr_tab)
 
     def setup_vr_panel(self, parent):
-        """VR 遥操控制：启动/停止开关 + 灵敏度参数标签页。
+        """VR 遥操控制：左侧启动/停止开关 + 灵敏度参数标签页，右侧数据采集面板。
 
         头显客户端连上 :5556 后即把手柄姿态喂给 _handle_vr_joints；但只有按下
         「启动」把 is_vr_control 置 True，回调才会真正下发机器人动作。执行线程在
         回调内按 is_vr_control 懒创建/回收，故开关本身即可驱动整条管线。
+
+        数据采集面板复用 self.env 的录制 API（start/stop_recording），可在遥操过程中
+        边操作边录制；右侧固定宽，左侧 VR 控制随窗口伸缩。
         """
-        top = ttk.Frame(parent)
+        # 左：VR 控制（开关 + 灵敏度参数），占据剩余空间并随窗口伸缩。
+        left = ttk.Frame(parent)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        top = ttk.Frame(left)
         top.pack(fill=tk.X, padx=8, pady=8)
         self.vr_toggle_btn = ttk.Button(
             top, text="启动 VR 遥操", style="Primary.TButton",
@@ -191,9 +201,14 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin):
         self.vr_toggle_btn.pack(side=tk.LEFT)
 
         # 灵敏度参数面板需要一个 Notebook 容器（setup_vr_params_panel 调 parent.add）。
-        nb = ttk.Notebook(parent)
+        nb = ttk.Notebook(left)
         nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self.setup_vr_params_panel(nb)
+
+        # 右：数据采集（录制控制 + 末端位姿实时），固定宽面板。
+        right = ttk.LabelFrame(parent, text="  📦  数据采集  ")
+        right.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
+        self.setup_data_collection_panel(right)
 
     def _toggle_vr(self):
         """翻转 VR 遥操总开关并同步按钮/状态栏文案。"""

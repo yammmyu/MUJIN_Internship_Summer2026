@@ -9,10 +9,12 @@ from gui.styles import StyleMixin
 from gui.camera_panel import CameraMixin
 from gui.inference_panel import InferenceMixin
 from gui.vr_control import VRMixin
+from gui.data_collection import DataCollectionMixin
 
 __all__ = [
     "StyleMixin",
     "CameraMixin",
     "InferenceMixin",
     "VRMixin",
+    "DataCollectionMixin",
 ]

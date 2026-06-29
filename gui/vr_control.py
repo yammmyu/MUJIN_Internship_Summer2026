@@ -80,6 +80,33 @@ def _clamp_magnitude(v: np.ndarray, max_m: float) -> np.ndarray:
     return v
 
 
+def _stick_expo(value: float, deadzone: float, expo: float) -> float:
+    """把原始摇杆轴 [-1,1] 整形为指令系数 [-1,1]（速率控制用）。
+
+    先去中心死区(滤掉松手回中漂移)，把剩余行程重标定到 0..1，再做 expo 混合
+    （线性↔三次方）：中心附近更细腻、推到边缘更快——这正是「精细滚转」的关键。
+    """
+    a = abs(float(value))
+    if a <= deadzone:
+        return 0.0
+    a = (a - deadzone) / (1.0 - deadzone)        # 剩余行程重标定到 0..1
+    a = (1.0 - expo) * a + expo * a ** 3          # expo 混合
+    return math.copysign(a, value)
+
+
+# 腕部滚转写入的旋转分量下标（6 维 delta 的旋转槽，0 基于整条向量）。
+# get_action_delta 把旋转排成 [index3=-rv[1]=roll, index4=rv[0]=pitch, index5=rv[2]=yaw]，
+# 故 roll = index 3。若上机后发现摇杆实际驱动的不是滚转，改成 4 或 5 即可；
+# 方向不对则把 VR_PARAMS.wrist_roll_rate 取负（或反转摇杆轴）。
+_WRIST_ROLL_SLOT = 3
+
+# 腕部滚转所对应的手臂关节（J7 法兰滚转）在 arm_joint_states()(14,) 中的下标：
+# 左臂 0–6、右臂 7–13，故 J7 = 左 6 / 右 13。硬限位即钳制这个关节的绝对角。
+_WRIST_ROLL_JOINT_IDX = {"left": 6, "right": 13}
+# 正向滚转「指令」是否使该关节角增大。上机若发现限位方向相反，改成 -1.0 即可。
+_WRIST_ROLL_JOINT_SIGN = 1.0
+
+
 def _quat_mult_xyzw(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Hamilton product, scipy convention (x, y, z, w)."""
     ax, ay, az, aw = a
@@ -177,6 +204,22 @@ class VRParameters:
     # queue_max: 动作队列上限。积压超过此值丢弃最旧动作，保证「最新意图优先」、避免长按滞后。
     queue_max: int = 30
 
+    # ===================== 摇杆腕部滚转（速率控制）=====================
+    # 左/右摇杆 X 轴 → 对应手臂腕部「滚转速率」。与手部姿态、与 L_Y/R_B 移动闸门均解耦：
+    # 不必按住闸门，摇杆推到底即以 wrist_roll_rate(rad/执行周期) 持续滚转，回中即停。
+    # 适合连续/精细的腕部滚转——手腕物理活动范围有限，靠姿态映射很难做到。
+    # 在 _vr_auto_execution_thread 的 50Hz 节拍里积分（手不动也会持续转）。
+    # wrist_roll_rate: 满量程每拍滚转增量(rad)。×50Hz ⇒ 角速度上限，0.02≈1.0rad/s≈57°/s。
+    wrist_roll_rate: float = 0.02
+    # wrist_roll_deadzone: 摇杆中心死区(0..1)，滤除松手时的回中漂移。
+    wrist_roll_deadzone: float = 0.15
+    # wrist_roll_expo: 0=线性，1=纯三次方；越大中心越细腻、边缘越快。
+    wrist_roll_expo: float = 0.6
+    # 腕部滚转「硬限位」：针对滚转关节 J7 的绝对角(弧度)。摇杆滚转每拍被钳到使 J7
+    # 落在 [lo, hi] 内——到限即停、绝不越界（非渐进）。需按实际关节零位标定。
+    wrist_roll_limit_lo: float = -1.57
+    wrist_roll_limit_hi: float = 1.57
+
 
 # 全局默认参数实例。需要现场调参时修改此处或替换该实例即可，所有引用点统一生效。
 # 运行时也可由 GUI 的 VR 参数面板通过 `dataclasses.replace` 原子替换该全局
@@ -214,6 +257,12 @@ VR_PARAM_SPECS = [
     # 头部行程限位(保护舵机)
     ("head_yaw_limit",  "头部偏航限位(rad)", 0.00, 1.57, 0.01, False, "头部限位"),
     ("head_pitch_limit", "头部俯仰限位(rad)", 0.00, 1.00, 0.01, False, "头部限位"),
+    # 摇杆腕部滚转(速率控制)
+    ("wrist_roll_rate",     "滚转速率(rad/拍)", 0.000, 0.060, 0.002, False, "腕部滚转(摇杆)"),
+    ("wrist_roll_deadzone", "摇杆死区",        0.000, 0.500, 0.010, False, "腕部滚转(摇杆)"),
+    ("wrist_roll_expo",     "expo 曲线",       0.000, 1.000, 0.050, False, "腕部滚转(摇杆)"),
+    ("wrist_roll_limit_lo", "滚转下限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
+    ("wrist_roll_limit_hi", "滚转上限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
     # 动作队列
     ("queue_max",       "动作队列上限",     1, 100, 1, True, "队列"),
 ]
@@ -422,6 +471,52 @@ class VRMixin:
                 left_action = _rebuild_arm_action(left_sum)
                 right_action = _rebuild_arm_action(right_sum)
 
+                # ---- 摇杆腕部滚转（速率，独立于 L_Y/R_B 闸门；J7 硬限位）----
+                # 在 merge 限幅「之后」叠加：滚转量自身已被 wrist_roll_rate 限到每拍上限，
+                # 不与手部旋转共用 merge_rot_clamp，因而可在位置冻结（未按闸门）时单独滚转。
+                # 手不动且队列为空时 left/right_action 为 None，这里按需新建一个纯滚转动作。
+                # 每拍读实测关节，把滚转钳到使 J7 绝对角落在 [lo, hi] 内——到限即停，绝不越界。
+                axes_now = getattr(self, "vr_axes", None) or []
+                p = VR_PARAMS
+                try:
+                    roll_joints, _ = self.robot.arm_joint_states()
+                except Exception as e:
+                    print(f"vr wrist-roll joint read error: {e}")
+                    roll_joints = None
+
+                def _roll_delta(axis_idx: int) -> float:
+                    if len(axes_now) <= axis_idx:
+                        return 0.0
+                    shaped = _stick_expo(axes_now[axis_idx],
+                                         p.wrist_roll_deadzone, p.wrist_roll_expo)
+                    return shaped * p.wrist_roll_rate
+
+                def _limit_roll(roll: float, arm: str) -> float:
+                    """钳制滚转，使 J7 绝对角不越过 [lo, hi]（硬限位）。读不到关节则不滚转
+                    —— 宁可不动也不盲目越界。J7 ≈ 滚转命令 1:1（带 _SIGN）。"""
+                    if abs(roll) < 1e-6:
+                        return 0.0
+                    idx = _WRIST_ROLL_JOINT_IDX[arm]
+                    if roll_joints is None or len(roll_joints) <= idx:
+                        return 0.0
+                    j = float(roll_joints[idx])
+                    s = _WRIST_ROLL_JOINT_SIGN
+                    # 命令域边界：使 j 恰好到达 lo / hi。j_next = j + s*roll ∈ [lo, hi]。
+                    a = (p.wrist_roll_limit_lo - j) / s
+                    b = (p.wrist_roll_limit_hi - j) / s
+                    return max(min(roll, max(a, b)), min(a, b))
+
+                def _apply_roll(action, roll: float):
+                    if abs(roll) < 1e-6:
+                        return action
+                    if action is None:
+                        action = [0.0] * 6
+                    action[_WRIST_ROLL_SLOT] += roll
+                    return action
+
+                left_action = _apply_roll(left_action, _limit_roll(_roll_delta(0), "left"))    # 左摇杆 X
+                right_action = _apply_roll(right_action, _limit_roll(_roll_delta(2), "right"))  # 右摇杆 X
+
                 # ---- 头部（绝对目标）----
                 if head_target is not None:
                     head_yaw_pos = float(np.clip(math.radians(head_target.yaw),
@@ -519,6 +614,11 @@ class VRMixin:
         # is the staleness signal — if it ages out, treat buttons as released.
         self.vr_buttons_pressed = set(buttons)
         assert len(axes) == 4
+        # Cache the raw thumbstick axes for the 50Hz exec loop's stick-driven wrist
+        # roll (axes[0]=left stick x, axes[2]=right stick x). Replaced as a new list
+        # each callback so the exec thread reads a consistent snapshot without locking;
+        # last_joint_update_timestamp is the staleness signal (exec loop times out on it).
+        self.vr_axes = list(axes)
         left_stick = _fmt_stick(axes, 0)
         right_stick = _fmt_stick(axes, 2)
         assert len(positions) == 21

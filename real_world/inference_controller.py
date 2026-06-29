@@ -18,7 +18,6 @@ to the env.
 
 """
 
-import base64
 import copy
 import http.client
 import json
@@ -27,13 +26,17 @@ import os
 import threading
 import time
 
-import cv2
 import numpy as np
 
 from collections import deque
 
 from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 from real_world.timing import RECORD_HZ   # single source of timing truth (see timing.py)
+# Client-side inference preprocessing: image crop/resize/encode (MUST stay identical to training
+# build_dataset.py and the server decode) plus the obs -> /predict request assembly. encode_image
+# is re-exported here so callers doing `from real_world.inference_controller import encode_image`
+# keep working.
+from real_world.build_data import encode_image, build_predict_request
 
 log = logging.getLogger(__name__)
 
@@ -91,49 +94,6 @@ SMOOTHNESS_WARN_DPOS = 0.03    # TUNE (m): DIAGNOSTIC threshold only — logs a 
                                # Lower to surface smaller seams; not a smoothing knob.
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
-
-
-# Client-side image preprocessing — MUST stay identical to MDM_data_collection/build_dataset.py
-# (training) and the policy server's decode. Doing the crop+resize HERE, BEFORE the JPEG encode,
-# shrinks the head frame from native (e.g. 1280x800) to IMG_W x IMG_H first, so imencode runs on
-# ~25x fewer pixels (the old ~0.2s encode was dominated by JPEG-ing two full-res head frames).
-# NOTE: with AGENT_CROP_ZOOM == 1.0 the server's own crop+resize become no-ops on an already-
-# target-size frame (aspect matches, zoom 1, shape == target -> resize skipped), so NO server
-# change is needed. If AGENT_CROP_ZOOM is ever raised > 1, the server MUST disable its center-crop
-# or the head frame gets zoomed twice.
-IMG_H = 180             # target rows  (build_dataset.IMG_H)
-IMG_W = 240             # target cols  (build_dataset.IMG_W)
-AGENT_CROP_ZOOM = 1.0   # head center-crop zoom (build_dataset.AGENT_CROP_ZOOM); keep in sync
-
-
-def center_crop_to_aspect(frame, target_w, target_h, zoom=1.0):
-    """Center-crop `frame` to the target aspect ratio (target_w/target_h), optionally zooming in.
-    Identical to build_dataset.center_crop_to_aspect / the server's crop. Returns a cropped view."""
-    h, w = frame.shape[:2]
-    target_ar = target_w / target_h
-    if w / h > target_ar:        # source too wide -> limited by height
-        crop_h, crop_w = h, int(round(h * target_ar))
-    else:                        # source too tall -> limited by width
-        crop_w, crop_h = w, int(round(w / target_ar))
-    crop_w = min(w, int(round(crop_w / zoom)))
-    crop_h = min(h, int(round(crop_h / zoom)))
-    x0, y0 = (w - crop_w) // 2, (h - crop_h) // 2
-    return frame[y0:y0 + crop_h, x0:x0 + crop_w]
-
-
-def encode_image(rgb_image, center_crop=False):
-    """RGB frame -> base64 JPEG string (matches the training/recording encode).
-
-    Applies the SAME preprocessing as training/server BEFORE encoding: head (center_crop=True) is
-    center-cropped to the target aspect (+AGENT_CROP_ZOOM); both cameras are then INTER_AREA-resized
-    to (IMG_W, IMG_H). Encoding the small frame is what makes this fast."""
-    if center_crop:
-        rgb_image = center_crop_to_aspect(rgb_image, IMG_W, IMG_H, AGENT_CROP_ZOOM)
-    if rgb_image.shape[:2] != (IMG_H, IMG_W):
-        rgb_image = cv2.resize(rgb_image, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
-    rgb_image_cv2 = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-    _, buffer = cv2.imencode('.jpg', rgb_image_cv2, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return base64.b64encode(buffer).decode('utf-8')
 
 
 def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict:
@@ -282,15 +242,7 @@ class InferenceController:
             log.debug("timestamp has not advanced")
             return False
 
-        req = {
-            # head (agent) is center-cropped to the target aspect like training; hand is resize-only.
-            'agent_imgs': [encode_image(img, center_crop=True) for img in obs['agent_imgs']],
-            'hand_imgs': [encode_image(img, center_crop=False) for img in obs['hand_imgs']],
-            'state': obs['state'],
-            # robot0_left_joint policy input: [j_{t-1}, j_t], each = 7 left-arm joints (rad) + raw
-            # gripper. Server must map this to robot0_left_joint (see train config shape_meta).
-            'left_joint': obs['joint_state'],
-        }
+        req = build_predict_request(obs)
 
         # Log the proprioception sent to the policy server, keyed by the same obs_ts that
         # chunks.jsonl/traj.jsonl use, so a request can be joined to its resulting action.
@@ -302,8 +254,14 @@ class InferenceController:
             log.warning("server error: %s", resp["error"])
             return False
 
-        # action rows: [eef_pos(3), 6D_rot(6), gripper(1)]
+        # The dual_arm policy returns 20-col rows: L[pos(3)+rot6d(6)+grip(1)] ++ R[...]. This env
+        # only ever commands the LEFT arm (the right arm is never actuated — see humanoid_env), and
+        # the temporal-ensemble + IK + execution pipeline below is built around 10-col left-EE rows.
+        # So we execute the LEFT-arm half (cols 0:10) and drop the right-arm half here. TODO(dual-arm):
+        # to drive both arms, extend the TE buffer/_rebuild_buffer and env.append_actions to 20 cols.
         action = np.asarray(resp['action'], dtype=np.float32)
+        if action.ndim == 2 and action.shape[1] >= 20:
+            action = action[:, :10]
         log.debug("response received in %.3fs", time.time() - ts)
         # Binarize the gripper column (idx 9) HERE, as soon as the chunk arrives: the raw [0,~85]
         # gripper signal is noisy (transient spikes), so only a (near-)fully-closed reading
@@ -366,12 +324,12 @@ class InferenceController:
                                "clock": int(cur), "queued_through": int(queued_through),
                                "jerk": jerk, "buffer": buf_list})
         # Publish for robot_info_server / visualisation. left_*_predict_* carry EE-pose data here:
-        #   *_start_values  = last two left EE states ([pos(3), quat(4), grip(1)])
+        #   *_start_values  = last two left EE obs rows ([pos(3), rot6d(6)], dual_arm_ee_image layout)
         #   *_action_values = the smoothed buffer rows
         # Skipped when robot_info is None (headless sim runner has no GUI to publish to).
         if self.robot_info is not None:
             with self.robot_info.lock:
-                self.robot_info.left_joint_predict_start_values = copy.deepcopy(obs['state'])
+                self.robot_info.left_joint_predict_start_values = copy.deepcopy(obs['robotl_eef_pos'])
                 self.robot_info.left_joint_predict_action_values = buf_list
                 self.robot_info.inference_timestamp = ts
 
