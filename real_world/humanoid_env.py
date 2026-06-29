@@ -44,9 +44,9 @@ from real_world.timing import (
 # needs to import this module for the IK/exec path, so guard the import. The sim runner never
 # constructs these (it injects a _NoRobot stand-in); only the GUI / live robot path does.
 try:
-    from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController
+    from a2d_sdk.robot import RobotDds as Robot, CosineCamera as Camera, RobotController, Slam
 except ImportError:
-    Robot = Camera = RobotController = None
+    Robot = Camera = RobotController = Slam = None
 
 # ----------------------------------------------------------------------------- #
 #  Safety limits for the real-robot release path (see the safety-review fixes).  #
@@ -198,6 +198,12 @@ class HumanoidEnv:
         self._owns_robot = robot is None
         self.robot = robot if robot is not None else Robot()
         self.robot_controller = robot_controller if robot_controller is not None else RobotController()
+        # RobotDds.{arm,head,waist}_joint_states() only stream live data if a Slam()
+        # instance exists in THIS process — Slam() brings up the robot-state pipeline
+        # those topics ride on. Without it they return a frozen initial sample (while
+        # gripper + EE poses, on a different channel, stay live: the signature of the
+        # frozen-joints bug). Construct it (side-effect only) when we own the robot.
+        self._slam = Slam() if (self._owns_robot and Slam is not None) else None
         if self._owns_robot:
             time.sleep(1.0)  # let freshly-created DDS resources come up
 

@@ -40,6 +40,16 @@ class DataCollectionMixin:
         self._dc_right_pos_var  = tk.StringVar(value="—")
         self._dc_right_quat_var = tk.StringVar(value="—")
 
+        # ── 大号录制指示灯：录制中=绿，未录制=红（一眼可辨）──
+        # 用原生 tk.Label（而非 ttk）直接设 bg，确保各主题下背景色都生效。
+        # 颜色/文案由 _dc_update_indicator() 按 self._dc_is_recording 驱动。
+        self._dc_indicator = tk.Label(
+            parent, text="■  未录制  NOT RECORDING",
+            font=("", 20, "bold"), bg="#c0392b", fg="white",
+            height=2, anchor="center", relief="raised", bd=2,
+        )
+        self._dc_indicator.pack(fill=tk.X, padx=8, pady=(8, 4))
+
         # ── 录制状态 ──
         sec_info = ttk.LabelFrame(parent, text="  ⏺  录制状态  ")
         sec_info.pack(fill=tk.X, padx=8, pady=(8, 6))
@@ -117,9 +127,20 @@ class DataCollectionMixin:
         ttk.Label(pos_grid, textvariable=self._dc_right_quat_var,
                   style="Value.TLabel").grid(row=4, column=1, sticky="w", padx=8)
 
+        self._dc_update_indicator()
         self._dc_bind_shortcuts()
         self._dc_start_ee_pos_thread()
         self._dc_start_vr_button_poll()
+
+    def _dc_update_indicator(self):
+        """Repaint the big recording box: solid GREEN while recording, solid RED otherwise."""
+        ind = getattr(self, "_dc_indicator", None)
+        if ind is None:
+            return
+        if self._dc_is_recording:
+            ind.config(text="●  录制中  RECORDING", bg="#27ae60", fg="white")
+        else:
+            ind.config(text="■  未录制  NOT RECORDING", bg="#c0392b", fg="white")
 
     # ── 键盘快捷键（焦点守卫，避免在 VR 参数输入框里误触发）──────────────────
 
@@ -163,6 +184,7 @@ class DataCollectionMixin:
         name = self._dc_next_name()
         self._dc_current_name.set(name)
         self._dc_is_recording = True
+        self._dc_update_indicator()                    # → 绿色「录制中」
         self._dc_status_var.set("🔴  录制中…")
         self._dc_btn_start.config(state=tk.DISABLED)
         self._dc_btn_stop.config(state=tk.NORMAL)
@@ -174,6 +196,7 @@ class DataCollectionMixin:
         if not self._dc_is_recording:
             return
         self._dc_is_recording = False
+        self._dc_update_indicator()                    # → 红色「未录制」
         self._dc_finalizing   = True   # 收尾中：禁止开始新录制，直到写盘完成
         self._dc_status_var.set("⏸  正在停止…")
         self._dc_btn_stop.config(state=tk.DISABLED)

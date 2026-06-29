@@ -94,14 +94,9 @@ def _stick_expo(value: float, deadzone: float, expo: float) -> float:
     return math.copysign(a, value)
 
 
-# 腕部滚转写入的旋转分量下标（6 维 delta 的旋转槽，0 基于整条向量）。
-# get_action_delta 把旋转排成 [index3=-rv[1]=roll, index4=rv[0]=pitch, index5=rv[2]=yaw]，
-# 故 roll = index 3。若上机后发现摇杆实际驱动的不是滚转，改成 4 或 5 即可；
-# 方向不对则把 VR_PARAMS.wrist_roll_rate 取负（或反转摇杆轴）。
-_WRIST_ROLL_SLOT = 3
-
-# 腕部滚转所对应的手臂关节（J7 法兰滚转）在 arm_joint_states()(14,) 中的下标：
-# 左臂 0–6、右臂 7–13，故 J7 = 左 6 / 右 13。硬限位即钳制这个关节的绝对角。
+# 腕部滚转直接驱动「关节」(ABS_JOINT)，完全不经末端(EE)/IK：摇杆 → J7(法兰滚转)的关节角速率，
+# 其余 6 个关节保持实测值不动。J7 在 arm_joint_states()(14,) 中的下标：左臂 0–6、右臂 7–13，
+# 故 J7 = 左 6 / 右 13；单臂 7 维向量内 J7 恒为 index 6。硬限位即钳制该关节的绝对角。
 _WRIST_ROLL_JOINT_IDX = {"left": 6, "right": 13}
 # 正向滚转「指令」是否使该关节角增大。上机若发现限位方向相反，改成 -1.0 即可。
 _WRIST_ROLL_JOINT_SIGN = 1.0
@@ -220,6 +215,13 @@ class VRParameters:
     wrist_roll_limit_lo: float = -1.57
     wrist_roll_limit_hi: float = 1.57
 
+    # ===================== 摇杆前后 → EE X 平移（固定步长，DELTA_POSE）=====================
+    # 左/右摇杆 Y（前后）→ 对应手臂末端沿 base_link X 轴平移。固定步长速率控制：摇杆推过死区即
+    # 每拍加一个固定增量（与推动幅度无关），回中即停。无限位、不读 EE 位姿——保持简单。
+    # 与手部 DELTA_POSE 叠加；但与同臂的腕滚(ABS_JOINT)互斥——该臂滚转时本拍忽略 X。
+    # ee_x_rate: 每拍固定 X 增量(m)，越小越慢越精细。×50Hz ⇒ 速度，0.002≈0.1 m/s。
+    ee_x_rate: float = 0.002
+
 
 # 全局默认参数实例。需要现场调参时修改此处或替换该实例即可，所有引用点统一生效。
 # 运行时也可由 GUI 的 VR 参数面板通过 `dataclasses.replace` 原子替换该全局
@@ -263,6 +265,8 @@ VR_PARAM_SPECS = [
     ("wrist_roll_expo",     "expo 曲线",       0.000, 1.000, 0.050, False, "腕部滚转(摇杆)"),
     ("wrist_roll_limit_lo", "滚转下限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
     ("wrist_roll_limit_hi", "滚转上限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
+    # 摇杆前后 → EE X 平移（固定步长）
+    ("ee_x_rate",       "X 步长(m/拍)",    0.000, 0.020, 0.0005, False, "末端 X 平移(摇杆前后)"),
     # 动作队列
     ("queue_max",       "动作队列上限",     1, 100, 1, True, "队列"),
 ]
@@ -583,16 +587,37 @@ class VRMixin:
                     b = (p.wrist_roll_limit_hi - j) / s
                     return max(min(roll, max(a, b)), min(a, b))
 
-                def _apply_roll(action, roll: float):
-                    if abs(roll) < 1e-6:
-                        return action
-                    if action is None:
-                        action = [0.0] * 6
-                    action[_WRIST_ROLL_SLOT] += roll
-                    return action
+                # 摇杆滚转是「纯关节」指令：保持该臂其余 6 个关节于实测值，只让 J7 自转——
+                # 与末端(EE)完全解耦，不走 DELTA_POSE/IK。每拍滚转量已被 _limit_roll 钳到使 J7
+                # 绝对角落在 [lo,hi] 内（关节实测读不到则返回 0，宁可不动也不盲目越界）。
+                left_roll = _limit_roll(_roll_delta(0), "left")     # 左摇杆 X
+                right_roll = _limit_roll(_roll_delta(2), "right")   # 右摇杆 X
 
-                left_action = _apply_roll(left_action, _limit_roll(_roll_delta(0), "left"))    # 左摇杆 X
-                right_action = _apply_roll(right_action, _limit_roll(_roll_delta(2), "right"))  # 右摇杆 X
+                def _wrist_roll_joint_cmd(arm: str, roll: float):
+                    """Pure joint-space wrist roll: the arm's MEASURED 7 joints with ONLY J7 bumped
+                    by `roll` (sent ABS_JOINT). Every other joint is commanded to its measured value,
+                    so nothing but the wrist spins — no EE/IK involvement. None if there's no roll
+                    this tick or the joints can't be read."""
+                    if abs(roll) < 1e-6 or roll_joints is None:
+                        return None
+                    base = 0 if arm == "left" else 7
+                    if len(roll_joints) < base + 7:
+                        return None
+                    j7 = [float(v) for v in roll_joints[base:base + 7]]   # current 7 joints (held)
+                    j7[_WRIST_ROLL_JOINT_IDX[arm] - base] += _WRIST_ROLL_JOINT_SIGN * roll
+                    return {"action_data": j7, "control_type": "ABS_JOINT"}
+
+                # ---- 摇杆前后 → EE X 平移（固定步长，DELTA_POSE）----
+                # 摇杆 Y 推过死区即每拍加一个固定 ±ee_x_rate（与推动幅度无关），回中即停。
+                # 慢而精细，步长可在面板调；无限位、不读 EE 位姿——保持简单。
+                _EE_X_DEADZONE = 0.5   # 摇杆中心死区(0..1)，防回中漂移
+                def _ee_x_dx(axis_idx: int) -> float:
+                    if len(axes_now) <= axis_idx or abs(axes_now[axis_idx]) < _EE_X_DEADZONE:
+                        return 0.0
+                    return math.copysign(p.ee_x_rate, axes_now[axis_idx])
+
+                left_x_dx = _ee_x_dx(1)    # 左摇杆 Y（前后）
+                right_x_dx = _ee_x_dx(3)   # 右摇杆 Y（前后）
 
                 # ---- 头部（绝对目标）----
                 if head_target is not None:
@@ -612,18 +637,27 @@ class VRMixin:
                     except Exception as e:
                         print(f"vr move_gripper error: {e}")
 
-                # ---- 臂部（增量目标）----
+                # ---- 臂部 ----
+                # Per arm: a non-zero stick roll takes that arm THIS TICK as a pure joint command
+                # (ABS_JOINT — only J7 moves); otherwise the hand-pose delta goes out as DELTA_POSE.
+                # The SDK can't combine both control types for the SAME arm in one call, and the
+                # stick is meant to touch ONLY the wrist joint, so roll wins. Arms are independent:
+                # one can roll in joint space while the other tracks hand pose.
                 robot_actions = {}
-                if left_action is not None:
-                    robot_actions["left_arm"] = {
-                        "action_data": left_action,
-                        "control_type": "DELTA_POSE",
-                    }
-                if right_action is not None:
-                    robot_actions["right_arm"] = {
-                        "action_data": right_action,
-                        "control_type": "DELTA_POSE",
-                    }
+                for arm, hand_action, roll, x_dx in (("left", left_action, left_roll, left_x_dx),
+                                                     ("right", right_action, right_roll, right_x_dx)):
+                    # 腕滚(ABS_JOINT) 优先且与 DELTA_POSE 互斥；否则手部位姿增量叠加摇杆 X 平移。
+                    cmd = _wrist_roll_joint_cmd(arm, roll)
+                    if cmd is None:
+                        delta = list(hand_action) if hand_action is not None else None
+                        if abs(x_dx) > 1e-6:
+                            if delta is None:
+                                delta = [0.0] * 6
+                            delta[0] += x_dx                 # base-X 在 6 维 delta 的槽 0
+                        if delta is not None:
+                            cmd = {"action_data": delta, "control_type": "DELTA_POSE"}
+                    if cmd is not None:
+                        robot_actions[f"{arm}_arm"] = cmd
                 if robot_actions:
                     try:
                         arm_states, _ = self.robot.arm_joint_states()
