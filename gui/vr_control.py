@@ -205,15 +205,15 @@ class VRParameters:
     # 适合连续/精细的腕部滚转——手腕物理活动范围有限，靠姿态映射很难做到。
     # 在 _vr_auto_execution_thread 的 50Hz 节拍里积分（手不动也会持续转）。
     # wrist_roll_rate: 满量程每拍滚转增量(rad)。×50Hz ⇒ 角速度上限，0.02≈1.0rad/s≈57°/s。
-    wrist_roll_rate: float = 0.02
+    wrist_roll_rate: float = 0.1
     # wrist_roll_deadzone: 摇杆中心死区(0..1)，滤除松手时的回中漂移。
     wrist_roll_deadzone: float = 0.15
     # wrist_roll_expo: 0=线性，1=纯三次方；越大中心越细腻、边缘越快。
     wrist_roll_expo: float = 0.6
     # 腕部滚转「硬限位」：针对滚转关节 J7 的绝对角(弧度)。摇杆滚转每拍被钳到使 J7
     # 落在 [lo, hi] 内——到限即停、绝不越界（非渐进）。需按实际关节零位标定。
-    wrist_roll_limit_lo: float = -1.57
-    wrist_roll_limit_hi: float = 1.57
+    wrist_roll_limit_lo: float = -2.17
+    wrist_roll_limit_hi: float = 2.17
 
     # ===================== 摇杆前后 → EE X 平移（固定步长，DELTA_POSE）=====================
     # 左/右摇杆 Y（前后）→ 对应手臂末端沿 base_link X 轴平移。固定步长速率控制：摇杆推过死区即
@@ -260,7 +260,7 @@ VR_PARAM_SPECS = [
     ("head_yaw_limit",  "头部偏航限位(rad)", 0.00, 1.57, 0.01, False, "头部限位"),
     ("head_pitch_limit", "头部俯仰限位(rad)", 0.00, 1.00, 0.01, False, "头部限位"),
     # 摇杆腕部滚转(速率控制)
-    ("wrist_roll_rate",     "滚转速率(rad/拍)", 0.000, 0.060, 0.002, False, "腕部滚转(摇杆)"),
+    ("wrist_roll_rate",     "滚转速率(rad/拍)", 0.000, 0.200, 0.002, False, "腕部滚转(摇杆)"),
     ("wrist_roll_deadzone", "摇杆死区",        0.000, 0.500, 0.010, False, "腕部滚转(摇杆)"),
     ("wrist_roll_expo",     "expo 曲线",       0.000, 1.000, 0.050, False, "腕部滚转(摇杆)"),
     ("wrist_roll_limit_lo", "滚转下限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
