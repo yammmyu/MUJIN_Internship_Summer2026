@@ -1539,11 +1539,15 @@ class HumanoidEnv:
         # --- Record robot state ---
         rec['left'].append(self._extract_pose(status['frames']['arm_left_link7']))
         rec['right'].append(self._extract_pose(status['frames']['arm_right_link7']))
-        # arm_joints sourced from arm_joint_states() (status quo). NOTE: this freezes
-        # under concurrent VR teleop — arm_joints_ts records its sample timestamp so a
-        # freeze is detectable (a constant ts across the episode == stale joints).
+        # arm_joints sourced from arm_joint_states(). COPY the returned array before
+        # storing it: arm_joint_states() hands back a handle to one REUSED internal SDK
+        # buffer, so appending it by reference makes every recorded row alias the same
+        # object — at finalize they all collapse to the buffer's final value (frozen
+        # joints across the whole episode, while the scalar arm_joints_ts stays live).
+        # np.array() snapshots the current values. arm_joints_ts records each sample's
+        # timestamp for staleness checks.
         arm_vals, arm_ts = self.robot.arm_joint_states()
-        rec['arm_joints'].append(arm_vals)
+        rec['arm_joints'].append(np.array(arm_vals))
         rec['arm_joints_ts'].append(arm_ts)
         rec['gripper'].append(grip)
         rec['timestamps'].append(t)

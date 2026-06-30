@@ -653,7 +653,7 @@ class VRMixin:
                         if abs(x_dx) > 1e-6:
                             if delta is None:
                                 delta = [0.0] * 6
-                            delta[0] += x_dx                 # base-X 在 6 维 delta 的槽 0
+                            delta[1] += x_dx                 # base-y 在 6 维 delta 的槽 0
                         if delta is not None:
                             cmd = {"action_data": delta, "control_type": "DELTA_POSE"}
                     if cmd is not None:
