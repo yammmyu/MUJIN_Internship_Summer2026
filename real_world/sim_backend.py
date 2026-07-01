@@ -529,17 +529,34 @@ class SimEnv:
         """TRIGGER-LINK (both arms) vs any-other-link pairs interpenetrating beyond
         SELF_COLLISION_PENETRATION, via getClosestPoints (geometry only -> no contact forces, no
         URDF self-collision flag needed). Adjacent (parent/child) pairs are skipped. Because the
-        trigger set is BOTH arms, left-vs-right (cross-arm) penetrations are detected here too."""
+        trigger set is BOTH arms, left-vs-right (cross-arm) penetrations are detected here too.
+
+        AABB broadphase: getClosestPoints is the expensive per-pair call (it dominated dual-arm
+        validation), and almost every link pair is far apart. So we first read each link's world AABB
+        (cheap, cached by the engine) and skip any pair whose boxes don't overlap within the
+        penetration margin — an interpenetration REQUIRES overlapping AABBs, so this culls the vast
+        majority of pairs with zero change to what's detected."""
         n = p.getNumJoints(self.body)
         others = [-1] + list(range(n))
+        m = SELF_COLLISION_PENETRATION
+        aabb = {li: p.getAABB(self.body, li) for li in set(self._collision_links).union(others)}
+
+        def _overlap(a, b):
+            return (a[0][0] - m <= b[1][0] and b[0][0] - m <= a[1][0] and
+                    a[0][1] - m <= b[1][1] and b[0][1] - m <= a[1][1] and
+                    a[0][2] - m <= b[1][2] and b[0][2] - m <= a[1][2])
+
         hits = set()
         for la in self._collision_links:
+            box_a = aabb[la]
             for lb in others:
                 if lb == la or tuple(sorted((la, lb))) in self._adjacent:
                     continue
+                if not _overlap(box_a, aabb[lb]):          # boxes disjoint -> can't interpenetrate
+                    continue
                 for cp in p.getClosestPoints(self.body, self.body, 0.0,
                                              linkIndexA=la, linkIndexB=lb):
-                    if cp[8] < -SELF_COLLISION_PENETRATION:     # cp[8] = signed distance (<0 = overlap)
+                    if cp[8] < -m:                          # cp[8] = signed distance (<0 = overlap)
                         hits.add(tuple(sorted((la, lb))))
                         break
         return hits
