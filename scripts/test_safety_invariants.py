@@ -7,13 +7,15 @@ MUST block deployment:
 
   C1  no sim running       -> nothing can ever be released to the robot
   C2  validation           -> steps the sim, self-collision-checks, records sim-ACHIEVED joints
-  C5  rate limit / ramp    -> released steps are <= MAX_JOINT_STEP, ramped from the current pose
+  C5  rate limit / ramp    -> released steps are <= MAX_JOINT_STEP (BOTH arms), ramped from pose
   H1  one-shot release     -> a validation can be released once (no re-release snap-back)
   C3  E-stop               -> latched, actively holds, refuses release until reset
-  C4  right arm untouched  -> the right arm is NEVER placed in a trajectory action (so it holds)
+  C4  DUAL-ARM commanded   -> BOTH arms are placed in every trajectory action and the right arm is
+                              also velocity-bounded (dual-arm inference; the old "right arm never
+                              moves" invariant is intentionally retired now that we drive both arms)
 
-Self-contained: targets are the FK of a small joint sweep near a safe seed, so they are
-reachable and self-consistent without needing a recording.
+Self-contained: targets are the FK of a small joint sweep near a safe seed for EACH arm, so they
+are reachable and self-consistent without needing a recording.
 
 Run standalone:
     .venv/bin/python scripts/test_safety_invariants.py
@@ -29,21 +31,28 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# A safe, clearly-away-from-torso left-arm seed (same as the sim replay runner's seed).
+# A safe, clearly-away-from-torso arm seed (same as the sim replay runner's seed). Used for BOTH
+# arms (clipped to each arm's own limits), so the synthetic dual-arm targets are reachable per side.
 SAFE_SEED = np.array([0.0, -0.3, 0.0, -0.6, 0.0, 0.3, 0.0])
 
 
 def _synthetic_actions(env, seed, n=24):
-    """Reachable action rows [pos(3), 6D_rot(6), grip(1)] from FK of a small sweep near seed."""
+    """Reachable DUAL action rows (20-col): L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1] from the FK
+    of a small joint sweep near `seed` on EACH arm (clipped to that arm's limits)."""
     import pinocchio as pin
-    m = env.solver.m
-    lo, hi = m.lower, m.upper
-    rows = []
-    for t in range(n):
-        q = np.clip(seed + 0.12 * np.sin(2 * np.pi * t / n) * np.ones(7), lo, hi)
+
+    def _arm_row(m, q):
         pos, quat = m.fk(q)                       # EE pose in the firmware frame
         R = pin.Quaternion(np.asarray(quat, dtype=float)).matrix()
-        rows.append(list(pos) + list(R[:, 0]) + list(R[:, 1]) + [0.0])
+        return list(pos) + list(R[:, 0]) + list(R[:, 1]) + [0.0]
+
+    mL, mR = env.solver.m, env.solver_r.m
+    rows = []
+    for t in range(n):
+        s = 0.12 * np.sin(2 * np.pi * t / n) * np.ones(7)
+        qL = np.clip(seed + s, mL.lower, mL.upper)
+        qR = np.clip(seed + s, mR.lower, mR.upper)
+        rows.append(_arm_row(mL, qL) + _arm_row(mR, qR))     # 20-col dual row
     return rows
 
 
@@ -70,7 +79,9 @@ class _FakeRobot:
 class _FakeCtl:
     def __init__(self):
         self.moves = []          # recorded LEFT-arm waypoints (7,)
-        self.right_touched = False   # set if any action ever addresses the right arm (C4)
+        self.moves_r = []        # recorded RIGHT-arm waypoints (7,)
+        self.right_touched = False   # set once any action addresses the right arm (dual-arm C4)
+        self.left_only = False       # set if any action omits the right arm (would be a bug now)
 
     def get_motion_status(self):
         return {'error': {'has_error': False}, 'collisions': []}
@@ -80,6 +91,9 @@ class _FakeCtl:
         for a in robot_actions:
             if "right_arm" in a:
                 self.right_touched = True
+                self.moves_r.append(np.asarray(a["right_arm"]["action_data"], dtype=float))
+            else:
+                self.left_only = True
             self.moves.append(np.asarray(a["left_arm"]["action_data"], dtype=float))
 
 
@@ -90,8 +104,9 @@ def run(verbose=True):
     from real_world.sim_backend import SimEnv
 
     # Isolate the RELEASE-pipeline invariants from the workspace-envelope check (H4 is config,
-    # tested separately): widen the envelope so synthetic FK targets aren't rejected by it.
+    # tested separately): widen BOTH arms' envelopes so synthetic FK targets aren't rejected by them.
     he.WORKSPACE_AABB = ((-9, 9), (-9, 9), (-9, 9))
+    he.WORKSPACE_AABB_RIGHT = ((-9, 9), (-9, 9), (-9, 9))
 
     sim = SimEnv(direct=True)
     seed = np.clip(SAFE_SEED, sim.model.lower, sim.model.upper)
@@ -125,8 +140,12 @@ def run(verbose=True):
             time.sleep(0.05)
         time.sleep(0.2)        # let the final in-flight substep's STEP_TIME wait complete
         assert nr > 0 and len(ctl.moves) >= nr - 2, "release did not reach the robot"
-        dmax = float(np.max(np.abs(np.diff(np.array(ctl.moves)[:, :7], axis=0))))
-        assert dmax <= MAX_JOINT_STEP + 1e-6, f"C5: step {dmax:.4f} exceeds cap {MAX_JOINT_STEP}"
+        # C5 — every released step of BOTH arms is <= MAX_JOINT_STEP.
+        dmaxL = float(np.max(np.abs(np.diff(np.array(ctl.moves)[:, :7], axis=0))))
+        assert dmaxL <= MAX_JOINT_STEP + 1e-6, f"C5(L): step {dmaxL:.4f} exceeds cap {MAX_JOINT_STEP}"
+        assert ctl.moves_r, "C5(R): right arm was never commanded (dual-arm release expected)"
+        dmaxR = float(np.max(np.abs(np.diff(np.array(ctl.moves_r)[:, :7], axis=0))))
+        assert dmaxR <= MAX_JOINT_STEP + 1e-6, f"C5(R): step {dmaxR:.4f} exceeds cap {MAX_JOINT_STEP}"
 
         # H1 — one-shot
         assert env.release_to_robot() == 0, "H1: re-release without new validation must refuse"
@@ -145,10 +164,12 @@ def run(verbose=True):
         env.reset_estop()
         assert not env.estopped, "C3: reset_estop did not clear the latch"
 
-        # C4 — the right arm is NEVER commanded (no right_arm in any trajectory action), so it
-        # physically holds. With move_arm gone there is no right-arm zeroing risk to guard; the
-        # invariant is now "we never address the right arm" across every release + the E-stop hold.
-        assert not ctl.right_touched, "C4: right arm was placed in a trajectory action"
+        # C4 (dual-arm) — BOTH arms are driven: every trajectory action addresses left_arm AND
+        # right_arm together (in lockstep), and the E-stop hold holds both. The retired invariant
+        # "right arm never moves" no longer applies now that dual-arm inference commands both; the
+        # right arm's safety is the SAME as the left's — sim-validated (C2) + velocity-bounded (C5).
+        assert ctl.right_touched, "C4: right arm was never commanded (dual-arm release expected)"
+        assert not ctl.left_only, "C4: a trajectory action omitted the right arm (arms must move together)"
     finally:
         env.stop()
         sim.disconnect()
