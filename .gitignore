@@ -4,5 +4,6 @@
 log
 *.zarr
 recordings/
+recordings_left/
 *.zip
 *.npz

@@ -38,9 +38,22 @@ DEFAULT_URDF = os.path.join(
     "G1_SDK_ENV", "a2d_sdk", "A2D_Omnipicker", "A2D.urdf",
 )
 DEFAULT_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fk_calibration.json")
+# Right-arm FK calibration (mirror of the left, produced by scripts/fk_consistency_check.py --side
+# right). Separate file so each arm carries its own base_offset / ee_frame / joint-slice.
+DEFAULT_CALIBRATION_RIGHT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "fk_calibration_right.json")
 
 LEFT_ARM_JOINTS = ["Joint1_l", "Joint2_l", "Joint3_l", "Joint4_l",
                    "Joint5_l", "Joint6_l", "Joint7_l"]
+RIGHT_ARM_JOINTS = ["Joint1_r", "Joint2_r", "Joint3_r", "Joint4_r",
+                    "Joint5_r", "Joint6_r", "Joint7_r"]
+
+# Per-side defaults: URDF joint names, EE frame, and calibration file. build_solver(side=...) and
+# the sim/env read from here so "which arm" is defined in exactly one place.
+ARM_SIDES = {
+    "left":  {"joints": LEFT_ARM_JOINTS,  "ee_frame": "Link7_l", "calibration": DEFAULT_CALIBRATION},
+    "right": {"joints": RIGHT_ARM_JOINTS, "ee_frame": "Link7_r", "calibration": DEFAULT_CALIBRATION_RIGHT},
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -273,11 +286,18 @@ def load_calibration(path: str = DEFAULT_CALIBRATION) -> FKCalibration:
     return FKCalibration(**known)
 
 
-def build_solver(calibration_path: str = DEFAULT_CALIBRATION,
+def build_solver(calibration_path: str = None,
                  urdf_path: str = DEFAULT_URDF,
+                 side: str = "left",
                  **solver_kwargs) -> "PinocchioDLSIKSolver":
-    """Convenience: load the calibrated config and return a ready DLS solver."""
-    cal = load_calibration(calibration_path)
+    """Convenience: load the calibrated config and return a ready DLS solver for one arm.
+
+    side ("left"/"right") selects the URDF arm joints, EE frame, and default calibration file
+    (ARM_SIDES). calibration_path overrides the per-side default (e.g. a custom right-arm fit).
+    The right arm needs its own fk_calibration_right.json (scripts/fk_consistency_check.py
+    --side right); until it exists, build_solver(side='right') raises on the missing file."""
+    spec = ARM_SIDES[side]
+    cal = load_calibration(calibration_path or spec["calibration"])
     model = PinocchioArmModel(urdf_path=urdf_path, ee_frame=cal.ee_frame,
-                              base_offset=cal.base_offset_se3())
+                              arm_joints=spec["joints"], base_offset=cal.base_offset_se3())
     return PinocchioDLSIKSolver(model, **solver_kwargs)

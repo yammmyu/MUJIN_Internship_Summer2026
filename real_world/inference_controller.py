@@ -246,30 +246,35 @@ class InferenceController:
 
         # Log the proprioception sent to the policy server, keyed by the same obs_ts that
         # chunks.jsonl/traj.jsonl use, so a request can be joined to its resulting action.
-        # Images (agent_imgs/hand_imgs) are omitted — large base64 JPEGs, not needed here.
-        self._trace("requests", {"obs_ts": sid, "state": req['state'], "left_joint": req['left_joint']})
+        # Images (agentview/eye_in_hand) are omitted — large base64 JPEGs, not needed here.
+        # GUARDED: build the dict only when tracing is on — it reads request fields, and building
+        # it unconditionally (with stale keys) would raise on every inference. Logs BOTH arms' EE.
+        if self._trace_files:
+            self._trace("requests", {"obs_ts": sid,
+                                     "robotl_eef_pos": req.get("robotl_eef_pos"),
+                                     "robotr_eef_pos": req.get("robotr_eef_pos"),
+                                     "robot0_grip": req.get("robot0_grip")})
 
         resp = post_predict(self.host, self.port, req, timeout=10)
         if 'error' in resp:
             log.warning("server error: %s", resp["error"])
             return False
 
-        # The dual_arm policy returns 20-col rows: L[pos(3)+rot6d(6)+grip(1)] ++ R[...]. This env
-        # only ever commands the LEFT arm (the right arm is never actuated — see humanoid_env), and
-        # the temporal-ensemble + IK + execution pipeline below is built around 10-col left-EE rows.
-        # So we execute the LEFT-arm half (cols 0:10) and drop the right-arm half here. TODO(dual-arm):
-        # to drive both arms, extend the TE buffer/_rebuild_buffer and env.append_actions to 20 cols.
+        # The dual_arm policy returns 20-col rows: L[pos(3)+rot6d(6)+grip(1)] ++ R[pos(3)+rot6d(6)+
+        # grip(1)]. We now drive BOTH arms, so the full 20-col row is carried through the temporal
+        # ensemble, IK (env solves left+right), sim validation, and release. (10-col left-only rows
+        # still pass through unchanged for back-compat with a single-arm policy.)
         action = np.asarray(resp['action'], dtype=np.float32)
-        if action.ndim == 2 and action.shape[1] >= 20:
-            action = action[:, :10]
         log.debug("response received in %.3fs", time.time() - ts)
-        # Binarize the gripper column (idx 9) HERE, as soon as the chunk arrives: the raw [0,~85]
-        # gripper signal is noisy (transient spikes), so only a (near-)fully-closed reading
-        # (>= GRIPPER_CLOSE_THRESH) becomes closed=1, else open=0. Everything downstream — sim
-        # preview, validation, staging, release — then carries a clean {0,1}, and the spikes no
-        # longer pollute the next inference's state context.
-        if action.ndim == 2 and action.shape[1] >= 10:
-            action[:, 9] = (action[:, 9] >= GRIPPER_CLOSE_THRESH).astype(action.dtype)
+        # Binarize the gripper column(s) HERE, as soon as the chunk arrives: the raw [0,~85] gripper
+        # signal is noisy (transient spikes), so only a (near-)fully-closed reading (>=
+        # GRIPPER_CLOSE_THRESH) becomes closed=1, else open=0. col 9 = left grip; col 19 = right grip
+        # (dual). Everything downstream — sim preview, validation, staging, release — then carries a
+        # clean {0,1} per arm, and the spikes no longer pollute the next inference's state context.
+        if action.ndim == 2:
+            for gc in (9, 19):
+                if action.shape[1] > gc:
+                    action[:, gc] = (action[:, gc] >= GRIPPER_CLOSE_THRESH).astype(action.dtype)
         self._last_inference_obs_ts = ts
         # A fresh chunk restarts the manual step-through from the first row.
         self._exec_cursor = 0
@@ -423,10 +428,18 @@ class InferenceController:
             self._prune_frozen(queued_through, R)         # nothing mutable to rebuild; just prune
             return
 
+        # Column layout: W = 10 (left-only) or 20 (dual L++R). Gripper cols {9, 19} are binary and
+        # NOT low-passed along id (that would blur open/close timing); every other col (pos + rot6d,
+        # per arm) is smoothed linearly. Derived from the row width so the same code handles both.
+        W = raw[-1][1].shape[1]
+        grip_cols = [c for c in (9, 19) if c < W]
+        smooth_cols = [c for c in range(W) if c not in grip_cols]
+        ns = len(smooth_cols)
+
         # (a) cross-chunk recency-weighted mean per mutable id (the ACT temporal ensemble).
         # Each chunk overlaps a CONTIGUOUS span of mutable ids, so it scatter-adds in one vectorised
         # slice (w*rows) instead of an id-by-id Python loop; per-id weight = sum of contributors.
-        acc = np.zeros((n_ids, 10), dtype=np.float64)
+        acc = np.zeros((n_ids, W), dtype=np.float64)
         wsum = np.zeros(n_ids, dtype=np.float64)
         for idx, (sid, a) in enumerate(raw):
             lo, hi = max(mut_lo, sid), min(max_id, sid + a.shape[0] - 1)
@@ -438,30 +451,33 @@ class InferenceController:
         present = wsum > 0.0                               # ids that any chunk covered
         tent = acc / np.where(present, wsum, 1.0)[:, None]  # normalized weighted mean (== old w/w.sum)
 
-        # (b) symmetric Gaussian along id over the mutable region; frozen rows (<= queued_through)
-        # are fixed left-context. Read from a dense padded context array (2R wider than the mutable
-        # span) so the convolution is 2R+1 vectorised shifted adds, not an id*kernel Python loop.
+        # (b) symmetric Gaussian along id over the SMOOTH (pos+rot6d, both arms) columns; frozen rows
+        # (<= queued_through) are fixed left-context. Read from a dense padded context array (2R wider
+        # than the mutable span) so the convolution is 2R+1 vectorised shifted adds.
         ext = n_ids + 2 * R
-        ctxv = np.zeros((ext, 9), dtype=np.float64)        # neighbor values, id (mut_lo-R) .. (max_id+R)
+        ctxv = np.zeros((ext, ns), dtype=np.float64)       # neighbor smooth-col values, (mut_lo-R)..(max_id+R)
         pres = np.zeros(ext, dtype=np.float64)             # 1 where that neighbor exists
-        ctxv[R:R + n_ids] = tent[:, :9]                    # mutable estimates (pre-smoothing)
+        ctxv[R:R + n_ids] = tent[:, smooth_cols]           # mutable estimates (pre-smoothing)
         pres[R:R + n_ids] = present
         for nid in range(mut_lo - R, mut_lo):              # frozen left-context (<= queued_through)
             v = self._buffer.get(nid) if nid <= queued_through else None
             if v is not None:
-                ctxv[nid - (mut_lo - R)] = v[:9]
+                ctxv[nid - (mut_lo - R)] = np.asarray(v)[smooth_cols]
                 pres[nid - (mut_lo - R)] = 1.0
-        num = np.zeros((n_ids, 9), dtype=np.float64)
+        num = np.zeros((n_ids, ns), dtype=np.float64)
         den = np.zeros(n_ids, dtype=np.float64)
         for d in range(-R, R + 1):                         # neighbor offset; ext idx of id i is R+i+d
             k = gauss[d + R]
             sl = slice(R + d, R + d + n_ids)
             num += k * ctxv[sl] * pres[sl][:, None]
             den += k * pres[sl]
-        out = tent.copy()                                  # carries gripper (col 9) + the (a) fallback
+        out = tent.copy()                                  # carries grippers + the (a) fallback
         good = den > 0.0
-        out[good, :9] = num[good] / den[good][:, None]     # pos + rot6d (linear) smoothed along id
-        out[:, 9] = (out[:, 9] >= 0.5)                     # gripper re-binarised (not low-passed)
+        smoothed = out[:, smooth_cols]                     # fancy-index copy; write back after filling
+        smoothed[good] = num[good] / den[good][:, None]    # pos + rot6d (linear) smoothed along id
+        out[:, smooth_cols] = smoothed
+        for gc in grip_cols:
+            out[:, gc] = (out[:, gc] >= 0.5)               # each gripper re-binarised (not low-passed)
         for i in np.nonzero(present)[0]:                   # write MUTABLE ids only; frozen untouched
             self._buffer[mut_lo + int(i)] = out[i]
 

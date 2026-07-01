@@ -4,10 +4,10 @@ One place for every transform that turns a raw observation into the policy-serve
 so the layout stays identical to MDM_data_collection/build_dataset.py (training) and the
 server's decode. Matches task/dual_arm_ee_image.yaml shape_meta:
 
-  request (obs) fields:
-    agentview_image            head camera         (center-cropped + resized base64 JPEG)
-    robotl_eye_in_hand_image   left  wrist camera  (resized base64 JPEG)
-    robotr_eye_in_hand_image   right wrist camera  (resized base64 JPEG)
+  request (obs) fields (all images standardized to 16:9 = IMG_W x IMG_H = 256 x 144):
+    agentview_image            head camera         (TOP-cropped to 16:9 + resized base64 JPEG)
+    robotl_eye_in_hand_image   left  wrist camera  (~16:9, centered crop + resized base64 JPEG)
+    robotr_eye_in_hand_image   right wrist camera  (~16:9, centered crop + resized base64 JPEG)
     robotl_eef_pos   (To, 9)   left  EE [pos(3) + rot6d(6)]
     robotr_eef_pos   (To, 9)   right EE [pos(3) + rot6d(6)]
     robot0_grip      (To, 2)   [left, right] gripper (raw, as the recordings stored it)
@@ -17,7 +17,8 @@ Two kinds of building live here:
     crop+resize HERE, BEFORE the JPEG encode, shrinks the head frame from native (e.g.
     1280x800) to IMG_W x IMG_H first, so imencode runs on ~25x fewer pixels. NOTE: with
     AGENT_CROP_ZOOM == 1.0 the server's own crop+resize become no-ops on an already-target-
-    size frame, so NO server change is needed. If AGENT_CROP_ZOOM is ever raised > 1, the
+    size 16:9 frame, so NO server change is needed PROVIDED the server's configured
+    image_shape is [3, 144, 256] (16:9) too. If AGENT_CROP_ZOOM is ever raised > 1, the
     server MUST disable its center-crop or the head frame gets zoomed twice.
   * PROPRIOCEPTION: pack each per-frame EE pose (build_ee_pose_row, with quat->rot6d done
     EXACTLY as training's quat_to_rot6d) and the 2-gripper row (build_grip_row) into the
@@ -33,14 +34,22 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-IMG_H = 180             # target rows  (build_dataset.IMG_H)
-IMG_W = 240             # target cols  (build_dataset.IMG_W)
-AGENT_CROP_ZOOM = 1.0   # head center-crop zoom (build_dataset.AGENT_CROP_ZOOM); keep in sync
+IMG_H = 144             # target rows  (build_dataset.IMG_H) — 16:9
+IMG_W = 256             # target cols  (build_dataset.IMG_W) — 16:9 (256/144 = 16/9)
+AGENT_CROP_ZOOM = 1.0   # head crop zoom (build_dataset.AGENT_CROP_ZOOM); keep in sync
 
 
-def center_crop_to_aspect(frame, target_w, target_h, zoom=1.0):
-    """Center-crop `frame` to the target aspect ratio (target_w/target_h), optionally zooming in.
-    Identical to build_dataset.center_crop_to_aspect / the server's crop. Returns a cropped view."""
+def crop_to_aspect(frame, target_w, target_h, zoom=1.0, keep="center"):
+    """Crop `frame` to the target aspect ratio (target_w/target_h), optionally zooming in.
+
+    All cameras are standardized to 16:9 (the target aspect) by cropping BEFORE the resize, so
+    the resize never distorts. The horizontal crop is always centered. The vertical crop position
+    (which rows to drop when the source is too tall) is set by `keep`:
+      "center" -> drop equally from top & bottom (default; wrist cams are already ~16:9, ~0 rows)
+      "bottom" -> KEEP the bottom, drop rows from the TOP   (head cam: 16:10 is too tall — preserve
+                  the workspace at the bottom of the frame, crop the ceiling/background at the top)
+      "top"    -> KEEP the top, drop rows from the bottom
+    Returns a cropped view."""
     h, w = frame.shape[:2]
     target_ar = target_w / target_h
     if w / h > target_ar:        # source too wide -> limited by height
@@ -49,30 +58,39 @@ def center_crop_to_aspect(frame, target_w, target_h, zoom=1.0):
         crop_w, crop_h = w, int(round(w / target_ar))
     crop_w = min(w, int(round(crop_w / zoom)))
     crop_h = min(h, int(round(crop_h / zoom)))
-    x0, y0 = (w - crop_w) // 2, (h - crop_h) // 2
+    x0 = (w - crop_w) // 2
+    if keep == "bottom":
+        y0 = h - crop_h          # drop rows from the TOP, keep the bottom
+    elif keep == "top":
+        y0 = 0                   # drop rows from the bottom, keep the top
+    else:
+        y0 = (h - crop_h) // 2   # centered
     return frame[y0:y0 + crop_h, x0:x0 + crop_w]
 
 
-def preprocess_frame(rgb_image, center_crop=False):
-    """RGB frame -> cropped+resized RGB uint8 at (IMG_H, IMG_W).
+def preprocess_frame(rgb_image, keep="center"):
+    """RGB frame -> cropped-to-16:9 + resized RGB uint8 at (IMG_H, IMG_W).
 
     THE shared pixel transform, used by BOTH training (build_dataset.read_video, building the zarr)
-    and inference (encode_image, building the request). head (center_crop=True) is center-cropped to
-    the target aspect (+AGENT_CROP_ZOOM); all cameras are then INTER_AREA-resized to (IMG_W, IMG_H).
+    and inference (encode_image, building the request). EVERY camera is cropped to the target 16:9
+    aspect, then INTER_AREA-resized to (IMG_W, IMG_H). The head passes keep="bottom" (it is 16:10 —
+    too tall — so the crop drops rows from the TOP only, preserving the workspace at the bottom and
+    applying AGENT_CROP_ZOOM); the wrist cams are already ~16:9 so their crop is a few rows, centered.
     Defining it once here is what keeps the train and deploy pixels identical."""
-    if center_crop:
-        rgb_image = center_crop_to_aspect(rgb_image, IMG_W, IMG_H, AGENT_CROP_ZOOM)
+    zoom = AGENT_CROP_ZOOM if keep == "bottom" else 1.0
+    rgb_image = crop_to_aspect(rgb_image, IMG_W, IMG_H, zoom=zoom, keep=keep)
     if rgb_image.shape[:2] != (IMG_H, IMG_W):
         rgb_image = cv2.resize(rgb_image, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
     return rgb_image
 
 
-def encode_image(rgb_image, center_crop=False):
+def encode_image(rgb_image, keep="center"):
     """RGB frame -> base64 JPEG string for the /predict request.
 
     Applies the shared preprocess_frame transform (so it matches training pixel-for-pixel up to the
-    JPEG codec), then BGR-JPEG-encodes the already-small frame, which is what makes it fast."""
-    rgb_image = preprocess_frame(rgb_image, center_crop)
+    JPEG codec), then BGR-JPEG-encodes the already-small frame, which is what makes it fast.
+    The head passes keep="bottom" (top-crop); wrist cams use the default centered crop."""
+    rgb_image = preprocess_frame(rgb_image, keep)
     rgb_image_cv2 = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
     _, buffer = cv2.imencode('.jpg', rgb_image_cv2, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return base64.b64encode(buffer).decode('utf-8')
@@ -123,8 +141,9 @@ def build_predict_request(obs):
     field names and image preprocessing here are the contract with task/dual_arm_ee_image.yaml's
     shape_meta and the server decode — keep in sync."""
     return {
-        # head (agent) is center-cropped to the target aspect like training; wrists are resize-only.
-        'agentview_image':          [encode_image(img, center_crop=True) for img in obs['agent_imgs']],
+        # head (agent) is top-cropped to 16:9 like training (keep="bottom"); wrists are already
+        # ~16:9 so they get the default centered few-row crop. Both go through the shared transform.
+        'agentview_image':          [encode_image(img, keep="bottom") for img in obs['agent_imgs']],
         'robotl_eye_in_hand_image': [encode_image(img) for img in obs['handl_imgs']],
         'robotr_eye_in_hand_image': [encode_image(img) for img in obs['handr_imgs']],
         'robotl_eef_pos':           obs['robotl_eef_pos'],   # (To, 9) [pos3 + rot6d6]

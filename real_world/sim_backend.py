@@ -133,15 +133,24 @@ class SimEnv:
             self.jmap[name] = i
             self.jlim[name] = (ji[8], ji[9])     # (lower, upper); lower>upper => no limit
             self.link_name[i] = ji[12].decode()  # child link name of this joint
-        self.arm_idx = [self.jmap[j] for j in LEFT_ARM_JOINTS]
+        self.arm_idx = [self.jmap[j] for j in LEFT_ARM_JOINTS]      # left actuation (replay/command)
         self.grip_idx = [self.jmap[j] for j in LEFT_GRIPPER_JOINTS if j in self.jmap]
-        # Self-collision trigger set = LEFT ARM links only (Joint*_l children). The right
-        # arm/gripper's inherent overlaps are irrelevant to a left-arm trajectory, and the LEFT
-        # gripper fingers' coarse, grip-driven meshes brush the arm base constantly -> excluded
-        # to avoid false positives. The real hazard we gate on is an ARM linkage hitting the
-        # torso / the other arm. (Gripper/environment hazards: firmware collisions + operator +
-        # physical E-stop.)
-        self._left_links = set(self.arm_idx)
+        # --- dual-arm validation additions (the release path validates BOTH arms) ---
+        self.arm_idx_r = [self.jmap[j] for j in RIGHT_ARM_JOINTS]
+        self.grip_idx_r = [self.jmap[j] for j in RIGHT_GRIPPER_JOINTS if j in self.jmap]
+        # 14-joint limits [left7, right7] for clipping dual configs. Right limits come from a
+        # right reduced model (URDF joint limits only — base_offset irrelevant, so no calib needed).
+        _right_model = PinocchioArmModel(urdf_path=urdf, ee_frame="Link7_r",
+                                         arm_joints=RIGHT_ARM_JOINTS)
+        self.lower14 = np.concatenate([self.model.lower, _right_model.lower])
+        self.upper14 = np.concatenate([self.model.upper, _right_model.upper])
+        # Self-collision trigger set = BOTH arms' links (Joint*_l and Joint*_r children). With both
+        # arms now moving, the hazards we gate on are an ARM linkage hitting the torso OR THE OTHER
+        # ARM (cross-arm collision) — the latter comes for free because _penetrating_pairs checks
+        # every trigger link against every other link (incl. the opposite arm). Inherent coarse-mesh
+        # overlaps at rest are absorbed into _ignore_pairs below. (Gripper/env hazards: firmware
+        # collisions + operator + physical E-stop.)
+        self._collision_links = set(self.arm_idx) | set(self.arm_idx_r)
         # Parent/child link pairs always meet at their shared joint -> exclude from the
         # force-free distance check (no EXCLUDE_PARENT flag applies to getClosestPoints).
         self._adjacent = set()
@@ -193,6 +202,12 @@ class SimEnv:
         """Snap the left arm to a seed config (owning thread; start of a run)."""
         q = np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
         for k, qi in zip(self.arm_idx, q):
+            p.resetJointState(self.body, k, float(qi))
+
+    def reset_arms(self, q14):
+        """Snap BOTH arms to a 14-joint seed [left7, right7] (owning thread; dual-arm validation)."""
+        q = np.clip(np.asarray(q14, dtype=np.float64), self.lower14, self.upper14)
+        for k, qi in zip(self.arm_idx + self.arm_idx_r, q):
             p.resetJointState(self.body, k, float(qi))
 
     def _set_joints(self, name_to_pos):
@@ -301,15 +316,35 @@ class SimEnv:
     def _cur_arm_q(self):
         return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
 
+    def _cur_arms_q(self):
+        """Current BOTH-arm joints as a 14-vec [left7, right7] (sim-achieved readback)."""
+        return np.array([p.getJointState(self.body, k)[0]
+                         for k in self.arm_idx + self.arm_idx_r])
+
+    def _apply_arms(self, q14, grips):
+        """Position-control BOTH arms to q14 [left7, right7] + both grippers to grips [gl, gr]
+        (normalized 0=open/1=closed). Owning thread. Used by the dual-arm validation slow path."""
+        q14 = np.asarray(q14, dtype=np.float64)
+        p.setJointMotorControlArray(self.body, self.arm_idx + self.arm_idx_r, p.POSITION_CONTROL,
+                                    targetPositions=q14.tolist(),
+                                    forces=[200.0] * (len(self.arm_idx) + len(self.arm_idx_r)))
+        for gidx, g in ((self.grip_idx, grips[0]), (self.grip_idx_r, grips[1])):
+            if gidx:
+                ang = _grip_to_finger_angle(g)
+                p.setJointMotorControlArray(self.body, gidx, p.POSITION_CONTROL,
+                                            targetPositions=[ang] * len(gidx),
+                                            forces=[20.0] * len(gidx))
+
     # ===================== validation (run on the owning thread) =====================
     def validate(self, configs, seed_q, max_joint_step, learn=False, fast=False, substeps_per_row=None):
         """Run PRE-SOLVED joint configs through the sim; return (validated_traj, ok, reason).
         Thread-safe entry (marshals to the owning thread via submit_job).
 
-        configs: [(q7, grip), ...] — the raw IK joints + gripper for each chunk row, ALREADY
-        solved by the caller (IK + workspace/orientation checks live OUTSIDE the sim job now,
-        on the caller's thread; see HumanoidEnv._solve_chunk_ik). The sim job is purely the
-        kinematic check: expand each row gap into SUBSTEPS_PER_ROW time-uniform configs (so
+        configs: [(q14, [gl, gr]), ...] — the raw IK joints (BOTH arms: [left7, right7]) + both
+        grippers for each chunk row, ALREADY solved by the caller (IK + workspace/orientation
+        checks live OUTSIDE the sim job now, on the caller's thread; see HumanoidEnv._solve_chunk_ik).
+        Both arms are driven in lockstep and cross-arm self-collision is checked. The sim job is
+        purely the kinematic check: expand each row gap into SUBSTEPS_PER_ROW time-uniform configs (so
         inter-row wall-clock = ROW_DT, independent of motion size), reject a row whose per-
         substep delta exceeds max_joint_step (the velocity ceiling), apply, settle, self-
         collision check, and record the sim-ACHIEVED joints (not raw IK).
@@ -327,22 +362,23 @@ class SimEnv:
     def _validate_impl(self, configs, seed_q, max_joint_step, learn=False, fast=False,
                        substeps_per_row=None):
         K = int(substeps_per_row) if substeps_per_row else SUBSTEPS_PER_ROW
-        seed = np.asarray(seed_q, dtype=np.float64).copy()
+        seed = np.asarray(seed_q, dtype=np.float64).copy()      # 14-vec [left7, right7]
         # Deterministic start (so learn & validate see the same path, and repeat runs agree):
-        # reset the left arm to the seed AND the gripper to open (GRIPPER_OPEN_RAD, since angle 0
+        # reset BOTH arms to the seed AND both grippers to open (GRIPPER_OPEN_RAD, since angle 0
         # is CLOSED — see _grip_to_finger_angle).
-        self.reset_arm(seed)
-        for k in self.grip_idx:
+        self.reset_arms(seed)
+        for k in self.grip_idx + self.grip_idx_r:
             p.resetJointState(self.body, k, GRIPPER_OPEN_RAD)
         # Clip every row config up front: the C1 inter-row interpolation (centripetal Catmull-Rom)
         # sets each waypoint's tangent from its NEIGHBOURING rows, so it needs the whole sequence and
-        # can't expand one gap in isolation like a plain lerp. P[k] = row k's joint target.
-        P = [np.clip(np.asarray(q7, dtype=np.float64), self.model.lower, self.model.upper)
-             for (q7, _g) in configs]
-        grips = [float(g) for (_q, g) in configs]
+        # can't expand one gap in isolation like a plain lerp. P[k] = row k's 14-joint target; the
+        # Catmull-Rom / velocity-cap math below is dimension-agnostic (both arms move in lockstep).
+        P = [np.clip(np.asarray(q14, dtype=np.float64), self.lower14, self.upper14)
+             for (q14, _g) in configs]
+        grips = [(float(g[0]), float(g[1])) for (_q, g) in configs]   # [gl, gr] per row
         out = []
         for k in range(len(P)):
-            q7, grip = P[k], grips[k]
+            q7, grip = P[k], grips[k]      # q7 is a 14-vec here; grip is (gl, gr)
             # Time-uniform expansion: each row gap becomes a FIXED SUBSTEPS_PER_ROW substeps (uniform
             # in time), so inter-row wall-clock is always ROW_DT regardless of motion size and the
             # splice's f=elapsed/STEP_TIME stays exact. Smoothness is set by CONTROL_HZ (=>
@@ -368,20 +404,20 @@ class SimEnv:
                             f"action {k}: joint-velocity cap exceeded "
                             f"({np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > "
                             f"{np.degrees(max_joint_step * CONTROL_HZ):.0f} deg/s)")
-            for sub in subs:
+            for sub in subs:                             # sub is a 14-vec [left7, right7]
                 if fast:
                     # Collision-only fast path: KINEMATIC TELEPORT, no physics settle. The preview is
                     # gravity-free position-hold, so resetJointState to `sub` IS the achieved pose,
                     # and getClosestPoints (below) is a geometric query computed from the current
                     # config — it needs no stepSimulation. This drops the per-substep settle loop
                     # (up to settle_max_steps steps), which was the dominant validation cost.
-                    self.reset_arm(sub)
-                    if self.grip_idx:
-                        g = _grip_to_finger_angle(grip)
-                        for gk in self.grip_idx:
-                            p.resetJointState(self.body, gk, g)
+                    self.reset_arms(sub)
+                    for gidx, g in ((self.grip_idx, grip[0]), (self.grip_idx_r, grip[1])):
+                        ang = _grip_to_finger_angle(g)
+                        for gk in gidx:
+                            p.resetJointState(self.body, gk, ang)
                 else:
-                    self._apply_arm(sub, grip)         # position control + physics settle (GUI watch)
+                    self._apply_arms(sub, grip)        # position control + physics settle (GUI watch)
                     self._settle(sub)
                 new = self._new_left_pairs()
                 if new:
@@ -391,7 +427,7 @@ class SimEnv:
                         a, b = sorted(new)[0]
                         return [], False, (f"action {k}: self-collision "
                                            f"{self.link_name.get(a, a)} <-> {self.link_name.get(b, b)}")
-                out.append((self._cur_arm_q().copy(), float(grip)))   # sim-ACHIEVED, not raw IK
+                out.append((self._cur_arms_q().copy(), grip))   # sim-ACHIEVED 14-vec + (gl, gr)
         return out, True, None
 
     @staticmethod
@@ -461,7 +497,7 @@ class SimEnv:
             p.stepSimulation()
             if not self.direct and not fast:
                 time.sleep(self.sim_dt)
-            if np.max(np.abs(self._cur_arm_q() - q_des)) < self.settle_tol:
+            if np.max(np.abs(self._cur_arms_q() - q_des)) < self.settle_tol:
                 break
 
     def calibrate_collision(self, arm_configs):
@@ -480,13 +516,14 @@ class SimEnv:
         return self.submit_job(job)
 
     def _penetrating_pairs(self):
-        """LEFT-ARM link vs any-other-link pairs interpenetrating beyond
+        """TRIGGER-LINK (both arms) vs any-other-link pairs interpenetrating beyond
         SELF_COLLISION_PENETRATION, via getClosestPoints (geometry only -> no contact forces, no
-        URDF self-collision flag needed). Adjacent (parent/child) pairs are skipped."""
+        URDF self-collision flag needed). Adjacent (parent/child) pairs are skipped. Because the
+        trigger set is BOTH arms, left-vs-right (cross-arm) penetrations are detected here too."""
         n = p.getNumJoints(self.body)
         others = [-1] + list(range(n))
         hits = set()
-        for la in self.arm_idx:
+        for la in self._collision_links:
             for lb in others:
                 if lb == la or tuple(sorted((la, lb))) in self._adjacent:
                     continue

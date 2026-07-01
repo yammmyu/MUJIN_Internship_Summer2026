@@ -63,7 +63,11 @@ except ImportError:
 QUAT_ALPHA = 0.5
 # Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
 # target outside is rejected (never sent to IK/robot). Generous box; tighten per workspace. (H4)
-WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y..),(z..)
+WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y..),(z..) LEFT arm
+# RIGHT-arm workspace envelope (H4): the right arm lives at NEGATIVE y (recorded right EE y in
+# ~[-0.38, -0.17]), so its AABB is the LEFT box mirrored across y=0 (same x,z). Per-arm envelopes
+# keep the safety bound tight for each side instead of one loose union box.
+WORKSPACE_AABB_RIGHT = ((-0.20, 0.85), (-1.10, 0.20), (0.40, 1.30))
 # A live observation older than this (no real change in EE pose / camera) is "stale": the
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
@@ -222,16 +226,25 @@ class HumanoidEnv:
         #     batches; only the LEFT arm is ever commanded, so the right arm is never moved.
         #   * _exec_loop drives the sim only (auto/replay preview); it never touches the robot.
         self.sim = sim                               # SimEnv (command/validate), or None
-        self.solver = solver if solver is not None else build_solver()
+        self.solver = solver if solver is not None else build_solver()          # LEFT arm IK
+        # RIGHT-arm IK solver (dual-arm execution): its own URDF joints + FK calibration
+        # (fk_calibration_right.json). Both arms are solved per row and streamed in lockstep.
+        self.solver_r = build_solver(side="right")
         # Left-arm joint limits (rad), captured once so the execution path can clamp commands
         # without reaching into the IK solver (it only needs the bounds, not the solver).
         self._jlower = np.asarray(self.solver.m.lower, dtype=np.float64).copy()
         self._jupper = np.asarray(self.solver.m.upper, dtype=np.float64).copy()
+        # 14-joint limits [left7, right7] for clamping dual-arm release commands.
+        self._jlower14 = np.concatenate([self._jlower, np.asarray(self.solver_r.m.lower, dtype=np.float64)])
+        self._jupper14 = np.concatenate([self._jupper, np.asarray(self.solver_r.m.upper, dtype=np.float64)])
         self._real = real
-        # IK warm-start seed (7,). Seeded from the recording's first arm joints when given,
-        # else the limit-clipped zero config.
+        # LEFT IK warm-start seed (7,), used ONLY by the sim-preview _solve_ik path. Seeded from the
+        # recording's first arm joints when given, else the limit-clipped zero config.
         self._last_q = (np.asarray(seed_q, dtype=np.float64).copy()
                         if seed_q is not None else self.solver.m.clip(np.zeros(7)))
+        # DUAL IK warm-start seed (14,) [left7, right7], used by the validate/append/release path.
+        # Re-anchored to the live robot on each idle validate (_resync) / auto ingest.
+        self._last_q14 = np.concatenate([self._last_q, self.solver_r.m.clip(np.zeros(7))])
         self._quat_prev = None                       # previous target quat for SLERP smoothing (H3)
         # Release pipeline state (guarded by self._lock):
         self._last_sim_traj = []                     # [(q7_achieved, grip)] last validated traj
@@ -743,27 +756,33 @@ class HumanoidEnv:
         skip_unreachable=True (calibrate path): drop unreachable/out-of-envelope rows and keep
         going (mirrors the old learn=True behaviour) instead of aborting."""
         configs = []
-        seed = np.asarray(seed_q, dtype=np.float64).copy()
-        qprev = None    # local quat-smoothing state (don't disturb the preview's)
+        seed = np.asarray(seed_q, dtype=np.float64).copy()   # 14-vec [left7, right7]
+        seedL, seedR = seed[:7].copy(), seed[7:14].copy()
+        qprevL = qprevR = None    # per-arm quat-smoothing state (don't disturb the preview's)
         for k, action in enumerate(action_chunk):
-            pos, quat, grip = self._decode_ee_action(action)
-            pos = np.asarray(pos, dtype=np.float64)
-            grip = float(grip)
-            if not self._pos_in_workspace(pos):                                  # H4
+            Lpos, Lquat, Lgrip, Rpos, Rquat, Rgrip = self._decode_ee_action_dual(action)
+            Lpos = np.asarray(Lpos, dtype=np.float64); Rpos = np.asarray(Rpos, dtype=np.float64)
+            if not self._pos_in_workspace(Lpos, "left") or not self._pos_in_workspace(Rpos, "right"):
                 if skip_unreachable:
                     continue
                 return [], False, f"action {k}: target EE pos outside workspace envelope"
-            qprev = _smooth_quat_step(qprev, quat, QUAT_ALPHA)                    # H3
-            q7 = self.solver.solve(IKQuery(target_pos=pos, target_quat=qprev,
-                                           current_joints=seed))
+            qprevL = _smooth_quat_step(qprevL, Lquat, QUAT_ALPHA)                 # H3 (per arm)
+            qprevR = _smooth_quat_step(qprevR, Rquat, QUAT_ALPHA)
+            qL = self.solver.solve(IKQuery(target_pos=Lpos, target_quat=qprevL, current_joints=seedL))
             if not self.solver.last_reachable:
                 if skip_unreachable:
                     continue
-                return [], False, (f"action {k}: IK unreachable "
+                return [], False, (f"action {k}: LEFT IK unreachable "
                                    f"(pos err {self.solver.last_pos_err*1000:.0f} mm)")
-            q7 = np.asarray(q7, dtype=np.float64)
-            configs.append((q7, grip))
-            seed = q7
+            qR = self.solver_r.solve(IKQuery(target_pos=Rpos, target_quat=qprevR, current_joints=seedR))
+            if not self.solver_r.last_reachable:
+                if skip_unreachable:
+                    continue
+                return [], False, (f"action {k}: RIGHT IK unreachable "
+                                   f"(pos err {self.solver_r.last_pos_err*1000:.0f} mm)")
+            qL = np.asarray(qL, dtype=np.float64); qR = np.asarray(qR, dtype=np.float64)
+            configs.append((np.concatenate([qL, qR]), [Lgrip, Rgrip]))
+            seedL, seedR = qL, qR
         return configs, True, None
 
     def calibrate_collisions(self, action_chunk):
@@ -773,11 +792,11 @@ class HumanoidEnv:
         recordings before trusting validation, or it will false-positive on normal poses."""
         if self.sim is None:
             return False, "no sim running"
-        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q,
+        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14,
                                                    skip_unreachable=True)
         if not ok:
             return False, reason
-        self.sim.validate(configs, self._last_q, MAX_JOINT_STEP, learn=True,
+        self.sim.validate(configs, self._last_q14, MAX_JOINT_STEP, learn=True,
                           substeps_per_row=self.substeps_per_row)
         return True, "collision baseline updated"
 
@@ -819,17 +838,17 @@ class HumanoidEnv:
 
         # Solve IK for the whole chunk first (outside the sim job), then validate the resulting
         # joint configs kinematically. On an IK/envelope failure there's nothing to validate.
-        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q)
-        traj, ok, reason = (self._validate_chunk(configs, self._last_q)
+        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14)
+        traj, ok, reason = (self._validate_chunk(configs, self._last_q14)
                             if ok else ([], False, reason))
         with self._lock:
             if ok and traj:
                 self._last_sim_traj = traj
                 self._validation_id += 1
-                # Advance the IK warm-start seed to the joints achieved at the end of this
+                # Advance the dual IK warm-start seed to the 14-joints achieved at the end of this
                 # validated segment, so a subsequent step-through call (单步/整条) plans
                 # continuously from here instead of restarting from the original seed.
-                self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()
+                self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()
                 # APPEND these substeps to the ready-to-release buffer (单步/整条 both accumulate
                 # here). release_next_substep / release_remaining_substeps drain it to the robot.
                 self._staged_release.extend(traj)
@@ -869,7 +888,8 @@ class HumanoidEnv:
             pass
         self.sim.submit_job(lambda: self.sim.reset_full(
             arm14=arm14, body_pitch=body_pitch, gripper_lr=grip))
-        self.set_seed(arm14[:7])                          # IK seed -> real left-arm joints
+        self.set_seed(arm14[:7])                          # LEFT preview IK seed -> real left joints
+        self._last_q14 = np.asarray(arm14, dtype=np.float64).copy()   # dual seed -> real both arms
 
     # ===================== real-robot release ("validate in sim, then release") =====================
     def release_to_robot(self):
@@ -892,11 +912,11 @@ class HumanoidEnv:
             if vid == self._released_id:
                 print("[HumanoidEnv] release refused: already released; run 执行 again.")
                 return 0
-        arm14 = self._read_arm14()                       # current LEFT pose for the C5 ramp-in
+        arm14 = self._read_arm14()                       # current BOTH-arm pose for the C5 ramp-in
         if arm14 is None:
             print("[HumanoidEnv] release refused: cannot read arm_joint_states (ramp-in start).")
             return 0
-        ramp = self._ramp(arm14[:7], traj[0][0], self.ramp_joint_step, traj[0][1])   # C5 ramp-in (cruise speed)
+        ramp = self._ramp(arm14, traj[0][0], self.ramp_joint_step, traj[0][1])   # C5 ramp-in (both arms)
         full = self._subdivide_points(ramp + traj)       # <= MAX_JOINT_STEP for the live per-tick drain
         with self._lock:
             self._robot_q.clear()
@@ -914,24 +934,25 @@ class HumanoidEnv:
             return len(self._staged_release)
 
     def staged_preview(self, n=10):
-        """The next up-to-n staged substeps as (7-joint array, grip) pairs (copies), in release
-        order. grip is the binary {0,1} gripper command staged with the substep. For the live
-        substep monitor; cheap snapshot under the lock."""
+        """The next up-to-n staged substeps as (14-joint array, [gl, gr]) pairs (copies), in release
+        order. grip is the binary {0,1} gripper command per arm. For the live substep monitor;
+        cheap snapshot under the lock."""
         with self._lock:
             items = list(self._staged_release)[:n]
-        return [(np.asarray(q, dtype=np.float64).copy(), float(grip)) for (q, grip) in items]
+        return [(np.asarray(q, dtype=np.float64).copy(), [float(g[0]), float(g[1])])
+                for (q, g) in items]
 
     def robot_q_preview(self, n=10):
         """The next up-to-n commands queued for the robot (_robot_q) as (7-joint array, grip)
         pairs (copies), in execution order. This is the buffer the AUTO-inference path appends to
         (append_actions) and the release loop drains, so it reflects upcoming real motion in BOTH
         manual-release and auto-inference modes — unlike staged_preview, which only sees the manual
-        pre-release buffer. _robot_q items are (q7, grip[, row_id]); grip may be None on a ramp
+        pre-release buffer. _robot_q items are (q14, [gl, gr][, row_id]); grip may be None on a ramp
         substep, passed through as None for the caller to render. Cheap snapshot under the lock."""
         with self._lock:
             items = list(self._robot_q)[:n]
         return [(np.asarray(sub[0], dtype=np.float64).copy(),
-                 (None if sub[1] is None else float(sub[1]))) for sub in items]
+                 (None if sub[1] is None else [float(sub[1][0]), float(sub[1][1])])) for sub in items]
 
     def release_n_substeps(self, n):
         """Release up to N staged substeps to the robot: pops the next n from the ready-to-release
@@ -983,7 +1004,7 @@ class HumanoidEnv:
         commanded — the right arm is never addressed. Returns commands queued."""
         if not subs:
             return 0
-        arm14 = self._read_arm14()                       # current LEFT pose for the C5 ramp-in
+        arm14 = self._read_arm14()                       # current BOTH-arm pose for the C5 ramp-in
         if arm14 is None:
             print("[HumanoidEnv] release refused: cannot read arm_joint_states (ramp-in start).")
             with self._lock:                             # don't lose the popped substeps
@@ -993,7 +1014,7 @@ class HumanoidEnv:
             if self._robot_q:                            # already streaming -> append, continuous
                 full = list(subs)
             else:                                        # idle -> C5 ramp from the measured pose
-                ramp = self._ramp(arm14[:7], subs[0][0], self.ramp_joint_step, subs[0][1])
+                ramp = self._ramp(arm14, subs[0][0], self.ramp_joint_step, subs[0][1])
                 full = ramp + list(subs)[1:]             # ramp's last point IS subs[0]
             self._robot_q.extend(self._subdivide_points(full))
             staged_substep_remaining = len(self._staged_release)
@@ -1020,7 +1041,7 @@ class HumanoidEnv:
         # Seed IK + validation from a FRESH real left-arm read so the self-collision check and IK
         # plan from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
         arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
-        seed = arm14[:7] if arm14 is not None else self._last_q
+        seed = arm14 if arm14 is not None else self._last_q14      # 14-vec dual seed
         # Solve IK for the chunk OUTSIDE the sim job (pure Pinocchio, caller's thread), then run
         # the resulting joint configs through the sim for the kinematic self-collision check.
         configs, ok, reason = self._solve_chunk_ik(action_chunk, seed)
@@ -1032,10 +1053,11 @@ class HumanoidEnv:
             return False, reason or "empty validated trajectory"
         # Tag each validated substep with its ABSOLUTE master row id. _validate_impl emits traj[0]
         # for row 0 and then K substeps per subsequent row, so substep s belongs to
-        # row 0 (s==0) else ceil(s / K); its master id = obs_step_id + that row.
-        tagged = [(np.asarray(q7, dtype=np.float64), float(grip),
+        # row 0 (s==0) else ceil(s / K); its master id = obs_step_id + that row. q14 = both arms;
+        # grip = [gl, gr].
+        tagged = [(np.asarray(q14, dtype=np.float64), grip,
                    int(obs_step_id) + (0 if s == 0 else int(np.ceil(s / K))))
-                  for s, (q7, grip) in enumerate(traj)]
+                  for s, (q14, grip) in enumerate(traj)]
         with self._lock:
             cur = self._current_row_id
             kept = [t for t in tagged if t[2] >= cur]      # drop rows the arm already passed
@@ -1048,13 +1070,13 @@ class HumanoidEnv:
             # >cap jump from where the arm actually is to the ramp's start. Holding the lock keeps the
             # release loop from advancing between this read and the queue swap.
             live = self._read_arm14()
-            start = live[:7] if live is not None else kept[0][0]
+            start = live if live is not None else kept[0][0]   # 14-vec both-arm start pose
             fq, fg, fid = kept[0]
             ramp = [(q, g, fid) for (q, g) in self._ramp(start, fq, self.ramp_joint_step, fg)]
             self._robot_q.clear()
             self._robot_q.extend(ramp + kept[1:])          # ramp ends AT kept[0]
             qlen = len(self._robot_q)
-            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()   # IK warm-start
+            self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
         print(f"[HumanoidEnv] auto-ramp: obs_row={obs_step_id}, now={cur}, "
               f"kept={len(kept)}/{len(tagged)} (+{len(ramp)} ramp) -> queue {qlen}")
         return True, ""
@@ -1098,7 +1120,7 @@ class HumanoidEnv:
 
         if seed is None:                                    # queue empty -> continue from live pose
             arm14 = self._read_arm14()
-            seed = arm14[:7] if arm14 is not None else self._last_q
+            seed = arm14 if arm14 is not None else self._last_q14   # 14-vec dual seed
         configs, ok, reason = self._solve_chunk_ik(action_chunk[lo:hi + 1], seed)
         if not ok:
             return False, reason
@@ -1108,9 +1130,9 @@ class HumanoidEnv:
             return False, reason or "empty validated trajectory"
         # Tag substeps with absolute master ids: traj[0] is the slice's first row (start_id), then
         # K substeps per subsequent row.
-        tagged = [(np.asarray(q7, dtype=np.float64), float(grip),
+        tagged = [(np.asarray(q14, dtype=np.float64), grip,     # q14 = both arms; grip = [gl, gr]
                    start_id + (0 if s == 0 else int(np.ceil(s / K))))
-                  for s, (q7, grip) in enumerate(traj)]
+                  for s, (q14, grip) in enumerate(traj)]
         with self._lock:
             cur = self._current_row_id
             # Validation took time; drop any row the clock has since passed or that's already queued.
@@ -1138,7 +1160,7 @@ class HumanoidEnv:
             self._robot_q.extend(ramp + new[1:])    # ramp ends AT new[0]; queue is NEVER cleared
             self._queued_through = new[-1][2]
             qlen = len(self._robot_q)
-            self._last_q = np.asarray(traj[-1][0], dtype=np.float64).copy()   # IK warm-start
+            self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
         print(f"[HumanoidEnv] append: obs_row={obs_step_id}, clock={cur}, "
               f"appended ids {new[0][2]}..{new[-1][2]} (+{len(ramp)} ramp) -> queue {qlen}")
         return True, ""
@@ -1160,11 +1182,11 @@ class HumanoidEnv:
                 print("[HumanoidEnv] E-stop WARNING: no joint read to hold — use physical E-stop.")
                 return
             for _ in range(3):                           # re-assert a few times to be sure
-                # Hold the LEFT arm at its current pose; don't touch the gripper. NOTE: the SDK
+                # Hold BOTH arms at their current pose; don't touch the grippers. NOTE: the SDK
                 # has no trajectory abort, so this can only PREEMPT (not cancel) an in-flight
                 # trajectory — clearing _robot_q above stops further batches; the physical E-stop
                 # remains primary for an already-dispatched batch.
-                self.run_trajectory_control([(arm14[:7], None)],  # None grip -> gripper untouched
+                self.run_trajectory_control([(arm14, None)],  # 14-vec both arms; None grip -> untouched
                                             ignore_estop=True)    # hold must send while estopped
 
     def reset_estop(self):
@@ -1218,7 +1240,8 @@ class HumanoidEnv:
         q_to = np.asarray(q_to, dtype=np.float64)
         n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap))
         n = max(n, 1)
-        return [(q_from + (q_to - q_from) * (i / n), float(grip)) for i in range(1, n+1)]
+        # grip is carried opaquely (a [gl, gr] pair for dual-arm release, or None); do NOT coerce.
+        return [(q_from + (q_to - q_from) * (i / n), grip) for i in range(1, n+1)]
         # this gives the points that provides a smooth transition BETWEEN q_from and q_to (incl. q_to)
 
     @staticmethod
@@ -1254,9 +1277,10 @@ class HumanoidEnv:
             n *= 2
         return out
 
-    def _pos_in_workspace(self, pos):
-        """True if the target EE position is inside the configured workspace AABB (H4)."""
-        (xl, xh), (yl, yh), (zl, zh) = WORKSPACE_AABB
+    def _pos_in_workspace(self, pos, side="left"):
+        """True if the target EE position is inside that arm's workspace AABB (H4). side="right"
+        uses the mirrored right-arm envelope (the right arm operates at negative y)."""
+        (xl, xh), (yl, yh), (zl, zh) = WORKSPACE_AABB_RIGHT if side == "right" else WORKSPACE_AABB
         x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
         return xl <= x <= xh and yl <= y <= yh and zl <= z <= zh
 
@@ -1336,12 +1360,13 @@ class HumanoidEnv:
             # measured joints at the same tick, same id, for tracking-error / lag analysis. The whole
             # block is wrapped so a disk/IO error logs once and motion continues.
             try:
-                q7_cmd, grip_cmd = sub[0], sub[1]
+                q14_cmd, grip_cmd = sub[0], sub[1]
                 with open("released_substeps.jsonl", "a") as f:
                     f.write(json.dumps({
                         "step_id": row_id,
-                        "q7": np.asarray(q7_cmd, dtype=np.float64).tolist(),
-                        "grip": (None if grip_cmd is None else float(grip_cmd)),
+                        "q14": np.asarray(q14_cmd, dtype=np.float64).tolist(),   # [left7, right7]
+                        "grip": (None if grip_cmd is None else
+                                 [float(grip_cmd[0]), float(grip_cmd[1])]),      # [gl, gr]
                     }) + "\n")
                 try:
                     live_vals, _ = self.robot.arm_joint_states()
@@ -1362,8 +1387,17 @@ class HumanoidEnv:
                 self.lock_robot()                              # couldn't dispatch -> estop
 
     def _decode_ee_action(self, action):
-        """action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip)."""
+        """LEFT half of an action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip).
+        Reads cols 0:10, so it works on both a 10-col left row and a 20-col dual row (preview path)."""
         return action[:3], rot6d_to_quat(action[3:9]), action[9]
+
+    @staticmethod
+    def _decode_ee_action_dual(action):
+        """Dual 20-col action row L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1] ->
+        (Lpos, Lquat, Lgrip, Rpos, Rquat, Rgrip). Left = cols 0:10, right = cols 10:20."""
+        a = np.asarray(action, dtype=np.float64)
+        return (a[0:3],   rot6d_to_quat(a[3:9]),   float(a[9]),
+                a[10:13], rot6d_to_quat(a[13:19]), float(a[19]))
 
     def _solve_ik(self, pos, quat):
         """Target EE pose -> 7 left-arm joint angles via our URDF IK (warm-started from the
@@ -1419,23 +1453,23 @@ class HumanoidEnv:
         # right arm never moves) with reference_time = STEP_TIME; we pace on self._stop_event so a
         # shutdown breaks promptly too.
         for item in points:
-            q7, grip = item[0], item[1]                  # tolerate (q7, grip) or (q7, grip, row_id)
+            q14, grip = item[0], item[1]                 # tolerate (q14, grip) or (q14, grip, row_id)
             # Stop streaming a RELEASE batch the instant an E-stop latches (or on shutdown). The
             # E-stop HOLD itself passes ignore_estop=True so it can re-assert the pose while latched.
             if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
                 return True                                  # halt: send no further waypoints
-            infer_timestamp = int(time.time() * 1e9)     
-            left7 = np.clip(np.asarray(q7, dtype=np.float64),
-                            self._jlower, self._jupper)      # joint-limit clamp (no IK solver needed)
-            # ONE waypoint driving BOTH the left arm and (optionally) the left gripper, via the
-            # 'left_arm' and 'gripper' GROUP_IDS (8.2.1). No move_gripper call, and neither the
-            # right arm nor the right gripper is ever addressed, so both hold.
-            robot_action = [{"left_arm": {"action_data": left7.tolist(),
-                                         "control_type": "ABS_JOINT"}}]
-            if grip is not None:                         # None -> leave the gripper alone (E-stop hold)
-                # grip is already the binary {0,1} normalized at inference -> open/close command.
-                grip_cmd = 1 if grip >= 0.5 else 0
-                self.robot.move_gripper([grip_cmd, 0])
+            infer_timestamp = int(time.time() * 1e9)
+            q14 = np.clip(np.asarray(q14, dtype=np.float64),
+                          self._jlower14, self._jupper14)    # 14-joint limit clamp (no IK solver needed)
+            # ONE waypoint driving BOTH arms via the 'left_arm' and 'right_arm' GROUP_IDS (8.2.1),
+            # and (optionally) both grippers via move_gripper. Both arms are addressed every tick, so
+            # the dual-arm policy drives them in lockstep; grip=None (E-stop hold) leaves grippers alone.
+            robot_action = [{"left_arm":  {"action_data": q14[:7].tolist(),  "control_type": "ABS_JOINT"},
+                             "right_arm": {"action_data": q14[7:].tolist(),  "control_type": "ABS_JOINT"}}]
+            if grip is not None:                         # None -> leave grippers alone (E-stop hold)
+                # grip = [gl, gr], already binary {0,1} normalized at inference -> open/close commands.
+                gl, gr = grip
+                self.robot.move_gripper([1 if gl >= 0.5 else 0, 1 if gr >= 0.5 else 0])
             try:
                 self.robot_controller.trajectory_tracking_control(
                     infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME

@@ -44,6 +44,7 @@ import pinocchio as pin
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from real_world.ik import (  # noqa: E402
     PinocchioArmModel, FKCalibration, DEFAULT_URDF, DEFAULT_CALIBRATION,
+    DEFAULT_CALIBRATION_RIGHT, LEFT_ARM_JOINTS, RIGHT_ARM_JOINTS,
     se3_to_pos_quat_xyzw,
 )
 
@@ -52,32 +53,39 @@ DEFAULT_RECORDINGS = os.path.join(
     "MDM_data_collection", "recordings",
 )
 
-EE_FRAMES = ["Link7_l", "left_base_link", "gripper_center"]
-SLICES = {"left_first": slice(0, 7), "right_first": slice(7, 14)}
+# Per-side candidates. The joint slice is fixed per side (left arm = arm_joints[0:7], right =
+# [7:14]); the model uses that side's URDF joints and its own EE-frame candidates.
+SIDE_CFG = {
+    "left":  {"arm_joints": LEFT_ARM_JOINTS,  "slice": slice(0, 7),  "slice_name": "left_first",
+              "ee_frames": ["Link7_l", "left_base_link", "gripper_center"],
+              "pos_key": "left_pos",  "quat_key": "left_quat",  "out": DEFAULT_CALIBRATION},
+    "right": {"arm_joints": RIGHT_ARM_JOINTS, "slice": slice(7, 14), "slice_name": "right_first",
+              "ee_frames": ["Link7_r", "right_base_link", "gripper_center"],
+              "pos_key": "right_pos", "quat_key": "right_quat", "out": DEFAULT_CALIBRATION_RIGHT},
+}
 QUAT_CONVENTIONS = ["xyzw", "wxyz"]
 
 
-def load_samples(recordings_dir, num_recordings, per_recording):
-    """Gather (q_left7, q_right7, sdk_pos, sdk_quat_raw) tuples from recordings."""
+def load_samples(recordings_dir, num_recordings, per_recording, cfg):
+    """Gather (q_arm7, sdk_pos, sdk_quat_raw) for the chosen side from recordings."""
     npzs = sorted(glob.glob(os.path.join(recordings_dir, "*", "robot_states.npz")))
     if not npzs:
         raise FileNotFoundError(f"no robot_states.npz under {recordings_dir}")
     npzs = npzs[:num_recordings]
-    qL, qR, pos, quat = [], [], [], []
+    q, pos, quat = [], [], []
     within_joint_std = []   # per-recording mean joint std (to detect frozen joints)
     for path in npzs:
         d = np.load(path)
         n = len(d["timestamps"])
         idx = np.linspace(0, n - 1, min(per_recording, n)).astype(int)
         aj = d["arm_joints"][idx]
-        qL.append(aj[:, SLICES["left_first"]])
-        qR.append(aj[:, SLICES["right_first"]])
-        pos.append(d["left_pos"][idx])
-        quat.append(d["left_quat"][idx])
-        within_joint_std.append(d["arm_joints"].astype(float).std(axis=0).mean())
-    return (np.concatenate(qL), np.concatenate(qR),
-            np.concatenate(pos), np.concatenate(quat), len(npzs),
-            float(np.max(within_joint_std)))
+        q.append(aj[:, cfg["slice"]])
+        pos.append(d[cfg["pos_key"]][idx])
+        quat.append(d[cfg["quat_key"]][idx])
+        # freeze-detect on THIS side's joint columns only (a frozen arm defeats calibration).
+        within_joint_std.append(d["arm_joints"][:, cfg["slice"]].astype(float).std(axis=0).mean())
+    return (np.concatenate(q), np.concatenate(pos), np.concatenate(quat),
+            len(npzs), float(np.max(within_joint_std)))
 
 
 def sdk_se3(pos, quat_raw, convention):
@@ -117,15 +125,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--recordings", default=DEFAULT_RECORDINGS)
     ap.add_argument("--urdf", default=DEFAULT_URDF)
+    ap.add_argument("--side", choices=["left", "right"], default="left",
+                    help="which arm to calibrate (right uses right_pos/right_quat + arm_joints[7:14])")
     ap.add_argument("--num-recordings", type=int, default=6)
     ap.add_argument("--per-recording", type=int, default=60)
     ap.add_argument("--write", action="store_true",
-                    help="write the winning config to fk_calibration.json")
-    ap.add_argument("--out", default=DEFAULT_CALIBRATION)
+                    help="write the winning config to the side's fk_calibration file")
+    ap.add_argument("--out", default=None, help="override output path (default per --side)")
     args = ap.parse_args()
 
-    qL, qR, pos, quat, n_rec, within_qstd = load_samples(
-        args.recordings, args.num_recordings, args.per_recording)
+    cfg = SIDE_CFG[args.side]
+    out_path = args.out or cfg["out"]
+    print(f"Calibrating the {args.side.upper()} arm "
+          f"(joints[{cfg['slice'].start}:{cfg['slice'].stop}], "
+          f"EE={cfg['pos_key']}/{cfg['quat_key']})\n")
+
+    qA, pos, quat, n_rec, within_qstd = load_samples(
+        args.recordings, args.num_recordings, args.per_recording, cfg)
     n = len(pos)
     print(f"Loaded {n} samples from {n_rec} recordings under {args.recordings}\n")
 
@@ -145,22 +161,25 @@ def main():
               "moving the arm).")
         return
 
-    qcols = {"left_first": qL, "right_first": qR}
     results = []
-    for ee_frame in EE_FRAMES:
-        model = PinocchioArmModel(urdf_path=args.urdf, ee_frame=ee_frame)
-        for slice_name, qarr in qcols.items():
-            As = [model.fk_local(q) for q in qarr]
-            for conv in QUAT_CONVENTIONS:
-                Bs = [sdk_se3(pos[i], quat[i], conv) for i in range(n)]
-                Xs = [B * A.inverse() for A, B in zip(As, Bs)]
-                X = se3_mean(Xs)
-                pe, re = residuals(X, As, Bs)
-                results.append(dict(
-                    ee_frame=ee_frame, slice=slice_name, quat=conv, X=X,
-                    pos_mean=pe.mean(), pos_med=np.median(pe), pos_max=pe.max(),
-                    rot_mean=re.mean(), rot_med=np.median(re), rot_max=re.max(),
-                ))
+    for ee_frame in cfg["ee_frames"]:
+        try:
+            model = PinocchioArmModel(urdf_path=args.urdf, ee_frame=ee_frame,
+                                      arm_joints=cfg["arm_joints"])
+        except ValueError:
+            print(f"  (skip ee_frame {ee_frame!r}: not in URDF)")
+            continue
+        As = [model.fk_local(q) for q in qA]
+        for conv in QUAT_CONVENTIONS:
+            Bs = [sdk_se3(pos[i], quat[i], conv) for i in range(n)]
+            Xs = [B * A.inverse() for A, B in zip(As, Bs)]
+            X = se3_mean(Xs)
+            pe, re = residuals(X, As, Bs)
+            results.append(dict(
+                ee_frame=ee_frame, slice=cfg["slice_name"], quat=conv, X=X,
+                pos_mean=pe.mean(), pos_med=np.median(pe), pos_max=pe.max(),
+                rot_mean=re.mean(), rot_med=np.median(re), rot_max=re.max(),
+            ))
 
     results.sort(key=lambda r: (r["rot_med"] + 50 * r["pos_med"]))
     print(f"{'ee_frame':16} {'slice':12} {'quat':5} | "
@@ -202,11 +221,11 @@ def main():
             pos_residual_m=float(best["pos_med"]),
             rot_residual_deg=float(best["rot_med"]),
         )
-        with open(args.out, "w") as f:
+        with open(out_path, "w") as f:
             json.dump(dataclasses.asdict(cal), f, indent=2)
-        print(f"\nWrote calibration -> {args.out}")
+        print(f"\nWrote calibration -> {out_path}")
     else:
-        print("\n(dry run; pass --write to save fk_calibration.json)")
+        print(f"\n(dry run; pass --write to save {out_path})")
 
 
 if __name__ == "__main__":

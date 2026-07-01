@@ -16,7 +16,10 @@ TUNING_CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "tuning_co
 
 
 def _grip_label(grip):
-    """Binary {0,1} gripper command -> readable label for the substep monitor."""
+    """Binary {0,1} gripper command -> readable label for the substep monitor. Accepts a scalar
+    (single gripper) or a [gl, gr] pair (dual-arm): the pair renders as 'L闭/R开'."""
+    if isinstance(grip, (list, tuple, np.ndarray)):
+        return f"L{'闭' if float(grip[0]) >= 0.5 else '开'}/R{'闭' if float(grip[1]) >= 0.5 else '开'}"
     return "闭(1)" if float(grip) >= 0.5 else "开(0)"
 
 
@@ -26,6 +29,11 @@ class InferenceMixin:
     @property
     def left_arm_joint_values(self):
         return self.robot.arm_joint_states()[0][:7]
+
+    @property
+    def both_arm_joint_values(self):
+        """Live 14 arm joints [left7, right7] for the dual-arm substep monitor."""
+        return self.robot.arm_joint_states()[0][:14]
 
     # ------------------------------------------------------------------ #
     #  左夹爪                                                              #
@@ -276,36 +284,57 @@ class InferenceMixin:
             print(f"[tuning] save failed: {e}")
 
     # ------------------------------------------------------------------ #
-    #  子步监视：实时左臂 7 关节 + 待释放子步滚动表                          #
+    #  子步监视：实时双臂 14 关节 + 待释放子步滚动表（左/右两张表）           #
     # ------------------------------------------------------------------ #
-    def _update_substep_monitor(self):
-        """Refresh the live joints readout + the rolling next-10 staged-substep table (each cell
-        shows the joint value and its delta vs the previous row / the live pose). Reschedules
-        itself ~5 Hz; the staged buffer draining in real time produces the rolling effect."""
-        try:
-            # --- live actual left-arm joints + gripper -> the pinned top "实时" row, which also
-            #     serves as the delta reference for substep #0 ---
-            try:
-                actual = list(self.left_arm_joint_values)
-            except Exception:
-                actual = None
-            try:
-                live_grip = float(self.robot.gripper_states()[0][0])  # left gripper {0,1}
-            except Exception:
-                live_grip = None
-            if actual is not None and len(actual) >= 7:
-                vals = [f"{actual[k]:+.3f}" for k in range(7)]
-                grip_txt = _grip_label(live_grip) if live_grip is not None else "—"
-                self._monitor_tree.item("live", values=("实时", *vals, grip_txt))
-                prev = np.asarray(actual[:7], dtype=np.float64)
+    def _update_one_arm_monitor(self, tree, sl, live14, live_grips, arm, subs):
+        """Fill ONE arm's 7-joint substep table. sl = slice(0,7) left / slice(7,14) right; arm =
+        0/1 selects that side's gripper. Both tables are driven by the SAME 14-joint subs, sliced
+        per arm, so left and right stay row-aligned (same master-id substep on each side)."""
+        # live row = that arm's 7 measured joints + its gripper; also the delta ref for substep #0.
+        if live14 is not None and len(live14) >= 14:
+            a7 = np.asarray(live14, dtype=np.float64)[sl]
+            vals = [f"{a7[k]:+.3f}" for k in range(7)]
+            gtxt = _grip_label(live_grips[arm]) if live_grips is not None else "—"
+            tree.item("live", values=("实时", *vals, gtxt))
+            prev = a7
+        else:
+            tree.item("live", values=("实时", *["—"] * 8))
+            prev = None
+        for i in range(self._monitor_rows):
+            iid = f"subrow{i}"
+            if i < len(subs):
+                q, grip = subs[i]
+                q = np.asarray(q, dtype=np.float64)[sl]          # this arm's 7 joints of the 14-vec
+                if prev is not None:
+                    d = q - prev
+                    vals = [f"{q[k]:+.3f} Δ{d[k]:+.3f}" for k in range(7)]
+                else:
+                    vals = [f"{q[k]:+.3f}" for k in range(7)]
+                g = grip[arm] if isinstance(grip, (list, tuple, np.ndarray)) else grip
+                gtxt = _grip_label(g) if g is not None else "—"
+                tree.item(iid, values=(i, *vals, gtxt))
+                prev = q
             else:
-                self._monitor_tree.item("live", values=("实时", *["—"] * 8))
-                prev = None
+                tree.item(iid, values=(i, *[""] * 8))
 
-            # --- upcoming robot commands, with per-joint delta vs the previous row ---
+    def _update_substep_monitor(self):
+        """Refresh the live joints readout + the rolling next-10 staged-substep tables for BOTH arms
+        (each cell shows the joint value and its delta vs the previous row / the live pose).
+        Reschedules itself ~5 Hz; the staged buffer draining in real time produces the rolling effect."""
+        try:
+            # --- live actual BOTH-arm joints + both grippers -> the pinned top "实时" rows ---
+            try:
+                live14 = list(self.both_arm_joint_values)
+            except Exception:
+                live14 = None
+            try:
+                live_grips = list(self.robot.gripper_states()[0][:2])  # [left, right] {0,1}
+            except Exception:
+                live_grips = None
+            # --- upcoming robot commands (14-joint substeps), shared by both arm tables ---
             # Manual path stages into _staged_release (shown pre-release); the AUTO path appends
             # straight onto _robot_q and never stages, so fall back to robot_q_preview when nothing
-            # is staged. Either way these are absolute q7 targets, so the same delta logic applies.
+            # is staged. Either way these are absolute (q14, [gl,gr]) targets; each table slices its side.
             try:
                 subs = self.env.staged_preview(self._monitor_rows)
                 source = "待释放（手动验证）"
@@ -316,21 +345,8 @@ class InferenceMixin:
                 subs = []
                 source = "—"
             self._monitor_src_var.set(f"队列来源：{source}")
-            for i in range(self._monitor_rows):
-                iid = f"subrow{i}"
-                if i < len(subs):
-                    q, grip = subs[i]
-                    q = np.asarray(q, dtype=np.float64)
-                    if prev is not None and len(prev) >= 7:
-                        d = q - prev
-                        vals = [f"{q[k]:+.3f} Δ{d[k]:+.3f}" for k in range(7)]
-                    else:
-                        vals = [f"{q[k]:+.3f}" for k in range(7)]
-                    grip_txt = _grip_label(grip) if grip is not None else "—"
-                    self._monitor_tree.item(iid, values=(i, *vals, grip_txt))
-                    prev = q
-                else:
-                    self._monitor_tree.item(iid, values=(i, *[""] * 8))
+            self._update_one_arm_monitor(self._monitor_tree_l, slice(0, 7), live14, live_grips, 0, subs)
+            self._update_one_arm_monitor(self._monitor_tree_r, slice(7, 14), live14, live_grips, 1, subs)
         except tk.TclError:
             self._monitor_after_id = None       # widget destroyed (window closed) -> stop
             return
@@ -530,45 +546,51 @@ class InferenceMixin:
         self._apply_exec_knobs(announce=False)
         self._refresh_tuning_state()             # set initial enabled/disabled + hint
 
-        # ===== 子步监视：实时左臂 7 关节 + 待释放子步滚动表（含每关节增量） =====
-        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（左臂 7 关节 · rad）  ")
+        # ===== 子步监视：实时双臂 14 关节 + 待释放子步滚动表（左/右各一张，含每关节增量） =====
+        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（双臂 14 关节 · rad）  ")
         sec_monitor.pack(fill=tk.X, padx=10, pady=6)
 
-        # 实时关节作为表内置顶高亮行（#＝实时），其下为接下来要下发到真机的子步；统一在同一组
-        # J1~J7 列里读，便于把“当前位姿 → 接下来要执行的子步”连起来看。括号内 Δ＝相对上一行增量。
+        # 实时关节作为表内置顶高亮行（#＝实时），其下为接下来要下发到真机的子步；左右两张表按同一
+        # 子步行号（master id）对齐，便于把“当前位姿 → 接下来要执行的子步”双臂一起看。Δ＝相对上一行增量。
         # 子步来源：手动验证时取待释放缓冲（_staged_release）；自动运行/已释放时取真机队列
-        # （_robot_q，即 append_actions 直接喂入的实时指令）。
+        # （_robot_q，即 append_actions 直接喂入的实时指令）。左右两表共用同一 subs，各取自己 7 关节。
         cap_row = ttk.Frame(sec_monitor)
         cap_row.pack(fill=tk.X, padx=8, pady=(6, 4))
         ttk.Label(cap_row,
-                  text="置顶行＝实时关节；其下 #0 = 下一个下发的子步，Δ＝相对上一行增量",
+                  text="置顶行＝实时关节；其下 #0 = 下一个下发的子步，Δ＝相对上一行增量（左右两表同步）",
                   style="Subtitle.TLabel", anchor=tk.W).pack(side=tk.LEFT)
         self._monitor_src_var = tk.StringVar(value="队列来源：—")
         ttk.Label(cap_row, textvariable=self._monitor_src_var,
                   style="Value.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
 
-        cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "grip")
-        tree = ttk.Treeview(sec_monitor, columns=cols, show="headings",
-                            height=11, style="Monitor.Treeview")
-        tree.heading("idx", text="#")
-        tree.column("idx", width=44, anchor="center", stretch=False)
-        for k, c in enumerate(cols[1:8], start=1):
-            tree.heading(c, text=f"J{k}")
-            tree.column(c, width=96, minwidth=72, anchor="center", stretch=True)
-        tree.heading("grip", text="夹爪")
-        tree.column("grip", width=62, anchor="center", stretch=False)
-        # 行样式：置顶实时行高亮；子步行斑马纹交替，便于逐行对照。
-        tree.tag_configure("live", background="#e3f2fd", foreground="#0d47a1",
-                           font=("Consolas", 9, "bold"))
-        tree.tag_configure("odd", background="#ffffff")
-        tree.tag_configure("even", background="#f3f5f9")
-        tree.pack(fill=tk.X, padx=8, pady=(0, 8))
-        self._monitor_tree = tree
         self._monitor_rows = 10
-        tree.insert("", "end", iid="live", tags=("live",), values=("实时", *["—"] * 8))
-        for i in range(self._monitor_rows):
-            tree.insert("", "end", iid=f"subrow{i}",
-                        tags=("even" if i % 2 else "odd",), values=(i, *[""] * 8))
+
+        def _build_arm_table(arm_label):
+            """Build one arm's 7-joint substep Treeview (live row + _monitor_rows substep rows)."""
+            grp = ttk.LabelFrame(sec_monitor, text=f"  {arm_label}  ")
+            grp.pack(fill=tk.X, padx=8, pady=(2, 6))
+            cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "grip")
+            t = ttk.Treeview(grp, columns=cols, show="headings", height=11, style="Monitor.Treeview")
+            t.heading("idx", text="#")
+            t.column("idx", width=44, anchor="center", stretch=False)
+            for k, c in enumerate(cols[1:8], start=1):
+                t.heading(c, text=f"J{k}")
+                t.column(c, width=96, minwidth=72, anchor="center", stretch=True)
+            t.heading("grip", text="夹爪")
+            t.column("grip", width=62, anchor="center", stretch=False)
+            t.tag_configure("live", background="#e3f2fd", foreground="#0d47a1",
+                            font=("Consolas", 9, "bold"))
+            t.tag_configure("odd", background="#ffffff")
+            t.tag_configure("even", background="#f3f5f9")
+            t.pack(fill=tk.X, padx=6, pady=(0, 6))
+            t.insert("", "end", iid="live", tags=("live",), values=("实时", *["—"] * 8))
+            for i in range(self._monitor_rows):
+                t.insert("", "end", iid=f"subrow{i}",
+                         tags=("even" if i % 2 else "odd",), values=(i, *[""] * 8))
+            return t
+
+        self._monitor_tree_l = _build_arm_table("左臂 (L)")
+        self._monitor_tree_r = _build_arm_table("右臂 (R)")
 
         # Start the periodic refresh (idempotent — only schedules once).
         if getattr(self, "_monitor_after_id", None) is None:

@@ -4,11 +4,11 @@ diffusion_policy/config/task/dual_arm_ee_image.yaml.
 
 Dual arm (left + right).
 
-Output Zarr schema (H x W = 180 x 240, matching task/dual_arm_ee_image.yaml's
-image_shape [C, H, W] = [3, 180, 240]):
-  data/agentview_image            (N, 180, 240, 3)  uint8  — head camera (RGB)
-  data/robotl_eye_in_hand_image   (N, 180, 240, 3)  uint8  — hand_left camera (RGB)
-  data/robotr_eye_in_hand_image   (N, 180, 240, 3)  uint8  — hand_right camera (RGB)
+Output Zarr schema (16:9, H x W = 144 x 256, matching task/dual_arm_ee_image.yaml's
+image_shape [C, H, W] = [3, 144, 256]):
+  data/agentview_image            (N, 144, 256, 3)  uint8  — head camera (RGB, top-cropped to 16:9)
+  data/robotl_eye_in_hand_image   (N, 144, 256, 3)  uint8  — hand_left camera (RGB)
+  data/robotr_eye_in_hand_image   (N, 144, 256, 3)  uint8  — hand_right camera (RGB)
   data/robotl_eef_pos             (N, 9)          float32  — left  EE [pos(3) + rot6d(6)] (raw)
   data/robotr_eef_pos             (N, 9)          float32  — right EE [pos(3) + rot6d(6)] (raw)
   data/robot0_grip                (N, 2)          float32  — [left, right] gripper (0=open 1=closed)
@@ -89,15 +89,18 @@ def arm_action(pos: np.ndarray, quat: np.ndarray, grip: np.ndarray,
 
 # ─── Video loading ────────────────────────────────────────────────────────────
 
-# The head camera is recorded at its native 1280x800 (16:10); the hand cameras at 320x240
-# (4:3 == the target aspect). The crop+resize itself is build_data.preprocess_frame — THE shared
-# transform used at inference too — so training and deployment pixels match (up to mp4-vs-JPEG).
+# The head camera is recorded at its native 1280x800 (16:10); the hand cameras at 848x480
+# (16:9). The target is 16:9 (IMG_W x IMG_H = 256 x 144). The crop+resize itself is
+# build_data.preprocess_frame — THE shared transform used at inference too — so training and
+# deployment pixels match (up to mp4-vs-JPEG). The head is too tall for 16:9, so it is cropped
+# from the TOP only (keep="bottom"), preserving the workspace at the bottom; the hand cams are
+# already ~16:9 and get the default centered few-row crop.
 
-def read_video(path: pathlib.Path, center_crop: bool = False) -> np.ndarray:
+def read_video(path: pathlib.Path, keep: str = "center") -> np.ndarray:
     """Returns (N, IMG_H, IMG_W, 3) uint8 RGB, or empty array if file missing.
 
-    center_crop=True center-crops each frame to the target aspect before downsizing (used for the
-    head camera, whose native aspect != target). All pixel work is the shared preprocess_frame."""
+    `keep` is the vertical crop anchor passed to the shared preprocess_frame (see build_data):
+    "bottom" for the head (drop rows from the TOP), "center" for the already-16:9 wrist cams."""
     if not path.exists():
         return np.empty((0, IMG_H, IMG_W, 3), dtype=np.uint8)
     cap    = cv2.VideoCapture(str(path))
@@ -107,7 +110,7 @@ def read_video(path: pathlib.Path, center_crop: bool = False) -> np.ndarray:
         if not ok:
             break
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(preprocess_frame(rgb, center_crop).astype(np.uint8))
+        frames.append(preprocess_frame(rgb, keep).astype(np.uint8))
     cap.release()
     return np.stack(frames) if frames else np.empty((0, IMG_H, IMG_W, 3), dtype=np.uint8)
 
@@ -175,9 +178,9 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
         n      = len(states['timestamps'])
 
         # ── Images ──────────────────────────────────────────────────────────
-        # head: native 16:10 -> centre-crop to 4:3 then downsize (see read_video).
-        # hand_*: already 4:3, so the resize keeps aspect.
-        head_frames  = read_video(ep / 'cameras' / 'head.mp4', center_crop=True)
+        # head: native 16:10 -> crop the TOP to 16:9 (keep the bottom) then downsize (see read_video).
+        # hand_*: already ~16:9, so the centered crop is a few rows and the resize keeps aspect.
+        head_frames  = read_video(ep / 'cameras' / 'head.mp4', keep="bottom")
         handl_frames = read_video(ep / 'cameras' / 'hand_left.mp4')
         handr_frames = read_video(ep / 'cameras' / 'hand_right.mp4')
 
