@@ -400,10 +400,20 @@ class SimEnv:
                 if not learn:
                     per_sub = float(np.max(np.abs(np.diff(np.vstack([P[k - 1][None], subs]), axis=0))))
                     if per_sub > max_joint_step + 1e-9:
-                        return [], False, (
-                            f"action {k}: joint-velocity cap exceeded "
-                            f"({np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > "
-                            f"{np.degrees(max_joint_step * CONTROL_HZ):.0f} deg/s)")
+                        # RAMP instead of REJECT: a large row (big IK step / redundancy branch switch /
+                        # fast policy row) is executed SLOWER, not dropped — re-expand this segment with
+                        # enough substeps that the per-substep joint delta respects the velocity cap.
+                        # The extra substeps are STILL self-collision-checked in the loop below, so the
+                        # ramp is validated, not blind. (NOTE: this makes the row emit more than K
+                        # substeps; the auto master-id tagging in append_actions assumes a fixed K, so
+                        # for streaming AUTO a heavily-ramped row can nudge id alignment — the manual /
+                        # single-step path has no ids and is unaffected. The dispatch guard in
+                        # run_trajectory_control is the final velocity floor regardless.)
+                        factor = int(np.ceil(per_sub / max_joint_step))
+                        subs = self._catmull_rom_segment(before, P[k - 1], P[k], after, K * factor)
+                        print(f"[SimEnv] action {k}: {np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > cap "
+                              f"{np.degrees(max_joint_step * CONTROL_HZ):.0f} -> ramped to {K * factor} "
+                              f"substeps ({factor}x), collision-checked")
             for sub in subs:                             # sub is a 14-vec [left7, right7]
                 if fast:
                     # Collision-only fast path: KINEMATIC TELEPORT, no physics settle. The preview is

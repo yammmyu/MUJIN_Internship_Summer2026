@@ -245,6 +245,10 @@ class HumanoidEnv:
         # DUAL IK warm-start seed (14,) [left7, right7], used by the validate/append/release path.
         # Re-anchored to the live robot on each idle validate (_resync) / auto ingest.
         self._last_q14 = np.concatenate([self._last_q, self.solver_r.m.clip(np.zeros(7))])
+        # Last 14-joint config actually COMMANDED to the robot (dispatch-time C5 velocity guard in
+        # run_trajectory_control). None until the first command / after an E-stop; re-seeded from the
+        # live pose so the guard bounds the very first waypoint too.
+        self._last_cmd_q14 = None
         self._quat_prev = None                       # previous target quat for SLERP smoothing (H3)
         # Release pipeline state (guarded by self._lock):
         self._last_sim_traj = []                     # [(q7_achieved, grip)] last validated traj
@@ -1011,11 +1015,16 @@ class HumanoidEnv:
                 self._staged_release.extendleft(reversed(subs))
             return 0
         with self._lock:
-            if self._robot_q:                            # already streaming -> append, continuous
-                full = list(subs)
-            else:                                        # idle -> C5 ramp from the measured pose
-                ramp = self._ramp(arm14, subs[0][0], self.ramp_joint_step, subs[0][1])
-                full = ramp + list(subs)[1:]             # ramp's last point IS subs[0]
+            # Bridge from the queue TAIL when already streaming, else from the live measured pose.
+            # ALWAYS ramp anchor -> subs[0] then subdivide the whole thing, so every gap — including
+            # the queue seam — is <= MAX_JOINT_STEP. Previously the streaming branch appended subs
+            # directly, leaving the tail->subs[0] seam unbounded (a large IK jump there could leak an
+            # over-cap substep). The dispatch guard also catches this, but bounding it here keeps the
+            # queue itself clean.
+            anchor = (np.asarray(self._robot_q[-1][0], dtype=np.float64)
+                      if self._robot_q else arm14)
+            ramp = self._ramp(anchor, subs[0][0], self.ramp_joint_step, subs[0][1])
+            full = ramp + list(subs)[1:]                 # ramp's last point IS subs[0]
             self._robot_q.extend(self._subdivide_points(full))
             staged_substep_remaining = len(self._staged_release)
         print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_substep_remaining} substep(s) still staged).")
@@ -1193,6 +1202,7 @@ class HumanoidEnv:
         """Clear the latched E-stop (operator confirms the arm is safe). Release stays refused
         until a fresh 执行→释放 (the previous trajectory was consumed)."""
         self._estop.clear()
+        self._last_cmd_q14 = None       # arm may have moved while latched -> re-seed guard from live
         print("[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).")
 
     @property
@@ -1446,38 +1456,57 @@ class HumanoidEnv:
             robot_states["head"] = list(self.robot.head_joint_states()[0])
         except Exception:
             pass
+        # Seed the dispatch guard from the live pose on the first command so even the very first
+        # waypoint is velocity-bounded from where the arm actually is.
+        if self._last_cmd_q14 is None and not ignore_estop:
+            live = self._read_arm14()
+            if live is not None:
+                self._last_cmd_q14 = np.asarray(live, dtype=np.float64).copy()
+
         # Stream the batch ONE waypoint at a time (not one big trajectory). The SDK has no
         # trajectory abort, so this is what makes an E-stop effective: latched mid-batch, we simply
         # stop sending the next waypoint and the arm halts within ~STEP_TIME at the last point.
-        # Each point is its own single-waypoint ABS_JOINT trajectory (8.2.4 schema, LEFT arm only ->
-        # right arm never moves) with reference_time = STEP_TIME; we pace on self._stop_event so a
-        # shutdown breaks promptly too.
+        # Each waypoint is its own single-waypoint ABS_JOINT trajectory (8.2.4 schema) driving BOTH
+        # arms; reference_time = STEP_TIME; we pace on self._stop_event so a shutdown breaks promptly.
         for item in points:
             q14, grip = item[0], item[1]                 # tolerate (q14, grip) or (q14, grip, row_id)
-            # Stop streaming a RELEASE batch the instant an E-stop latches (or on shutdown). The
-            # E-stop HOLD itself passes ignore_estop=True so it can re-assert the pose while latched.
             if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
                 return True                                  # halt: send no further waypoints
-            infer_timestamp = int(time.time() * 1e9)
             q14 = np.clip(np.asarray(q14, dtype=np.float64),
                           self._jlower14, self._jupper14)    # 14-joint limit clamp (no IK solver needed)
-            # ONE waypoint driving BOTH arms via the 'left_arm' and 'right_arm' GROUP_IDS (8.2.1),
-            # and (optionally) both grippers via move_gripper. Both arms are addressed every tick, so
-            # the dual-arm policy drives them in lockstep; grip=None (E-stop hold) leaves grippers alone.
-            robot_action = [{"left_arm":  {"action_data": q14[:7].tolist(),  "control_type": "ABS_JOINT"},
-                             "right_arm": {"action_data": q14[7:].tolist(),  "control_type": "ABS_JOINT"}}]
-            if grip is not None:                         # None -> leave grippers alone (E-stop hold)
-                # grip = [gl, gr], already binary {0,1} normalized at inference -> open/close commands.
+            # C5 DISPATCH GUARD (defense-in-depth, BOTH arms): never send a waypoint more than
+            # MAX_JOINT_STEP from the last commanded config. If the target jumps further — a large IK
+            # step, a queue seam, a redundancy branch switch, a jumpy policy row — RAMP it: subdivide
+            # into ceil(|Δq|/cap) linear waypoints and stream each, paced. This makes an over-cap joint
+            # velocity physically impossible regardless of what produced `points`. Upstream ramps keep
+            # this a no-op in the common case; when it fires it means an upstream gap leaked through.
+            prev = self._last_cmd_q14
+            if prev is not None and not ignore_estop and MAX_JOINT_STEP > 0:
+                span = float(np.max(np.abs(q14 - prev)))
+                nseg = max(1, int(np.ceil(span / MAX_JOINT_STEP)))
+                if nseg > 1:
+                    print(f"[HumanoidEnv] dispatch-ramp: |Δq|={span:.3f} rad exceeds cap "
+                          f"{MAX_JOINT_STEP:.3f} -> streaming {nseg} bounded substeps")
+                waypoints = [prev + (q14 - prev) * (i / nseg) for i in range(1, nseg + 1)]
+            else:
+                waypoints = [q14]
+            # Grippers (binary) accompany the motion; send once for the whole (possibly ramped) step.
+            if grip is not None:
                 gl, gr = grip
                 self.robot.move_gripper([1 if gl >= 0.5 else 0, 1 if gr >= 0.5 else 0])
-            try:
-                self.robot_controller.trajectory_tracking_control(
-                    infer_timestamp, robot_states, robot_action, "base_link", STEP_TIME
-                    )
-            except Exception as e:
-                print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
-                return False
-            self._stop_event.wait(STEP_TIME)                 # pace; interruptible by stop_event
+            for wp in waypoints:
+                if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
+                    return True
+                robot_action = [{"left_arm":  {"action_data": wp[:7].tolist(),  "control_type": "ABS_JOINT"},
+                                 "right_arm": {"action_data": wp[7:].tolist(),  "control_type": "ABS_JOINT"}}]
+                try:
+                    self.robot_controller.trajectory_tracking_control(
+                        int(time.time() * 1e9), robot_states, robot_action, "base_link", STEP_TIME)
+                except Exception as e:
+                    print(f"[HumanoidEnv] trajectory_tracking_control failed: {e}")
+                    return False
+                self._last_cmd_q14 = wp                       # advance the guard's reference
+                self._stop_event.wait(STEP_TIME)             # pace; interruptible by stop_event
         return True
 
     @staticmethod
