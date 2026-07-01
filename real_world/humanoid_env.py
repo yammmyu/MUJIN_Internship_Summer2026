@@ -230,6 +230,11 @@ class HumanoidEnv:
         # RIGHT-arm IK solver (dual-arm execution): its own URDF joints + FK calibration
         # (fk_calibration_right.json). Both arms are solved per row and streamed in lockstep.
         self.solver_r = build_solver(side="right")
+        # Nominal per-arm joint posture (median of the training recordings), used as a FALLBACK IK
+        # warm-start when the live/chained seed resolves to a contorted or unreachable config — this
+        # is what stops a PARKED arm (esp. the right, never moved in the old pipeline) from picking a
+        # twisted redundancy branch far from the training distribution. Same rule for both arms.
+        self._nominal_q14 = self._load_nominal_config()
         # Left-arm joint limits (rad), captured once so the execution path can clamp commands
         # without reaching into the IK solver (it only needs the bounds, not the solver).
         self._jlower = np.asarray(self.solver.m.lower, dtype=np.float64).copy()
@@ -749,6 +754,47 @@ class HumanoidEnv:
         with self._lock:
             return not self._action_queue
 
+    @staticmethod
+    def _load_nominal_config():
+        """Nominal per-arm training posture (real_world/nominal_arm_config.json) as a 14-vec
+        [left7, right7] — the IK FALLBACK seed. Zeros if the file is absent (fallback disabled-ish)."""
+        path = pathlib.Path(__file__).parent / "nominal_arm_config.json"
+        try:
+            d = json.loads(path.read_text())
+            return np.asarray(list(d["left"]) + list(d["right"]), dtype=np.float64)
+        except Exception as e:
+            print(f"[HumanoidEnv] nominal_arm_config.json unavailable ({e}); IK fallback seed = zeros.")
+            return np.zeros(14, dtype=np.float64)
+
+    @staticmethod
+    def _limit_pinned(solver, q, margin=0.10):
+        """True if any joint of q sits within `margin` rad of its limit — the signature of a
+        CONTORTED IK solution (the redundant DOF shoved into a limit to reach the target)."""
+        lo = np.asarray(solver.m.lower, dtype=np.float64)
+        hi = np.asarray(solver.m.upper, dtype=np.float64)
+        q = np.asarray(q, dtype=np.float64)
+        return float(np.min(np.minimum(q - lo, hi - q))) < margin
+
+    def _ik_robust(self, solver, pos, quat, seed, nominal):
+        """Solve IK from the live/chained `seed`; if that lands UNREACHABLE or LIMIT-PINNED
+        (contorted), retry from `nominal` (the training posture) and prefer a clean solve. Returns
+        (q7, reachable). Same rule for both arms: a warm seed keeps its natural branch (no retry, no
+        regression); a parked / out-of-distribution seed escapes contortion. This is what makes the
+        robot's PARKED right arm resolve to a sane pose instead of 'going crazy' — the sim eval never
+        saw it because it seeds from the recorded (warm) joints."""
+        q1 = solver.solve(IKQuery(target_pos=pos, target_quat=quat, current_joints=seed))
+        if solver.last_reachable and not self._limit_pinned(solver, q1):
+            return np.asarray(q1, dtype=np.float64), True          # live seed is clean -> keep it
+        r1 = solver.last_reachable
+        q2 = solver.solve(IKQuery(target_pos=pos, target_quat=quat, current_joints=nominal))
+        if solver.last_reachable and not self._limit_pinned(solver, q2):
+            return np.asarray(q2, dtype=np.float64), True          # nominal fallback is clean
+        if solver.last_reachable:                                  # neither clean; prefer reachable
+            return np.asarray(q2, dtype=np.float64), True
+        if r1:
+            return np.asarray(q1, dtype=np.float64), True
+        return np.asarray(q2, dtype=np.float64), False             # genuinely unreachable
+
     def _solve_chunk_ik(self, action_chunk, seed_q, skip_unreachable=False):
         """Solve IK for an ENTIRE chunk up front, OUTSIDE the sim validation job: workspace
         check (H4) + orientation smoothing (H3) + our IK, chaining each row's warm-start from
@@ -772,19 +818,20 @@ class HumanoidEnv:
                 return [], False, f"action {k}: target EE pos outside workspace envelope"
             qprevL = _smooth_quat_step(qprevL, Lquat, QUAT_ALPHA)                 # H3 (per arm)
             qprevR = _smooth_quat_step(qprevR, Rquat, QUAT_ALPHA)
-            qL = self.solver.solve(IKQuery(target_pos=Lpos, target_quat=qprevL, current_joints=seedL))
-            if not self.solver.last_reachable:
+            # live/chained seed first, nominal-training-posture fallback on a contorted/unreachable
+            # solve (per arm) — keeps a warm arm's natural branch, un-contorts a parked one.
+            qL, okL = self._ik_robust(self.solver, Lpos, qprevL, seedL, self._nominal_q14[:7])
+            if not okL:
                 if skip_unreachable:
                     continue
                 return [], False, (f"action {k}: LEFT IK unreachable "
                                    f"(pos err {self.solver.last_pos_err*1000:.0f} mm)")
-            qR = self.solver_r.solve(IKQuery(target_pos=Rpos, target_quat=qprevR, current_joints=seedR))
-            if not self.solver_r.last_reachable:
+            qR, okR = self._ik_robust(self.solver_r, Rpos, qprevR, seedR, self._nominal_q14[7:])
+            if not okR:
                 if skip_unreachable:
                     continue
                 return [], False, (f"action {k}: RIGHT IK unreachable "
                                    f"(pos err {self.solver_r.last_pos_err*1000:.0f} mm)")
-            qL = np.asarray(qL, dtype=np.float64); qR = np.asarray(qR, dtype=np.float64)
             configs.append((np.concatenate([qL, qR]), [Lgrip, Rgrip]))
             seedL, seedR = qL, qR
         return configs, True, None
