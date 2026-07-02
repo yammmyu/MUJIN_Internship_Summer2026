@@ -33,9 +33,12 @@ import numpy as np
 import pinocchio as pin
 
 # Default robot model (the URDF the SDK ships; FK calibrated against firmware offline).
+# Vendored under real_world/assets/ so IK is self-contained and works from a fresh clone —
+# the URDF uses package://meshes/ refs and ships its own meshes/ alongside (sim_backend's
+# patched_urdf strips package:// and loads them relative to this file's dir).
 DEFAULT_URDF = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "G1_SDK_ENV", "a2d_sdk", "A2D_Omnipicker", "A2D.urdf",
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets", "A2D_Omnipicker", "A2D.urdf",
 )
 DEFAULT_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fk_calibration.json")
 # Right-arm FK calibration (mirror of the left, produced by scripts/fk_consistency_check.py --side
