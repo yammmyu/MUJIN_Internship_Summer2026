@@ -1,9 +1,0 @@
-Log file created at: 2026/04/14 13:31:52
-Running on machine: amit-MS-7E13
-Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
-I0414 13:31:52.084416 158841 dylog_impl.cpp:607] [DYLOG] set dylog default level from env = FATAL
-W0414 13:31:52.084440 158841 dylog_impl.cpp:617] [DYLOG] can't find available soc record file with path : /proc/device-tree/model, use s1
-I0414 13:31:52.084443 158841 dylog_impl.cpp:626] [DYLOG] soc num : s1
-I0414 13:31:52.084450 158841 dylog_impl.cpp:631] [DYLOG] can't read scene_mode, use sud
-W0414 13:31:52.084462 158841 dylog_impl.cpp:693] [DYLOG] can't find available json config file with path : /home/agi/app/conf/scene_server/dylog_sud_default.json, use default.
-I0414 13:31:52.084517 158841 dylog_impl.cpp:251] [DYLOG] register dsd_name : dylog/python3.10/cosine_internal

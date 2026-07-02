@@ -1,9 +1,31 @@
+# --- Python ---
 *__pycache__
-*.idea
+__pycache__/
 *.pyc
+*.idea
+.venv/
+venv/
+
+# --- OS / archive cruft ---
+.DS_Store
+__MACOSX/
+*.zip
+
+# --- Logs & runtime scratch ---
 log
+*.log
+*.log.INFO*
+live_joints.jsonl
+
+# --- Editor / backup files ---
+*.bak
+*.orig
+
+# --- Data & recordings (large, not versioned) ---
 *.zarr
+*.npz
 recordings/
 recordings_left/
-*.zip
-*.npz
+
+# --- Legacy SDK snapshot (kept on disk, not tracked) ---
+G1_SDK_ENV/

@@ -83,7 +83,7 @@ def main():
         import threading
         import rclpy
         from a2d_sdk.robot import Slam
-        from control_wheel_example import WheelController
+        from examples.control_wheel_example import WheelController
         slam = Slam()                      # noqa: F841
         rclpy.init(args=None)
         wc = WheelController()

@@ -23,8 +23,8 @@ import argparse
 import rclpy
 
 from a2d_sdk.robot import RobotDds as Robot, RobotController, Slam
-from control_wheel_example import WheelController
-from robot_info_server import create_robot_info_http_server, RobotInfo
+from examples.control_wheel_example import WheelController
+from servers.robot_info_server import create_robot_info_http_server, RobotInfo
 
 from gui import StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataCollectionMixin
 from pico_vr.pico_vr_server.server import DummyServer
