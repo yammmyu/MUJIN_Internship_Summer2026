@@ -18,7 +18,7 @@ Self-contained: targets are the FK of a small joint sweep near a safe seed for E
 are reachable and self-consistent without needing a recording.
 
 Run standalone:
-    .venv/bin/python scripts/test_safety_invariants.py
+    .venv/bin/python tests/test_safety_invariants.py
 It also runs automatically as a launch pre-flight in robot_control_gui.py; a failure blocks
 the GUI from starting. Set HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (logs a loud warning).
 """

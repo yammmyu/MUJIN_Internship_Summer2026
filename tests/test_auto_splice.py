@@ -11,7 +11,7 @@ temporal ensemble. Runs fully offline with the same fakes as test_safety_invaria
                              non-overlapping rows pass through (identity); gripper re-binarised.
 
 Run:
-    .venv/bin/python scripts/test_auto_splice.py
+    .venv/bin/python tests/test_auto_splice.py
 """
 import os
 import sys

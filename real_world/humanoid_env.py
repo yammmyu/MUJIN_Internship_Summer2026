@@ -301,6 +301,8 @@ class HumanoidEnv:
         self._cams = {}                                        # name -> CosineCamera([name]) (live subscription)
         self._frames = {}                                      # name -> rolling [prev, cur]
         self._intrinsics = {}                                  # name -> intrinsics dict (lazy)
+        self._unknown_cam_warned = set()                       # bad camera names already warned (once each)
+        self._log_ts = {}                                      # key -> last monotonic print time (throttling)
         # Dual-arm EE-pose obs (policy input), rolling [row_{t-1}, row_t], each row 9-dim
         # [pos(3) + rot6d(6)] in the training robot*_eef_pos layout. Built in _collect_loop:
         # left from calibrated FK on the live joints, right from the firmware status frame.
@@ -355,26 +357,31 @@ class HumanoidEnv:
                 and self._last_two_robotr_eef is not None
 
     # ===================== consumer-facing camera switch =====================
+    def _throttled(self, key, interval=1.0):
+        """True at most once per `interval` seconds for `key` (rate-limits hot-loop prints)."""
+        now = time.monotonic()
+        if now - self._log_ts.get(key, 0.0) >= interval:
+            self._log_ts[key] = now
+            return True
+        return False
+
     def request(self, name):
         """Mark a camera as wanted this cycle and switch it ON.
 
         Idempotent and cheap — consumers call this every loop tick to keep a
         camera alive. Names outside the SDK's constructed set are ignored.
+        Logs ONLY on the OFF->ON transition (this is a per-tick hot path).
         """
-        print(f"processing request for camera {name}")
-
         if name not in self.cameras:
-            print(f"[HumanoidEnv] camera name not recognized: {name}")
+            if name not in self._unknown_cam_warned:     # warn once per bad name, never per tick
+                self._unknown_cam_warned.add(name)
+                print(f"[HumanoidEnv] camera name not recognized: {name}")
             return
         with self._lock:
             self._last_requested[name] = time.monotonic()
-            if name not in self._active:        # log only on the OFF->ON transition
-                print(f"[HumanoidEnv] activated camera: {name}")
+            if name not in self._active:                 # OFF->ON transition only
                 self._active.add(name)
-            else:
-                print(f"[HumanoidEnv] camera: {name} is already active")
-                # Inline read (we already hold self._lock; active_cameras() re-locks -> deadlock).
-                print(f"current active cameras: {sorted(self._cams.keys())}")
+                print(f"[HumanoidEnv] camera ON: {name} -> {sorted(self._active)}")
 
 
     def get_frame(self, name):
@@ -721,10 +728,13 @@ class HumanoidEnv:
         with self._lock:
             if (self._last_two_robotl_eef is None or self._last_two_robotr_eef is None
                     or self._last_two_grip is None):
-                print("[HumanoidEnv] Waiting for EE / gripper states")
+                if self._throttled("warmup_ee", 2.0):
+                    print("[HumanoidEnv] warming up: waiting for EE / gripper states…")
                 return None
             if any(self._frames.get(n) is None for n in INFERENCE_CAMERAS):
-                print("[HumanoidEnv] Wait for Camera")
+                if self._throttled("warmup_cam", 2.0):
+                    missing = [n for n in INFERENCE_CAMERAS if self._frames.get(n) is None]
+                    print(f"[HumanoidEnv] warming up: waiting for cameras {missing}…")
                 return None
             age = (time.monotonic() - self._fresh_mono) if self._fresh_mono else float('inf')
             stale = age > STALE_TIMEOUT or self._firmware_has_error
@@ -1133,8 +1143,9 @@ class HumanoidEnv:
             self._robot_q.extend(ramp + kept[1:])          # ramp ends AT kept[0]
             qlen = len(self._robot_q)
             self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
-        print(f"[HumanoidEnv] auto-ramp: obs_row={obs_step_id}, now={cur}, "
-              f"kept={len(kept)}/{len(tagged)} (+{len(ramp)} ramp) -> queue {qlen}")
+        if self._throttled("auto_ramp", 1.0):
+            print(f"[HumanoidEnv] auto-ramp: obs_row={obs_step_id}, now={cur}, "
+                  f"kept={len(kept)}/{len(tagged)} (+{len(ramp)} ramp) -> queue {qlen}")
         return True, ""
     
     def append_actions(self, action_chunk, obs_step_id, n_rows=None):
@@ -1217,8 +1228,9 @@ class HumanoidEnv:
             self._queued_through = new[-1][2]
             qlen = len(self._robot_q)
             self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
-        print(f"[HumanoidEnv] append: obs_row={obs_step_id}, clock={cur}, "
-              f"appended ids {new[0][2]}..{new[-1][2]} (+{len(ramp)} ramp) -> queue {qlen}")
+        if len(ramp) > 0 or self._throttled("append", 1.0):     # always show seam ramps; else 1/s
+            print(f"[HumanoidEnv] append: obs_row={obs_step_id}, clock={cur}, "
+                  f"appended ids {new[0][2]}..{new[-1][2]} (+{len(ramp)} ramp) -> queue {qlen}")
         return True, ""
 
     def lock_robot(self):

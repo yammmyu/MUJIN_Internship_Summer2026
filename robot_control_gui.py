@@ -298,15 +298,15 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
 
 
 def _safety_preflight():
-    """Run the safety-invariant suite (scripts/test_safety_invariants.py) before the GUI builds
+    """Run the safety-invariant suite (tests/test_safety_invariants.py) before the GUI builds
     the robot. A failure means a safety regression and BLOCKS launch — the GUI can drive
     hardware, so it must not start on a broken release pipeline. Set
     HUMANOID_SKIP_SAFETY_PREFLIGHT=1 to bypass (logs a loud warning)."""
     if os.environ.get("HUMANOID_SKIP_SAFETY_PREFLIGHT") == "1":
         print("\n*** WARNING: safety pre-flight SKIPPED via HUMANOID_SKIP_SAFETY_PREFLIGHT=1 ***\n")
         return
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-    print("[startup] running safety pre-flight (scripts/test_safety_invariants.py)…")
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+    print("[startup] running safety pre-flight (tests/test_safety_invariants.py)…")
     try:
         from test_safety_invariants import run as run_safety
         run_safety()

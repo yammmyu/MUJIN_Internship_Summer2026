@@ -10,13 +10,18 @@ them to one value PER MASTER ID (the apples-to-apples view) and measures:
     whether they land on chunk-row boundaries (the ramp signature).
 
 Usage:
-    python -m real_world.analyze_smoothness [DIR]      # DIR holds the *.jsonl (default: cwd)
+    python -m scripts.analyze_smoothness [DIR]      # DIR holds the *.jsonl (default: cwd)
 """
 import json
+import os
 import sys
 import pathlib
 
 import numpy as np
+
+# Allow `python scripts/analyze_smoothness.py` (not just `-m scripts.analyze_smoothness`)
+# to resolve `real_world.*` by putting the repo root on the path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _load(path):

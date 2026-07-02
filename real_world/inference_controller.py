@@ -40,6 +40,11 @@ from real_world.build_data import encode_image, build_predict_request
 
 log = logging.getLogger(__name__)
 
+
+def _hms(t):
+    """Wall-clock `t` (time.time()) as HH:MM:SS.mmm for compact per-inference timeline logs."""
+    return time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d}"
+
 # Per-inference JSONL traces (requests/chunks/buffer) are debug aids only and sit on the
 # real-time inference thread, so they are OFF by default and gated behind this flag. The
 # buffer dump in particular re-serialises the whole smoothed run every cycle; enable only
@@ -152,6 +157,7 @@ class InferenceController:
         self.inference_thread = None
         self.is_auto_inference = False
         self._last_inference_obs_ts = 0.0
+        self._infer_count = 0            # total inferences this process (per-inference trace id)
         # Temporal-ensemble state: rolling buffer of recent RAW chunks (ts_obs, action[N,10]).
         # Always averaged from raw — never re-buffer ensembled output, or smoothing compounds.
         self.use_temporal_ensemble = USE_TEMPORAL_ENSEMBLE
@@ -217,6 +223,8 @@ class InferenceController:
         submit=True also hands the predicted chunk to the env's execution queue.
         Returns True if a fresh inference was produced.
         """
+        t_start_wall = time.time()             # inference START (wall clock, for the per-cycle trace)
+        t_start_mono = time.monotonic()
         env = self.humanoid_env
         if env is None:
             log.warning("humanoid_env not accessible")
@@ -255,7 +263,9 @@ class InferenceController:
                                      "robotr_eef_pos": req.get("robotr_eef_pos"),
                                      "robot0_grip": req.get("robot0_grip")})
 
+        t_req = time.monotonic()
         resp = post_predict(self.host, self.port, req, timeout=10)
+        srv_ms = (time.monotonic() - t_req) * 1e3          # policy-server round-trip latency
         if 'error' in resp:
             log.warning("server error: %s", resp["error"])
             return False
@@ -338,14 +348,35 @@ class InferenceController:
                 self.robot_info.left_joint_predict_action_values = buf_list
                 self.robot_info.inference_timestamp = ts
 
+        append_ok = None
         if submit and buf.size:
             # AUTO-to-robot (streaming): append_actions reads the live clock + queued_through itself
             # and pulls the window [queued_through+1 .. clock+n] from this contiguous buffer (base_id
             # = its first master id), validating + appending only the not-yet-queued ids. Rows are
             # only ever appended (never cleared); the release loop drains one master id at a time.
-            ok, reason = env.append_actions(buf_list, int(base_id))
-            if not ok:
+            append_ok, reason = env.append_actions(buf_list, int(base_id))
+            if not append_ok:
                 log.info("auto: append skipped — %s", reason)
+
+        # ---- per-inference lifecycle trace ---------------------------------------------------
+        # One line per inference so the timeline is legible: START/END wall-clock, how long the
+        # whole cycle took (obs -> server -> ensemble -> validate+append), the master-id RANGE this
+        # inference carried onto the robot, and where the robot's release clock is right now (so the
+        # "lead" = how many master ids are queued ahead of the arm). Only in the AUTO->robot path;
+        # manual one-shots (submit=False) don't stream and would just add noise.
+        t_end_wall = time.time()
+        dur_ms = (time.monotonic() - t_start_mono) * 1e3
+        clk, qthru = env.queue_status()                    # re-read: queue advanced during append
+        rows = action.shape[0] if action.ndim == 2 else len(action)
+        self._infer_count += 1
+        if submit:
+            span = f"{int(base_id)}..{int(base_id) + rows - 1}" if rows else str(int(base_id))
+            log.info("[infer] #%d | start %s end %s | took %.1f ms | carried ids %s | "
+                     "robot@id %d (queued->%d, lead %d)%s%s",
+                     self._infer_count, _hms(t_start_wall), _hms(t_end_wall), dur_ms, span,
+                     clk, qthru, qthru - clk,
+                     f" | srv {srv_ms:.0f} ms" if srv_ms >= 50 else "",
+                     "" if append_ok is None or append_ok else " | append SKIPPED")
         return True
 
     @staticmethod
@@ -578,7 +609,8 @@ class InferenceController:
         if stop:
             self.is_auto_inference = False
             if self.inference_thread is not None:
-                log.info("Stopping auto_inference thread...")
+                log.info("[auto] STOP requested — draining queue (%d inferences this run).",
+                         self._infer_count)
                 self.inference_thread.join()
                 self.inference_thread = None
             # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
@@ -610,8 +642,9 @@ class InferenceController:
                     log.warning("E-stop latched — disarming auto-inference.")
                     self.is_auto_inference = False
                     break
-                # submit=True -> validate + splice onto the robot. On a skipped inference (stale
-                # obs, server error, validation failure) back off briefly so we don't busy-spin.
+                # submit=True -> validate + splice onto the robot (and emit the per-inference
+                # lifecycle line, see _run_inference). On a skipped inference (stale obs, server
+                # error, validation failure) back off briefly so we don't busy-spin.
                 if not self._run_inference(submit=True):
                     time.sleep(0.01)
                     continue
@@ -630,5 +663,8 @@ class InferenceController:
 
         if self.inference_thread is None:
             self.inference_thread = threading.Thread(target=_run_auto_inference, daemon=True)
-            log.info("Starting auto_inference (-> robot) thread...")
+            cadence = f"{self.inference_hz:.1f} Hz cap" if self.inference_hz and self.inference_hz > 0 \
+                else "uncapped (latency-bound)"
+            log.info("[auto] START -> robot | server %s:%s | %s | temporal-ensemble %s",
+                     self.host, self.port, cadence, "ON" if self.use_temporal_ensemble else "OFF")
             self.inference_thread.start()
