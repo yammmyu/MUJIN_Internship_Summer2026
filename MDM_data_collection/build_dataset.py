@@ -20,8 +20,13 @@ ground truth. Actions use Gaussian-smoothed EE trajectories to reduce
 teleoperation jerk. Position/rotation layout is pos-first in both obs and action.
 
 Usage:
-    python build_dataset.py                          # recordings_filtered/ → dual_ee.zarr
+    python build_dataset.py                          # recordings_filtered/ → dual_ee.zarr (30 Hz)
     python build_dataset.py --src recordings --out my.zarr
+    python build_dataset.py --fps 10 --out dual_ee_10hz.zarr   # train at 10 Hz (3x more motion/row)
+
+Row cadence: recordings are 30 Hz. --fps sets the OUTPUT row rate by keeping every (30//fps)-th
+frame. A lower rate makes each action row span more motion, so the model makes more progress per
+inference. A model built at --fps N MUST be deployed with real_world/timing.py RECORD_HZ == N.
 """
 import argparse
 import os
@@ -47,7 +52,15 @@ from real_world.build_data import (  # noqa: E402
 # ─── Configuration ────────────────────────────────────────────────────────────
 CHUNK_T       = 100
 COMPRESSOR    = numcodecs.Blosc(cname='zstd', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
-SMOOTH_SIGMA  = 1.7   # Gaussian sigma in frames; set to 0 to disable smoothing
+SMOOTH_SIGMA  = 1.7   # Gaussian sigma in OUTPUT frames; set to 0 to disable smoothing
+# Row-cadence downsampling. Recordings are at SOURCE_HZ; the dataset is built at TARGET_HZ by keeping
+# every STRIDE-th frame (STRIDE = SOURCE_HZ // TARGET_HZ). Training at a lower rate (e.g. 10 Hz) makes
+# each action row span more motion -> more progress per inference. Set via --fps in main().
+# IMPORTANT: a model trained at TARGET_HZ must be DEPLOYED with real_world/timing.py RECORD_HZ ==
+# TARGET_HZ, or the arm executes each row at the wrong speed.
+SOURCE_HZ     = 30
+TARGET_HZ     = 30
+STRIDE        = 1
 
 
 # ─── Action smoothing (TRAINING ONLY — obs stays raw, see build_data) ────────
@@ -190,16 +203,23 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
             print(f"  SKIP — no usable frames")
             continue
 
-        head_frames  = head_frames[:n]
-        handl_frames = handl_frames[:n]
-        handr_frames = handr_frames[:n]
+        # ── Downsample to the target row cadence ──────────────────────────────
+        # Train at a LOWER row rate than the recording (e.g. 10 Hz vs 30 Hz): each action row then
+        # spans `stride` recorded frames = more motion, so the model makes more progress per
+        # inference. sel picks every `stride`-th aligned frame; images, obs and action all use the
+        # SAME sel, so each image stays matched to its proprioception. stride=1 = native rate.
+        sel = np.arange(0, n, STRIDE)
+        n = len(sel)
+        head_frames  = head_frames[sel]
+        handl_frames = handl_frames[sel]
+        handr_frames = handr_frames[sel]
 
-        # ── Arm state ─────────────────────────────────────────────────────────
-        left_pos   = states['left_pos'][:n]      # (N, 3)
-        left_quat  = states['left_quat'][:n]     # (N, 4)  [qx,qy,qz,qw]
-        right_pos  = states['right_pos'][:n]     # (N, 3)
-        right_quat = states['right_quat'][:n]    # (N, 4)
-        grip       = states['gripper'][:n, :2]   # (N, 2)  [left, right]
+        # ── Arm state (downsampled) ───────────────────────────────────────────
+        left_pos   = states['left_pos'][sel]     # (N, 3)
+        left_quat  = states['left_quat'][sel]    # (N, 4)  [qx,qy,qz,qw]
+        right_pos  = states['right_pos'][sel]    # (N, 3)
+        right_quat = states['right_quat'][sel]   # (N, 4)
+        grip       = states['gripper'][sel, :2]  # (N, 2)  [left, right]
         left_grip  = grip[:, :1]                 # (N, 1)
         right_grip = grip[:, 1:2]                # (N, 1)
 
@@ -273,10 +293,26 @@ if __name__ == '__main__':
                         help='Source dir (falls back to recordings/ if not found)')
     parser.add_argument('--out', default='dual_ee.zarr',
                         help='Output Zarr store path')
-    parser.add_argument('--sigma', type=float, default=SMOOTH_SIGMA,
-                        help='Gaussian sigma (frames) for action smoothing; 0 = disabled')
+    parser.add_argument('--fps', type=float, default=SOURCE_HZ,
+                        help=f'target row cadence (Hz); < {SOURCE_HZ} downsamples so each row spans '
+                             f'more motion. e.g. --fps 10 (deploy with timing.py RECORD_HZ=10).')
+    parser.add_argument('--source-hz', type=float, default=SOURCE_HZ,
+                        help='native recording rate (Hz)')
+    parser.add_argument('--sigma', type=float, default=None,
+                        help='Gaussian sigma (OUTPUT frames) for action smoothing; 0 = disabled. '
+                             'Default preserves the 30 Hz time-window (scales with --fps).')
     args = parser.parse_args()
-    SMOOTH_SIGMA = args.sigma
+
+    SOURCE_HZ = args.source_hz
+    TARGET_HZ = args.fps
+    STRIDE = max(1, round(SOURCE_HZ / TARGET_HZ))
+    # Default sigma preserves the physical smoothing time-window of the 1.7-frame @30 Hz default,
+    # so lowering the rate doesn't over-smooth (1.7 * fps/30). Explicit --sigma overrides.
+    SMOOTH_SIGMA = (1.7 * (TARGET_HZ / 30.0)) if args.sigma is None else args.sigma
+    print(f"Building at {TARGET_HZ:g} Hz (source {SOURCE_HZ:g} Hz, stride {STRIDE}); "
+          f"action smoothing sigma={SMOOTH_SIGMA:.2f} output-frames")
+    if STRIDE > 1:
+        print(f"  NOTE: deploy the resulting model with real_world/timing.py RECORD_HZ={TARGET_HZ:g}\n")
 
     src = pathlib.Path(args.src)
     if not src.exists():
