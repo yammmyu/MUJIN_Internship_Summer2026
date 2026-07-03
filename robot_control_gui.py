@@ -85,8 +85,11 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
 
         # In-process PyBullet 预览：用户按「启动仿真预览」时在自有线程上懒加载（所有 p.* 调用
         # 都在该线程），attach 到 self.env.sim 供执行循环驱动。None 表示未启动。
+        # 采用无窗口(direct)模式，每帧离屏渲染到 self._sim_frame，由相机面板当作一路「相机」平铺显示，
+        # 而非弹出独立的 PyBullet 窗口。None = 未运行（相机面板据此增删仿真图块）。
         self._sim_thread = None
         self._sim_stop = threading.Event()
+        self._sim_frame = None
 
         # 策略推理控制器（复用注入的 env）
         self.inference = InferenceController(self.env, self.robot_info)
@@ -222,7 +225,8 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
 
     # ===================== sim preview (in-process PyBullet) =====================
     def launch_sim(self):
-        """Start the PyBullet preview on its own thread (idempotent)."""
+        """Start the headless PyBullet preview on its own thread (idempotent). The preview renders
+        into a camera-style tile (see _sim_loop), so no separate PyBullet window opens."""
         if self._sim_thread is not None and self._sim_thread.is_alive():
             self.status_text.set("仿真预览已在运行")
             return
@@ -232,11 +236,12 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         self.status_text.set("仿真预览已启动")
 
     def _sim_loop(self):
-        """Owns the PyBullet connection: build it here, seed to the robot's current pose,
-        attach to env, then step until stopped. All p.* calls stay on this thread; the exec
-        thread only calls sim.command() (no p.*)."""
+        """Owns the PyBullet connection: build it HEADLESS (direct=True, no OpenGL window), seed to
+        the robot's current pose, attach to env, then step until stopped while rendering an off-screen
+        RGB frame into self._sim_frame (~30 Hz) for the camera panel to show as a tile. All p.* calls
+        (step + render) stay on this thread; the exec thread only calls sim.command() (no p.*)."""
         try:
-            sim = SimEnv(direct=False)
+            sim = SimEnv(direct=True)
         except Exception as e:
             print(f"[GUI] sim launch failed: {e}")
             return
@@ -250,17 +255,47 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         except Exception as e:
             print(f"[GUI] sim seed failed: {e}")
         self.env.sim = sim              # exec loop now drives the preview
+        # Render one frame BEFORE showing the tile so _sim_frame is non-None (the camera panel keys
+        # the 仿真预览 tile on that). Tk is single-threaded, so marshal the rebuild onto the main loop.
+        tw, th = getattr(self, "camera_tile_size", (320, 240))
+        try:
+            self._sim_frame = sim.render(tw, th)
+        except Exception as e:
+            print(f"[GUI] sim render error: {e}")
+        self.root.after(0, self._rebuild_camera_display)   # add the 仿真预览 tile (main thread)
+        last_render = time.monotonic()
         try:
             while not self._sim_stop.is_set() and sim.connected():
                 sim.step()
+                time.sleep(sim.sim_dt)   # pace the headless loop (GUI mode slept internally)
+                now = time.monotonic()
+                if now - last_render >= 0.033:              # ~30 Hz off-screen render (like a camera)
+                    tw, th = getattr(self, "camera_tile_size", (320, 240))
+                    try:
+                        self._sim_frame = sim.render(tw, th)
+                    except Exception as e:
+                        print(f"[GUI] sim render error: {e}")
+                    last_render = now
         finally:
             self.env.sim = None
+            self._sim_frame = None
+            # remove the 仿真预览 tile on the main thread (best-effort; window may be closing)
+            try:
+                self.root.after(0, self._rebuild_camera_display)
+            except Exception:
+                pass
             sim.disconnect()
 
     def _stop_sim(self):
         self._sim_stop.set()
         if self._sim_thread is not None:
             self._sim_thread.join(timeout=3.0)
+        self._sim_frame = None
+        # remove the 仿真预览 tile (guard: on_closing may run after the UI is torn down)
+        try:
+            self._rebuild_camera_display()
+        except Exception:
+            pass
 
     def on_closing(self):
         """窗口关闭时依次释放各资源，最后强制退出进程。
