@@ -94,9 +94,49 @@ def rot6d_to_quat(rot6d):
 
 
 def decode_action_row(row):
-    """Policy action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat_xyzw(4), grip)."""
+    """LEFT half of a policy action row [eef_pos(3), 6D_rot(6), gripper(1)] ->
+    (pos(3), quat_xyzw(4), grip). Reads cols 0:10, so it works on both a 10-col left row and a
+    20-col dual row (the sim-preview path decodes only the left arm)."""
     row = np.asarray(row, dtype=np.float64)
     return row[:3], rot6d_to_quat(row[3:9]), float(row[9])
+
+
+def decode_action_row_dual(row):
+    """Dual 20-col action row L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1] ->
+    (Lpos, Lquat, Lgrip, Rpos, Rquat, Rgrip). Left = cols 0:10, right = cols 10:20."""
+    a = np.asarray(row, dtype=np.float64)
+    return (a[0:3],   rot6d_to_quat(a[3:9]),   float(a[9]),
+            a[10:13], rot6d_to_quat(a[13:19]), float(a[19]))
+
+
+def slerp(q0, q1, t):
+    """Spherical-linear interpolation between two quaternions (any consistent layout; we use
+    xyzw). t in [0,1]; t=0 -> q0, t=1 -> q1. Takes the shorter arc."""
+    q0 = np.asarray(q0, dtype=np.float64)
+    q1 = np.asarray(q1, dtype=np.float64)
+    q0 = q0 / (np.linalg.norm(q0) + 1e-12)
+    q1 = q1 / (np.linalg.norm(q1) + 1e-12)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:                      # shorter arc
+        q1 = -q1
+        d = -d
+    if d > 0.9995:                   # nearly aligned -> linear + renormalize
+        out = q0 + t * (q1 - q0)
+        return out / (np.linalg.norm(out) + 1e-12)
+    th0 = np.arccos(d)
+    s0 = np.sin((1.0 - t) * th0) / np.sin(th0)
+    s1 = np.sin(t * th0) / np.sin(th0)
+    return s0 * q0 + s1 * q1
+
+
+def smooth_quat_step(prev, quat, alpha):
+    """One step of orientation smoothing (H3): SLERP the previous target toward the new quat
+    by `alpha` (1.0 = no smoothing). `prev` None -> pass the new quat through unchanged."""
+    q = np.asarray(quat, dtype=np.float64)
+    q = q / (np.linalg.norm(q) + 1e-12)
+    if prev is None:
+        return q
+    return slerp(prev, q, alpha)
 
 
 # --------------------------------------------------------------------------- #

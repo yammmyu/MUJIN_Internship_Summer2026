@@ -17,21 +17,30 @@ Data-collection / streaming logic is copied from
 MDM_data_collection/robot_data_collect.py, which is the tested, reliable path.
 """
 
-import copy
 import json
 import pathlib
 import threading
 import time
 from collections import deque
-from datetime import datetime
 
-import cv2
 import numpy as np
 
-from real_world.ik import IKQuery, build_solver, rot6d_to_quat as _ik_rot6d_to_quat
-# Per-frame proprioception rows (EE pose / grippers) are packed in the training zarr layout
-# by build_data so the live env and the offline replay source share one definition.
-from real_world.build_data import build_ee_pose_row, build_grip_row
+from real_world.ik import build_solver, rot6d_to_quat as _ik_rot6d_to_quat
+# Episode recording is owned by a dedicated Recorder (its own lock + disk I/O); the env just
+# drives it from the collect loop and lifecycle. RECORD_CAMERAS is re-exported here for
+# back-compat (data_collection_gui imports it from this module).
+from real_world.recording import Recorder, RECORD_CAMERAS
+# Dynamic camera subscriptions live in a dedicated CameraHub (its own lock; one SDK camera
+# object per camera, opened/closed on demand). KNOWN_CAMERAS / CAMERA_IDLE_TIMEOUT are the
+# hub's defaults, imported here for the env constructor's signature.
+from real_world.camera import CameraHub, KNOWN_CAMERAS, CAMERA_IDLE_TIMEOUT
+# Chunk IK-solve + sim-validation (#4) and the sim-only preview loop (#7) are their own
+# collaborators. Workspace envelopes + QUAT_ALPHA moved into planner with the code that uses them.
+from real_world.planner import ChunkPlanner
+from real_world.sim_preview import SimPreview
+# Producer-side observation buffers + freshness + get_obs/inf_ready (#3). extract_pose is the
+# shared status-frame parser (obs right-EE + recorder both use it).
+from real_world.observer import ObsCollector, extract_pose
 # Timing/rate constants live in ONE place (real_world/timing.py) so RECORD_HZ, the substep rate
 # (CONTROL_HZ/STEP_TIME) and the velocity cap (MAX_JOINT_VEL/MAX_JOINT_STEP) can't drift apart.
 # Re-exported below for back-compat — scripts and tests import these names from humanoid_env.
@@ -56,18 +65,8 @@ except ImportError:
 # rejects a policy row whose joint velocity exceeds MAX_JOINT_VEL; the release loop and the
 # ramp/bridge subdivision clamp to MAX_JOINT_STEP so a step-change target becomes a bounded ramp
 # instead of a snap (C5). Motion smoothness is set by CONTROL_HZ, NOT by this cap.
-# Orientation EMA factor toward the new target quaternion (0..1; 1 = no smoothing). (H3)
-# TUNE [0..1]: the ONLY orientation smoother on the robot path (applied row-to-row in
-# _solve_chunk_ik). 1.0 -> no smoothing (snappiest, roughest); LOWER -> smoother orientation but
-# more lag. (Position is NOT EMA-filtered on the robot path — TE does that; see pos_alpha note.)
-QUAT_ALPHA = 0.5
-# Workspace envelope (firmware EE frame, metres) the policy's target EE pos must lie in. A
-# target outside is rejected (never sent to IK/robot). Generous box; tighten per workspace. (H4)
-WORKSPACE_AABB = ((-0.20, 0.85), (-0.20, 1.10), (0.40, 1.30))   # (x_lo,x_hi),(y..),(z..) LEFT arm
-# RIGHT-arm workspace envelope (H4): the right arm lives at NEGATIVE y (recorded right EE y in
-# ~[-0.38, -0.17]), so its AABB is the LEFT box mirrored across y=0 (same x,z). Per-arm envelopes
-# keep the safety bound tight for each side instead of one loose union box.
-WORKSPACE_AABB_RIGHT = ((-0.20, 0.85), (-1.10, 0.20), (0.40, 1.30))
+# QUAT_ALPHA (orientation smoothing, H3) and the WORKSPACE_AABB / WORKSPACE_AABB_RIGHT envelopes
+# (H4) now live in real_world.planner, alongside the solve_chunk_ik code that applies them.
 # A live observation older than this (no real change in EE pose / camera) is "stale": the
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
@@ -92,13 +91,12 @@ APPEND_AHEAD_ROWS = 2
 # staging, release) then carries {0,1}; the LEFT gripper is then driven via the 'gripper' group of
 # trajectory_tracking_control (never move_gripper), so the right gripper is never addressed.
 GRIPPER_CLOSE_THRESH = 10.0     # raw gripper value at/above which we call it CLOSED (-> 1)
-# Cameras captured to disk during data collection (mirrors the old
-# RobotDataCollector.CAMERA_NAMES). build_dataset.py only consumes head +
-# hand_left; hand_right is recorded for future use.
-RECORD_CAMERAS = ["hand_left", "hand_right", "head"]
+# RECORD_CAMERAS (the cameras captured to disk during data collection) now lives in
+# real_world.recording and is imported/re-exported above.
 
-# A camera auto-switches OFF if no consumer has requested it within this window.
-CAMERA_IDLE_TIMEOUT = 5.0
+# KNOWN_CAMERAS (allowed names), CAMERA_IDLE_TIMEOUT, and the fallback intrinsics now live in
+# real_world.camera (CameraHub). KNOWN_CAMERAS / CAMERA_IDLE_TIMEOUT are imported above for the
+# constructor defaults. The camera ROLES below stay here — they are policy-obs mapping, not hub state.
 
 # Camera roles for the dual_arm_ee_image policy obs.
 AGENT_CAMERA = "head"               # -> agentview_image
@@ -106,34 +104,6 @@ HAND_CAMERA_LEFT = "hand_left"      # -> robotl_eye_in_hand_image
 HAND_CAMERA_RIGHT = "hand_right"    # -> robotr_eye_in_hand_image
 HAND_CAMERA = HAND_CAMERA_LEFT      # back-compat alias (left wrist)
 INFERENCE_CAMERAS = [AGENT_CAMERA, HAND_CAMERA_LEFT, HAND_CAMERA_RIGHT]
-
-# Every camera name the SDK knows about. A camera is only SUBSCRIBED (i.e. costs
-# DDS bandwidth) while we hold a live CosineCamera object for it — see the
-# per-camera dynamic subscription in HumanoidEnv. This list is just the set of
-# names a consumer is allowed to request.
-KNOWN_CAMERAS = ["head", "head_depth", "hand_left", "hand_right", "head_center_fisheye"] 
-# Tho more camera angles exist, limited to these for simplisity
-
-
-# Fallback intrinsics when the SDK can't supply them (ported from
-# gui/camera_panel.py:get_default_camera_intrinsics so the env owns intrinsics).
-_DEFAULT_INTRINSICS = {
-    "head": {'width': 1280, 'height': 800, 'fx': 900.0, 'fy': 900.0,
-             'cx': 640.0, 'cy': 400.0, 'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]},
-    "head_depth": {'width': 1280, 'height': 800, 'fx': 900.0, 'fy': 900.0,
-                   'cx': 640.0, 'cy': 400.0, 'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]},
-    "hand_left": {'width': 320, 'height': 240, 'fx': 300.0, 'fy': 300.0,
-                  'cx': 160.0, 'cy': 120.0, 'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]},
-    "hand_right": {'width': 320, 'height': 240, 'fx': 300.0, 'fy': 300.0,
-                   'cx': 160.0, 'cy': 120.0, 'distortion': [0.0, 0.0, 0.0, 0.0, 0.0]},
-    "head_center_fisheye": {'width': 640, 'height': 480, 'fx': 400.0, 'fy': 400.0,
-                            'cx': 320.0, 'cy': 240.0, 'distortion': [0.1, -0.1, 0.0, 0.0, 0.0]},
-}
-
-
-def _default_camera_intrinsics(name):
-    """Default intrinsics for a camera (falls back to 'head' for unknown names)."""
-    return _DEFAULT_INTRINSICS.get(name, _DEFAULT_INTRINSICS["head"])
 
 
 def rot6d_to_quat(rot6d):
@@ -146,36 +116,6 @@ def rot6d_to_quat(rot6d):
     ~20% of recorded targets spuriously IK-unreachable.
     """
     return np.asarray(_ik_rot6d_to_quat(rot6d), dtype=np.float64)
-
-
-def _slerp(q0, q1, t):
-    """Spherical-linear interpolation between two quaternions (any consistent layout; we use
-    xyzw). t in [0,1]; t=0 -> q0, t=1 -> q1. Takes the shorter arc."""
-    q0 = np.asarray(q0, dtype=np.float64)
-    q1 = np.asarray(q1, dtype=np.float64)
-    q0 = q0 / (np.linalg.norm(q0) + 1e-12)
-    q1 = q1 / (np.linalg.norm(q1) + 1e-12)
-    d = float(np.dot(q0, q1))
-    if d < 0.0:                      # shorter arc
-        q1 = -q1
-        d = -d
-    if d > 0.9995:                   # nearly aligned -> linear + renormalize
-        out = q0 + t * (q1 - q0)
-        return out / (np.linalg.norm(out) + 1e-12)
-    th0 = np.arccos(d)
-    s0 = np.sin((1.0 - t) * th0) / np.sin(th0)
-    s1 = np.sin(t * th0) / np.sin(th0)
-    return s0 * q0 + s1 * q1
-
-
-def _smooth_quat_step(prev, quat, alpha):
-    """One step of orientation smoothing (H3): SLERP the previous target toward the new quat
-    by `alpha` (1.0 = no smoothing). `prev` None -> pass the new quat through unchanged."""
-    q = np.asarray(quat, dtype=np.float64)
-    q = q / (np.linalg.norm(q) + 1e-12)
-    if prev is None:
-        return q
-    return _slerp(prev, q, alpha)
 
 
 class HumanoidEnv:
@@ -195,9 +135,9 @@ class HumanoidEnv:
                  real=False,
                  seed_q=None):
         # Robot/controller may be injected (the GUI shares them across panels);
-        # we only tear down what we created. Cameras are NOT injected — the env is
-        # the sole owner of camera subscriptions and manages one CosineCamera per
-        # camera dynamically (see _reconcile_cameras), so nothing streams until a
+        # we only tear down what we created. Cameras are NOT injected — the CameraHub
+        # (self.camhub, built below) is the sole owner of camera subscriptions and manages
+        # one SDK camera object per camera dynamically, so nothing streams until a
         # consumer request()s it.
         self._owns_robot = robot is None
         self.robot = robot if robot is not None else Robot()
@@ -230,11 +170,10 @@ class HumanoidEnv:
         # RIGHT-arm IK solver (dual-arm execution): its own URDF joints + FK calibration
         # (fk_calibration_right.json). Both arms are solved per row and streamed in lockstep.
         self.solver_r = build_solver(side="right")
-        # Nominal per-arm joint posture (median of the training recordings), used as a FALLBACK IK
-        # warm-start when the live/chained seed resolves to a contorted or unreachable config — this
-        # is what stops a PARKED arm (esp. the right, never moved in the old pipeline) from picking a
-        # twisted redundancy branch far from the training distribution. Same rule for both arms.
-        self._nominal_q14 = self._load_nominal_config()
+        # Chunk IK-solve + sim-validation (#4). Owns the nominal-posture IK fallback (median of the
+        # training recordings) that un-contorts a parked/out-of-distribution arm; references the
+        # env's LEFT/RIGHT solvers. The release pipeline calls solve_chunk_ik / validate_chunk.
+        self.planner = ChunkPlanner(self.solver, self.solver_r)
         # Left-arm joint limits (rad), captured once so the execution path can clamp commands
         # without reaching into the IK solver (it only needs the bounds, not the solver).
         self._jlower = np.asarray(self.solver.m.lower, dtype=np.float64).copy()
@@ -243,18 +182,17 @@ class HumanoidEnv:
         self._jlower14 = np.concatenate([self._jlower, np.asarray(self.solver_r.m.lower, dtype=np.float64)])
         self._jupper14 = np.concatenate([self._jupper, np.asarray(self.solver_r.m.upper, dtype=np.float64)])
         self._real = real
-        # LEFT IK warm-start seed (7,), used ONLY by the sim-preview _solve_ik path. Seeded from the
-        # recording's first arm joints when given, else the limit-clipped zero config.
-        self._last_q = (np.asarray(seed_q, dtype=np.float64).copy()
-                        if seed_q is not None else self.solver.m.clip(np.zeros(7)))
+        # Sim-only action preview (#7). Owns the action queue + smoothing state + the LEFT IK
+        # warm-start seed (its last_q / set_seed); the env's exec loop drives it via preview.tick.
+        self.preview = SimPreview(self.solver, seed_q=seed_q, pos_alpha=pos_alpha)
         # DUAL IK warm-start seed (14,) [left7, right7], used by the validate/append/release path.
-        # Re-anchored to the live robot on each idle validate (_resync) / auto ingest.
-        self._last_q14 = np.concatenate([self._last_q, self.solver_r.m.clip(np.zeros(7))])
+        # Re-anchored to the live robot on each idle validate (_resync) / auto ingest. Its LEFT half
+        # starts from the preview's seed so both paths agree on the initial left-arm pose.
+        self._last_q14 = np.concatenate([self.preview.last_q, self.solver_r.m.clip(np.zeros(7))])
         # Last 14-joint config actually COMMANDED to the robot (dispatch-time C5 velocity guard in
         # run_trajectory_control). None until the first command / after an E-stop; re-seeded from the
         # live pose so the guard bounds the very first waypoint too.
         self._last_cmd_q14 = None
-        self._quat_prev = None                       # previous target quat for SLERP smoothing (H3)
         # Release pipeline state (guarded by self._lock):
         self._last_sim_traj = []                     # [(q7_achieved, grip)] last validated traj
         self._validation_id = 0                      # bumped on each successful validation
@@ -268,55 +206,33 @@ class HumanoidEnv:
         self._estop = threading.Event()              # latched stop for the release path (C3)
         self._last_good_arm14 = None                 # last finite 14-joint read (observation anchor)
 
-        # Liveness/staleness tracking (H2): the collect loop bumps _fresh_mono only when the EE
-        # pose or a policy camera frame ACTUALLY changes, so a frozen feed is detectable even
-        # though every tick is "recent". _firmware_has_error mirrors get_motion_status().
-        self._fresh_mono = 0.0
-        self._last_ee_sig = None
-        self._last_cam_sig = {}
-        self._firmware_has_error = False
-
-        # Names a consumer is allowed to request (validation only — not subscribed).
-        self.cameras = list(allowed_cameras)
-        # "Pinned" cameras stay ON for the env's whole life (never idle-evicted),
-        # e.g. data-collection cameras. Empty for the GUI -> nothing on at launch.
-        self._pinned = set(cameras)
+        # Camera subscriptions are owned by a CameraHub (its own lock; one SDK camera object per
+        # camera, opened/closed on demand). `cameras=` (constructor) are the PINNED cameras — kept
+        # ON for the env's life, e.g. data collection; `allowed_cameras` is the requestable set.
+        self.camhub = CameraHub(Camera, allowed=allowed_cameras, pinned=cameras,
+                                idle_timeout=idle_timeout)
         self.output_dir = pathlib.Path(output_dir)
         self.record_hz = frequency
         self.dt = 1.0 / frequency
-        self.pos_alpha = pos_alpha          # position low-pass EMA (1.0 = no smoothing).
-        # TUNE [0..1] but NOTE: applied ONLY in _sim_loop (the SIM PREVIEW). It does NOT touch the
-        # real robot path (_solve_chunk_ik), so it does NOT affect auto-inference motion. Position
-        # smoothing on the robot comes from the temporal ensemble (TE_* in inference_controller).
+        # pos_alpha (position low-pass EMA for the sim preview) is owned by self.preview. It applies
+        # ONLY to the preview and does NOT touch the real robot path; robot-path position smoothing
+        # comes from the temporal ensemble (TE_* in inference_controller).
         self.command_lifetime = command_lifetime
-        self.idle_timeout = idle_timeout    # auto-off a camera idle longer than this
 
         # ---- shared state (replaces robot_info.lock + scattered GUI buffers) ----
         self._lock = threading.Lock()
-        # Per-camera on/off switch: a camera is SUBSCRIBED (live CosineCamera object
-        # in self._cams -> costs bandwidth) only while ACTIVE. It goes active when a
-        # consumer request()s it, and is evicted (object closed) after idle_timeout.
-        self._active = set()                                   # cameras requested recently
-        self._last_requested = {}                              # name -> time.monotonic()
-        self._cams = {}                                        # name -> CosineCamera([name]) (live subscription)
-        self._frames = {}                                      # name -> rolling [prev, cur]
-        self._intrinsics = {}                                  # name -> intrinsics dict (lazy)
-        self._unknown_cam_warned = set()                       # bad camera names already warned (once each)
         self._log_ts = {}                                      # key -> last monotonic print time (throttling)
-        # Dual-arm EE-pose obs (policy input), rolling [row_{t-1}, row_t], each row 9-dim
-        # [pos(3) + rot6d(6)] in the training robot*_eef_pos layout. Built in _collect_loop:
-        # left from calibrated FK on the live joints, right from the firmware status frame.
-        self._last_two_robotl_eef = None
-        self._last_two_robotr_eef = None
-        # robot0_grip obs: rolling [g_{t-1}, g_t], each = [left, right] RAW gripper (2-dim).
-        self._last_two_grip = None
-        self._obs_timestamp = 0.0
+        # Producer-side observation (#3): rolling dual-arm EE-pose / gripper buffers + freshness +
+        # get_obs/inf_ready live in the ObsCollector. The collect thread feeds it one ingest() per
+        # tick; it FKs the left EE from the live joints and reads the right EE from the status frame.
+        self.obs = ObsCollector(
+            self.solver, INFERENCE_CAMERAS, AGENT_CAMERA, HAND_CAMERA_LEFT, HAND_CAMERA_RIGHT,
+            STALE_TIMEOUT)
         # Master row clock (the robot's own execution timeline, in policy-row units, independent of
         # wall-clock). _release_loop advances _current_row_id as substeps dispatch; _collect_loop
-        # snapshots it into _obs_row_id when it samples an obs, so each prediction is anchored to the
-        # row the arm was actually on. Alignment (ensemble + ramp ingest) is keyed on this, not time.
+        # snapshots it into the obs (obs._obs_row_id) so each prediction is anchored to the row the
+        # arm was actually on. Alignment (ensemble + ramp ingest) is keyed on this, not time.
         self._current_row_id = 0
-        self._obs_row_id = 0
         # Highest master id currently sitting in _robot_q (append_actions' streaming buffer cursor).
         # -1 = nothing queued; reset to -1 whenever the queue is force-cleared (E-stop) so the next
         # append re-anchors to the live clock instead of leaving a hole in the id stream.
@@ -332,14 +248,16 @@ class HumanoidEnv:
         self.ramp_joint_step = RAMP_JOINT_STEP
         self.append_ahead_rows = APPEND_AHEAD_ROWS
 
-        # Recording state — guarded by _rec_lock. _rec holds the in-progress
-        # recording session (None when not recording). Ported from RobotDataCollector.
-        self._rec_lock = threading.Lock()
-        self._rec = None
-        self._is_recording = False
-
-        self._action_queue = []            # most recent predicted chunk, FIFO drained
-        self._smoothed_pos = None
+        # Episode recording is delegated to a Recorder (owns its own lock + session state +
+        # disk I/O). It reads arm joints via the robot and reuses this env's status-frame pose
+        # parser, so recorded rows match the obs source exactly. The env only drives it (tick
+        # from the collect loop; start/stop/finalize from lifecycle) and pins the record cameras.
+        self.recorder = Recorder(
+            output_dir=self.output_dir,
+            record_hz=self.record_hz,
+            read_arm_joints=self.robot.arm_joint_states,
+            extract_pose=extract_pose,
+        )
 
         self._stop_event = threading.Event()
         self._collect_thread = None
@@ -348,13 +266,14 @@ class HumanoidEnv:
 
     # ===================== lifecycle (RealEnv.start/stop/__enter__) =====================
     @property
+    def cameras(self):
+        """Names a consumer is allowed to request (back-compat: the GUI reads env.cameras)."""
+        return self.camhub.allowed
+
+    @property
     def inf_ready(self):
         """Ready for inference once the three policy cameras + both EE states are populated."""
-        with self._lock:
-            frames_ready = all(
-                self._frames.get(n) is not None for n in INFERENCE_CAMERAS)
-            return frames_ready and self._last_two_robotl_eef is not None \
-                and self._last_two_robotr_eef is not None
+        return self.obs.inf_ready(self.camhub)
 
     # ===================== consumer-facing camera switch =====================
     def _throttled(self, key, interval=1.0):
@@ -365,73 +284,22 @@ class HumanoidEnv:
             return True
         return False
 
+    # Camera switch/query is delegated to the CameraHub (kept as methods for the GUI's API).
     def request(self, name):
-        """Mark a camera as wanted this cycle and switch it ON.
-
-        Idempotent and cheap — consumers call this every loop tick to keep a
-        camera alive. Names outside the SDK's constructed set are ignored.
-        Logs ONLY on the OFF->ON transition (this is a per-tick hot path).
-        """
-        if name not in self.cameras:
-            if name not in self._unknown_cam_warned:     # warn once per bad name, never per tick
-                self._unknown_cam_warned.add(name)
-                print(f"[HumanoidEnv] camera name not recognized: {name}")
-            return
-        with self._lock:
-            self._last_requested[name] = time.monotonic()
-            if name not in self._active:                 # OFF->ON transition only
-                self._active.add(name)
-                print(f"[HumanoidEnv] camera ON: {name} -> {sorted(self._active)}")
-
+        """Mark a camera as wanted this cycle and switch it ON (idempotent; call every tick)."""
+        self.camhub.request(name)
 
     def get_frame(self, name):
-        """request(name) + return the latest single frame (copy), or None.
-
-        Returns None until the collect loop has fetched the camera at least once
-        (it was just switched on, or it is still warming up).
-        """
-        self.request(name)
-        with self._lock:
-            pair = self._frames.get(name)
-            return copy.deepcopy(pair[-1]) if pair else None
+        """request(name) + return the latest single frame (copy), or None while warming up."""
+        return self.camhub.get_frame(name)
 
     def active_cameras(self):
-        """Names currently SUBSCRIBED (a live CosineCamera object exists -> streaming).
-
-        This is what the GUI's live indicator shows: every camera the humanoid env
-        is actually pulling from the robot right now (display ticks + inference + pinned).
-        """
-        with self._lock:
-            return sorted(self._cams.keys())
+        """Names currently SUBSCRIBED (streaming) — what the GUI's live indicator shows."""
+        return self.camhub.active_cameras()
 
     def get_intrinsics(self, name):
-        """Camera intrinsics, fetched once from the live SDK object then cached.
-
-        Falls back to defaults when the camera isn't currently subscribed (intrinsics
-        are static, so a sensible default is fine while the camera is OFF).
-        """
-        with self._lock:
-            cached = self._intrinsics.get(name)
-            cam = self._cams.get(name)
-        if cached is not None:
-            return cached
-        info = None
-        if cam is not None:                     # only query a live subscription
-            try:
-                if hasattr(cam, 'get_camera_info'):
-                    info = cam.get_camera_info(name)
-                elif hasattr(cam, 'get_intrinsics'):
-                    info = cam.get_intrinsics(name)
-            except Exception as e:
-                print(f"[HumanoidEnv] [HumanoidEnv.get_intrinsics] {name}: {e}")
-                info = None
-        if not info:
-            info = _default_camera_intrinsics(name)
-            # don't cache the default — let a real value replace it once the camera is on
-            return info
-        with self._lock:
-            self._intrinsics[name] = info
-        return info
+        """Camera intrinsics (live SDK value cached; falls back to defaults while OFF)."""
+        return self.camhub.get_intrinsics(name)
 
     def __enter__(self):
         self.start()
@@ -467,12 +335,7 @@ class HumanoidEnv:
 
         # Grab any in-progress recording before the collect thread can touch it
         # for one more tick, so we can finalize it after the thread exits.
-        rec = None
-        with self._rec_lock:
-            if self._is_recording:
-                self._is_recording = False
-                rec = self._rec
-                self._rec = None
+        rec = self.recorder.stop()
 
         for t in (self._collect_thread, self._exec_thread, self._release_thread):
             if t is not None and t.is_alive():
@@ -481,53 +344,15 @@ class HumanoidEnv:
 
         # Finalize the grabbed recording now that the collect thread is gone.
         if rec is not None:
-            self._finalize(rec)
+            self.recorder.finalize(rec)
 
-        # Close every live camera subscription (env owns all of them).
-        for name, cam in list(self._cams.items()):
-            try:
-                cam.close()
-            except Exception as e:
-                print(f"[HumanoidEnv.stop] camera.close({name}): {e}")
-        self._cams.clear()
+        # Close every live camera subscription (the hub owns all of them).
+        self.camhub.close_all()
         if self._owns_robot:
             try:
                 self.robot.shutdown()
             except Exception as e:
                 print(f"[HumanoidEnv.stop] robot.shutdown: {e}")
-
-    # ===================== per-camera dynamic subscription =====================
-    def _reconcile_cameras(self, desired):
-        """Make the set of live CosineCamera objects match `desired`.
-
-        Opens a dedicated CosineCamera([name]) for each newly-wanted camera (this
-        is the actual DDS subscription that costs bandwidth) and closes the object
-        for any camera no longer wanted (stopping its stream). Using one object per
-        camera means toggling one camera never disturbs the others' streams.
-
-        Runs only in the collect thread, so self._cams has a single mutator; reads
-        of self._cams elsewhere take self._lock.
-        """
-        current = set(self._cams.keys())
-        for name in current - desired:
-            cam = self._cams.pop(name)
-            try:
-                cam.close()
-            except Exception as e:
-                print(f"[HumanoidEnv] camera.close({name}) failed: {e}")
-            with self._lock:
-                self._frames.pop(name, None)        # no stale frame on re-activation
-                self._intrinsics.pop(name, None)
-            print(f"[HumanoidEnv] camera unsubscribed (OFF): {name}")
-        for name in desired - current:
-            try:
-                cam = Camera([name])                # <-- the per-camera DDS subscription
-            except Exception as e:
-                print(f"[HumanoidEnv] camera open({name}) failed: {e}")
-                continue
-            with self._lock:
-                self._cams[name] = cam
-            print(f"[HumanoidEnv] camera subscribed (ON): {name}")
 
     # ===================== producer: collection loop =====================
     # Pacing + SDK reads copied from RobotDataCollector._stream_loop.
@@ -545,87 +370,29 @@ class HumanoidEnv:
         next_tick = time.monotonic()
         while not self._stop_event.is_set():
             now = time.time()
-
-            # Evict cameras idle longer than the timeout (pinned never evict), then
-            # the desired subscription set = recently-requested + pinned.
             now_mono = time.monotonic()
-            with self._lock:
-                stale = [n for n, t in self._last_requested.items()
-                         if now_mono - t > self.idle_timeout and n not in self._pinned]
-                for n in stale:
-                    self._active.discard(n)
-                    self._last_requested.pop(n, None)
-                desired = set(self._active) | self._pinned
 
-            # Open/close CosineCamera objects to match desired (controls bandwidth).
-            self._reconcile_cameras(desired)
+            # Camera producer step: evict idle, reconcile the live subscription set, read the
+            # latest frame per camera. Returns this tick's fresh {name: [prev, cur]} pairs.
+            frames = self.camhub.capture_tick()
 
-            # get_motion_status (firmware error flag + recording) + gripper + arm joints per tick.
+            # Raw per-tick SDK reads (the env owns the robot/controller): motion status (firmware
+            # error flag), gripper, and both-arm joints. The ObsCollector turns these into the
+            # policy obs (left-EE FK, right-EE from status, grippers, freshness).
             try:
                 status = self.robot_controller.get_motion_status()
                 grip = self.robot.gripper_states()[0]     # array-like [left, right] RAW gripper
                 arm14 = self._read_arm14()                # refresh last-good arm read (C4)
-                # LEFT EE obs is FK on the LIVE joints, NOT status['frames']['arm_left_link7']: the
-                # firmware parks its EE/FK estimator while an ABS_JOINT trajectory executes
-                # (auto-inference), freezing that frame even though arm_joint_states() stays live.
-                # FK keeps the EE tracking the arm and matches the training EE frame (see _left_ee_fk).
-                robotl_eef = self._left_ee_fk(arm14[:7]) if arm14 is not None else None
-                # RIGHT EE obs comes from the firmware status frame arm_right_link7 (same source the
-                # recordings used for right_pos/right_quat). The right arm is NEVER commanded here, so
-                # its FK frame never parks -> the firmware estimate stays valid; no right-arm solver
-                # is needed. Both rows are 9-dim [pos(3) + rot6d(6)] (training robot*_eef_pos layout).
-                if status is not None and 'frames' in status:
-                    rp = self._extract_pose(status['frames']['arm_right_link7'])
-                    robotr_eef = build_ee_pose_row(rp[:3], rp[3:7])
-                else:
-                    robotr_eef = None
-                # robot0_grip obs: [left, right] RAW gripper (matches the training zarr layout).
-                grip_state = build_grip_row(grip[0], grip[1]) if grip is not None else None
             except Exception as e:
-                print(f"[HumanoidEnv]  [collect] get_motion_status failed: {e}")
-                status = grip = robotl_eef = robotr_eef = grip_state = None
-
-            frames = self._read_frames(desired)
-
-            # Freshness (H2): did the EE pose or a policy camera frame actually CHANGE? Only then
-            # bump _fresh_mono. A frozen feed (stale arm_joint_states / dropped camera) stops
-            # advancing _fresh_mono even though `now` keeps moving, so get_obs can flag staleness.
-            changed = False
-            ee_sig = tuple(np.round(robotl_eef, 6)) if robotl_eef is not None else None
-            if ee_sig is not None and ee_sig != self._last_ee_sig:
-                changed = True
-            cam_sigs = {n: self._frame_sig(frames[n][-1]) for n in INFERENCE_CAMERAS
-                        if n in frames}
-            for n, sig in cam_sigs.items():
-                if sig != self._last_cam_sig.get(n):
-                    changed = True
-            fw_error = bool(status and status.get('error', {}).get('has_error'))
+                print(f"[HumanoidEnv]  [collect] SDK read failed: {e}")
+                status = grip = arm14 = None
 
             with self._lock:
-                self._obs_timestamp = now
-                self._obs_row_id = self._current_row_id   # master-ID this obs is anchored to
-                self._firmware_has_error = fw_error
-                if ee_sig is not None:
-                    self._last_ee_sig = ee_sig
-                self._last_cam_sig.update(cam_sigs)
-                if changed or self._fresh_mono == 0.0:
-                    self._fresh_mono = now_mono
-                for name, pair in frames.items():
-                    self._frames[name] = pair
-                if robotl_eef is not None:
-                    self._last_two_robotl_eef = ([self._last_two_robotl_eef[-1], robotl_eef]
-                                                 if self._last_two_robotl_eef else [robotl_eef, robotl_eef])
-                if robotr_eef is not None:
-                    self._last_two_robotr_eef = ([self._last_two_robotr_eef[-1], robotr_eef]
-                                                 if self._last_two_robotr_eef else [robotr_eef, robotr_eef])
-                if grip_state is not None:
-                    self._last_two_grip = ([self._last_two_grip[-1], grip_state]
-                                           if self._last_two_grip else [grip_state, grip_state])
+                cur = self._current_row_id                # master-ID this obs is anchored to
+            self.obs.ingest(now, now_mono, status, grip, arm14, frames, cur)
 
-            # Append a recording row while a session is active.
-            with self._rec_lock:
-                if self._is_recording and self._rec is not None and status is not None:
-                    self._record_tick(now, status, grip, frames)
+            # Append a recording row while a session is active (no-op otherwise).
+            self.recorder.tick(now, status, grip, frames)
 
             next_tick += self.dt
             sleep_for = next_tick - time.monotonic()
@@ -633,40 +400,6 @@ class HumanoidEnv:
                 self._stop_event.wait(sleep_for)
             else:
                 next_tick = time.monotonic()
-
-    @staticmethod
-    def _extract_pose(frame):
-        """One motion-status link frame -> (x, y, z, qx, qy, qz, qw).
-
-        Same extraction as RobotDataCollector._get_hand_statuses._extract.
-        """
-        pos = frame['position']
-        quat = frame['orientation']['quaternion']
-        return (
-            pos['x'], pos['y'], pos['z'],
-            quat['x'], quat['y'], quat['z'], quat['w'],
-        )
-
-    def _left_ee_fk(self, arm7):
-        """Left EE obs row [pos(3) + rot6d(6)] (9-dim) via pinocchio FK on the LIVE arm joints.
-
-        The obs EE comes from FK, NOT status['frames']['arm_left_link7']: the firmware parks its
-        EE/FK estimator while an ABS_JOINT trajectory executes (auto-inference), so that frame
-        FREEZES even though arm_joint_states() stays live. FK from the live joints keeps the EE
-        tracking the arm and matches the training EE frame (~3mm vs firmware FK, calibrated via
-        fk_calibration.json — recordings were collected under EE-space teleop while the firmware
-        FK was live). The gripper is published separately (robot0_grip), not in this row."""
-        pos, quat = self.solver.m.fk(np.asarray(arm7, dtype=np.float64))
-        return build_ee_pose_row(pos, quat)
-
-    @staticmethod
-    def _frame_sig(frame):
-        """Cheap change signature for a camera frame (H2): a coarse subsample, not the whole
-        image, so per-tick freeze detection stays light. None frame -> None."""
-        if frame is None:
-            return None
-        a = np.asarray(frame)
-        return a[::64, ::64].tobytes() if a.ndim >= 2 else a.tobytes()
 
     def _firmware_unsafe(self):
         """Defense-in-depth: True if get_motion_status reports an error or active collisions, or
@@ -687,164 +420,41 @@ class HumanoidEnv:
             return True
         return False
 
-    def _read_frames(self, active):
-        """Latest frame per live camera, kept as a rolling [prev, cur] pair.
-
-        Each camera has its own CosineCamera object; get_latest_image returns
-        (image, timestamp) and the first frame is None (SDK note 9.6), so we skip
-        until a real frame arrives.
-        """
-        out = {}
-        for name in active:
-            cam = self._cams.get(name)
-            if cam is None:                 # just requested; object opens next tick
-                continue
-            image, _ = cam.get_latest_image(name)
-            if image is None:
-                continue
-            prev = self._frames.get(name)
-            out[name] = [prev[-1], image] if prev else [image, image]
-        return out
-
     # ===================== obs snapshot for the caller (RealEnv.get_obs) =====================
     def get_obs(self):
-        """Time-aligned snapshot for one inference, or None if not ready yet.
-
-        Returns the dual_arm_ee_image obs (see build_data.build_predict_request):
-            agent_imgs:     [head_{t-1}, head_t]
-            handl_imgs:     [hand_left_{t-1},  hand_left_t]
-            handr_imgs:     [hand_right_{t-1}, hand_right_t]
-            robotl_eef_pos: [row_{t-1}, row_t]   each [pos(3) + rot6d(6)] (9)
-            robotr_eef_pos: [row_{t-1}, row_t]   each [pos(3) + rot6d(6)] (9)
-            robot0_grip:    [g_{t-1}, g_t]       each [left, right] (2)
-            timestamp:  float (seconds)
-            age:        seconds since the EE pose / cameras last actually changed (H2)
-            stale:      True if age > STALE_TIMEOUT or the firmware reports an error
-            firmware_error: bool
-        """
-        # Keep the three policy cameras warm while inference polls get_obs().
-        for cam in INFERENCE_CAMERAS:
-            self.request(cam)
-        with self._lock:
-            if (self._last_two_robotl_eef is None or self._last_two_robotr_eef is None
-                    or self._last_two_grip is None):
-                if self._throttled("warmup_ee", 2.0):
-                    print("[HumanoidEnv] warming up: waiting for EE / gripper states…")
-                return None
-            if any(self._frames.get(n) is None for n in INFERENCE_CAMERAS):
-                if self._throttled("warmup_cam", 2.0):
-                    missing = [n for n in INFERENCE_CAMERAS if self._frames.get(n) is None]
-                    print(f"[HumanoidEnv] warming up: waiting for cameras {missing}…")
-                return None
-            age = (time.monotonic() - self._fresh_mono) if self._fresh_mono else float('inf')
-            stale = age > STALE_TIMEOUT or self._firmware_has_error
-            return {
-                'agent_imgs': copy.deepcopy(self._frames[AGENT_CAMERA]),
-                'handl_imgs': copy.deepcopy(self._frames[HAND_CAMERA_LEFT]),
-                'handr_imgs': copy.deepcopy(self._frames[HAND_CAMERA_RIGHT]),
-                'robotl_eef_pos': copy.deepcopy(self._last_two_robotl_eef),
-                'robotr_eef_pos': copy.deepcopy(self._last_two_robotr_eef),
-                'robot0_grip': copy.deepcopy(self._last_two_grip),
-                'timestamp': self._obs_timestamp,
-                'step_id': self._obs_row_id,    # master row-ID for alignment (see ensemble/ingest)
-                'age': age,
-                'stale': bool(stale),
-                'firmware_error': bool(self._firmware_has_error),
-            }
+        """Time-aligned dual_arm_ee_image obs for one inference, or None if not ready yet.
+        Delegated to the ObsCollector (which pulls camera frames from the hub)."""
+        return self.obs.get_obs(self.camhub)
 
     # ===================== caller -> env: hand off a prediction =====================
     def submit_actions(self, action_chunk):
         """Hand a chunk to the SIM-PREVIEW queue (auto-run / replay). Sim only — this path can
         NEVER reach the robot. The hardware path is validate_and_stage() + release_to_robot()."""
-        with self._lock:
-            self._action_queue = copy.deepcopy(list(action_chunk)) if action_chunk else []
+        self.preview.submit(action_chunk)
 
     def queue_empty(self):
-        """True when no actions are pending (used by runners to detect drain)."""
-        with self._lock:
-            return not self._action_queue
+        """True when no preview actions are pending (used by runners to detect drain)."""
+        return self.preview.queue_empty()
 
-    @staticmethod
-    def _load_nominal_config():
-        """Nominal per-arm training posture (real_world/nominal_arm_config.json) as a 14-vec
-        [left7, right7] — the IK FALLBACK seed. Zeros if the file is absent (fallback disabled-ish)."""
-        path = pathlib.Path(__file__).parent / "nominal_arm_config.json"
-        try:
-            d = json.loads(path.read_text())
-            return np.asarray(list(d["left"]) + list(d["right"]), dtype=np.float64)
-        except Exception as e:
-            print(f"[HumanoidEnv] nominal_arm_config.json unavailable ({e}); IK fallback seed = zeros.")
-            return np.zeros(14, dtype=np.float64)
-
-    @staticmethod
-    def _limit_pinned(solver, q, margin=0.10):
-        """True if any joint of q sits within `margin` rad of its limit — the signature of a
-        CONTORTED IK solution (the redundant DOF shoved into a limit to reach the target)."""
-        lo = np.asarray(solver.m.lower, dtype=np.float64)
-        hi = np.asarray(solver.m.upper, dtype=np.float64)
-        q = np.asarray(q, dtype=np.float64)
-        return float(np.min(np.minimum(q - lo, hi - q))) < margin
-
-    def _ik_robust(self, solver, pos, quat, seed, nominal):
-        """Solve IK from the live/chained `seed`; if that lands UNREACHABLE or LIMIT-PINNED
-        (contorted), retry from `nominal` (the training posture) and prefer a clean solve. Returns
-        (q7, reachable). Same rule for both arms: a warm seed keeps its natural branch (no retry, no
-        regression); a parked / out-of-distribution seed escapes contortion. This is what makes the
-        robot's PARKED right arm resolve to a sane pose instead of 'going crazy' — the sim eval never
-        saw it because it seeds from the recorded (warm) joints."""
-        q1 = solver.solve(IKQuery(target_pos=pos, target_quat=quat, current_joints=seed))
-        if solver.last_reachable and not self._limit_pinned(solver, q1):
-            return np.asarray(q1, dtype=np.float64), True          # live seed is clean -> keep it
-        r1 = solver.last_reachable
-        q2 = solver.solve(IKQuery(target_pos=pos, target_quat=quat, current_joints=nominal))
-        if solver.last_reachable and not self._limit_pinned(solver, q2):
-            return np.asarray(q2, dtype=np.float64), True          # nominal fallback is clean
-        if solver.last_reachable:                                  # neither clean; prefer reachable
-            return np.asarray(q2, dtype=np.float64), True
-        if r1:
-            return np.asarray(q1, dtype=np.float64), True
-        return np.asarray(q2, dtype=np.float64), False             # genuinely unreachable
-
+    # ===================== chunk IK-solve + sim-validation (delegated to ChunkPlanner) =====================
     def _solve_chunk_ik(self, action_chunk, seed_q, skip_unreachable=False):
-        """Solve IK for an ENTIRE chunk up front, OUTSIDE the sim validation job: workspace
-        check (H4) + orientation smoothing (H3) + our IK, chaining each row's warm-start from
-        the previous raw IK solution starting at seed_q (fresh quat-smoothing state per call).
-        Returns (configs, ok, reason) where configs = [(q7, grip), ...] are the raw IK joints
-        the sim then validates kinematically. Pulled out of sim.validate so the (pure-numerical
-        Pinocchio) IK runs on the caller's thread while the sim job only does the substep +
-        self-collision check on already-solved configs.
-        skip_unreachable=True (calibrate path): drop unreachable/out-of-envelope rows and keep
-        going (mirrors the old learn=True behaviour) instead of aborting."""
-        configs = []
-        seed = np.asarray(seed_q, dtype=np.float64).copy()   # 14-vec [left7, right7]
-        seedL, seedR = seed[:7].copy(), seed[7:14].copy()
-        qprevL = qprevR = None    # per-arm quat-smoothing state (don't disturb the preview's)
-        for k, action in enumerate(action_chunk):
-            Lpos, Lquat, Lgrip, Rpos, Rquat, Rgrip = self._decode_ee_action_dual(action)
-            Lpos = np.asarray(Lpos, dtype=np.float64); Rpos = np.asarray(Rpos, dtype=np.float64)
-            if not self._pos_in_workspace(Lpos, "left") or not self._pos_in_workspace(Rpos, "right"):
-                if skip_unreachable:
-                    continue
-                return [], False, f"action {k}: target EE pos outside workspace envelope"
-            qprevL = _smooth_quat_step(qprevL, Lquat, QUAT_ALPHA)                 # H3 (per arm)
-            qprevR = _smooth_quat_step(qprevR, Rquat, QUAT_ALPHA)
-            # live/chained seed first, nominal-training-posture fallback on a contorted/unreachable
-            # solve (per arm) — keeps a warm arm's natural branch, un-contorts a parked one.
-            qL, okL = self._ik_robust(self.solver, Lpos, qprevL, seedL, self._nominal_q14[:7])
-            if not okL:
-                if skip_unreachable:
-                    continue
-                return [], False, (f"action {k}: LEFT IK unreachable "
-                                   f"(pos err {self.solver.last_pos_err*1000:.0f} mm)")
-            qR, okR = self._ik_robust(self.solver_r, Rpos, qprevR, seedR, self._nominal_q14[7:])
-            if not okR:
-                if skip_unreachable:
-                    continue
-                return [], False, (f"action {k}: RIGHT IK unreachable "
-                                   f"(pos err {self.solver_r.last_pos_err*1000:.0f} mm)")
-            configs.append((np.concatenate([qL, qR]), [Lgrip, Rgrip]))
-            seedL, seedR = qL, qR
-        return configs, True, None
+        """Solve IK for an ENTIRE chunk (workspace check H4 + orientation smoothing H3 + dual-arm IK
+        with nominal-posture fallback) on the caller's thread. Delegated to ChunkPlanner; returns
+        (configs, ok, reason) with configs = [(q14, [gl,gr]), ...] for the sim to validate."""
+        return self.planner.solve_chunk_ik(action_chunk, seed_q, skip_unreachable=skip_unreachable)
+
+    def _validate_chunk(self, configs, seed_q, fast=False, substeps_per_row=None):
+        """Run PRE-SOLVED configs through self.sim from seed_q (substep + self-collision + joint
+        readback) -> (traj, ok, reason), traj = sim-ACHIEVED [(q14, grip), ...]. The single
+        validation primitive shared by manual validate_and_stage and auto-inference. Owns the
+        no-sim / empty-chunk guards (env owns the sim); the kinematic check is ChunkPlanner's.
+        substeps_per_row: the SAME K the caller uses for master-id tagging; None -> current value."""
+        if self.sim is None:
+            return [], False, "no sim running — press 启动仿真预览 first"
+        if not configs:
+            return [], False, "empty action chunk"
+        K = self.substeps_per_row if substeps_per_row is None else substeps_per_row
+        return self.planner.validate_chunk(self.sim, configs, seed_q, K, fast=fast)
 
     def calibrate_collisions(self, action_chunk):
         """Learn this coarse URDF's inherent self-collision overlaps from a KNOWN-SAFE action
@@ -860,25 +470,6 @@ class HumanoidEnv:
         self.sim.validate(configs, self._last_q14, MAX_JOINT_STEP, learn=True,
                           substeps_per_row=self.substeps_per_row)
         return True, "collision baseline updated"
-
-    # ===================== shared sim-validation core (manual + auto) =====================
-    def _validate_chunk(self, configs, seed_q, fast=False, substeps_per_row=None):
-        """Run PRE-SOLVED joint configs through self.sim from seed_q (substep + self-collision +
-        joint readback) and return (traj, ok, reason) where traj is the sim-ACHIEVED
-        [(q7, grip), ...]. The single validation primitive shared by the manual
-        validate_and_stage and auto-inference. IK is now solved OUTSIDE this call (see
-        _solve_chunk_ik) — `configs` is its [(q7, grip), ...] output, so this is purely the
-        kinematic sim check.
-        fast=True (auto path): skip the per-substep real-time sleep — that sleep is just for the
-        operator to watch the manual preview and is ~1s of pure latency per auto inference.
-        substeps_per_row: pass the SAME K the caller will use for master-id tagging, so a live
-        speed_scale change between expansion and tagging can't desync them; None -> current value."""
-        if self.sim is None:
-            return [], False, "no sim running — press 启动仿真预览 first"
-        if not configs:
-            return [], False, "empty action chunk"
-        K = self.substeps_per_row if substeps_per_row is None else substeps_per_row
-        return self.sim.validate(configs, seed_q, MAX_JOINT_STEP, fast=fast, substeps_per_row=K)
 
     # ===================== manual: validate a chunk in the sim, then release =====================
     def validate_and_stage(self, action_chunk):
@@ -1298,8 +889,9 @@ class HumanoidEnv:
             return self._current_row_id, self._queued_through
 
     def set_seed(self, q7):
-        """Set the IK warm-start seed (e.g. to the robot's current left-arm joints)."""
-        self._last_q = np.asarray(q7, dtype=np.float64).copy()
+        """Set the sim-preview IK warm-start seed (e.g. to the robot's current left-arm joints).
+        Delegated to the SimPreview, which owns that seed."""
+        self.preview.set_seed(q7)
 
     @staticmethod
     def _ramp(q_from, q_to, cap, grip):
@@ -1346,13 +938,6 @@ class HumanoidEnv:
             n *= 2
         return out
 
-    def _pos_in_workspace(self, pos, side="left"):
-        """True if the target EE position is inside that arm's workspace AABB (H4). side="right"
-        uses the mirrored right-arm envelope (the right arm operates at negative y)."""
-        (xl, xh), (yl, yh), (zl, zh) = WORKSPACE_AABB_RIGHT if side == "right" else WORKSPACE_AABB
-        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
-        return xl <= x <= xh and yl <= y <= yh and zl <= z <= zh
-
     def _read_arm14(self):
         """Return a finite 14-vector of arm joints, caching the last good read. Falls back to
         the last good value on a failed/garbage read; None only if never read once (C4)."""
@@ -1369,36 +954,11 @@ class HumanoidEnv:
 
     # ===================== consumer: sim-preview execution loop =====================
     def _sim_loop(self):
-        """Drain the sim-preview queue (auto-run / replay) -> IK -> SIM only. NEVER touches the
-        robot (that is _release_loop). Applies the same workspace + smoothing guards as
-        validation so the preview matches what would be validated."""
+        """Own the sim-preview thread + pacing; the per-tick work (decode -> workspace -> smooth ->
+        IK -> sim.command) is the SimPreview's. Sim only — NEVER touches the robot (that is
+        _release_loop). Passes the current self.sim in, since the GUI attaches/detaches it live."""
         while not self._stop_event.is_set():
-            with self._lock:
-                action = self._action_queue.pop(0) if self._action_queue else None
-            if action is None:
-                self._stop_event.wait(self.dt)
-                continue
-
-            pos, quat, grip = self._decode_ee_action(action)
-            pos = np.asarray(pos, dtype=np.float64)
-            if not self._pos_in_workspace(pos):                        # H4
-                print("[HumanoidEnv] preview: target outside workspace; skipping")
-                self._stop_event.wait(self.dt)
-                continue
-
-            #check if there exists a smoothed path, if no smooth it
-            if self._smoothed_pos is None:
-                self._smoothed_pos = pos
-            else:
-                self._smoothed_pos = self.pos_alpha * pos + (1.0 - self.pos_alpha) * self._smoothed_pos
-            self._quat_prev = _smooth_quat_step(self._quat_prev, quat, QUAT_ALPHA)   # H3
-
-            q7 = self._solve_ik(self._smoothed_pos, self._quat_prev)
-            if q7 is None:                     # unreachable target -> skip (seed not advanced)
-                self._stop_event.wait(self.dt)
-                continue
-            if self.sim is not None:
-                self.sim.command(q7, grip)
+            self.preview.tick(self.sim)
             self._stop_event.wait(self.dt)
 
     def _release_loop(self):
@@ -1454,34 +1014,6 @@ class HumanoidEnv:
             # so there is no extra wait here (that would double the period).
             if not self.run_trajectory_control([sub]):
                 self.lock_robot()                              # couldn't dispatch -> estop
-
-    def _decode_ee_action(self, action):
-        """LEFT half of an action row [eef_pos(3), 6D_rot(6), gripper(1)] -> (pos(3), quat(4), grip).
-        Reads cols 0:10, so it works on both a 10-col left row and a 20-col dual row (preview path)."""
-        return action[:3], rot6d_to_quat(action[3:9]), action[9]
-
-    @staticmethod
-    def _decode_ee_action_dual(action):
-        """Dual 20-col action row L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1] ->
-        (Lpos, Lquat, Lgrip, Rpos, Rquat, Rgrip). Left = cols 0:10, right = cols 10:20."""
-        a = np.asarray(action, dtype=np.float64)
-        return (a[0:3],   rot6d_to_quat(a[3:9]),   float(a[9]),
-                a[10:13], rot6d_to_quat(a[13:19]), float(a[19]))
-
-    def _solve_ik(self, pos, quat):
-        """Target EE pose -> 7 left-arm joint angles via our URDF IK (warm-started from the
-        last solution). Returns None when the target is unreachable, leaving the seed intact
-        so the next target plans from the last good config."""
-        q7 = self.solver.solve(IKQuery(
-            target_pos=np.asarray(pos, dtype=np.float64),
-            target_quat=np.asarray(quat, dtype=np.float64),
-            current_joints=self._last_q))
-        if not self.solver.last_reachable:
-            print(f"[HumanoidEnv] IK unreachable (pos err "
-                  f"{self.solver.last_pos_err * 1000:.1f} mm); skipping action")
-            return None
-        self._last_q = q7
-        return q7
 
     def run_trajectory_control(self, points, ignore_estop=False):
         """Stream a batch of sim-validated LEFT-arm waypoints to trajectory_tracking_control ONE at
@@ -1587,145 +1119,21 @@ class HumanoidEnv:
             prev = q
         return out
 
-    # ===================== data-collection recording (ported from RobotDataCollector) =====================
+    # ===================== data-collection recording (delegated to Recorder) =====================
     def start_recording(self, episode_name=None):
-        """Begin a recording session that writes mp4 per RECORD_CAMERA + an npz.
-
-        Pins the record cameras so a tick never misses one to idle-eviction.
-        """
-        with self._rec_lock:
-            if self._is_recording:
-                print("[HumanoidEnv] Already recording.")
-                return
-
-            if episode_name is None:
-                episode_name = f'episode_{sum(1 for _ in self.output_dir.glob("episode_*")):03d}'
-
-            episode_dir = self.output_dir / episode_name
-            cameras_dir = episode_dir / 'cameras'
-            cameras_dir.mkdir(parents=True, exist_ok=True)
-
-            self._rec = {
-                'episode_dir':   episode_dir,
-                'cameras_dir':   cameras_dir,
-                'writers':       {},
-                'needs_bgr':     {},
-                'timestamps':    [],
-                'left':          [],
-                'right':         [],
-                'arm_joints':    [],
-                'arm_joints_ts': [],
-                'gripper':       [],
-                'cam_ready':     {name: False for name in RECORD_CAMERAS},
-                'start_time':    datetime.now().isoformat(),
-            }
-            self._is_recording = True
-
-        self._pinned |= set(RECORD_CAMERAS)
-        print(f"[HumanoidEnv] Recording started -> {episode_dir}")
+        """Begin a recording session (writes mp4 per RECORD_CAMERA + an npz). Pins the record
+        cameras so a tick never misses one to idle-eviction. Delegated to self.recorder; the env
+        only owns the camera-pin side effect."""
+        if self.recorder.start(episode_name):
+            self.camhub.pin(RECORD_CAMERAS)
 
     def stop_recording(self):
-        """End the active session and flush video/npz/metadata to disk."""
-        with self._rec_lock:
-            if not self._is_recording:
-                return
-            print("[HumanoidEnv] Stopping recording...")
-            self._is_recording = False
-            rec = self._rec
-            self._rec = None
-
-        self._pinned -= set(RECORD_CAMERAS)
-        # Finalize outside the lock — the collect loop sees _rec is None and won't
-        # touch this session, so writing files can't block streaming.
-        self._finalize(rec)
+        """End the active session and flush video/npz/metadata to disk. Unpins the record
+        cameras and finalizes outside the recorder lock (the collect loop already sees the
+        session gone, so writing files can't block streaming)."""
+        rec = self.recorder.stop()
+        if rec is None:
+            return
+        self.camhub.unpin(RECORD_CAMERAS)
+        self.recorder.finalize(rec)
         print("[HumanoidEnv] Recording stopped.")
-
-    def _record_tick(self, t, status, grip, frames):
-        """Append one row to the active session. Caller holds _rec_lock.
-
-        `frames` is the collect loop's per-camera rolling [prev, cur] pairs; the
-        current frame is frames[name][-1] (absent for a camera that dropped this tick).
-        """
-        rec = self._rec
-
-        # Wait until every record camera has produced at least one frame before
-        # writing anything, so row counts stay in sync.
-        for name in RECORD_CAMERAS:
-            if name in frames:
-                rec['cam_ready'][name] = True
-        if not all(rec['cam_ready'].values()):
-            missing = [n for n, r in rec['cam_ready'].items() if not r]
-            print(f"[HumanoidEnv]   waiting for cameras: {missing}")
-            return
-
-        # --- Record robot state ---
-        rec['left'].append(self._extract_pose(status['frames']['arm_left_link7']))
-        rec['right'].append(self._extract_pose(status['frames']['arm_right_link7']))
-        # arm_joints sourced from arm_joint_states(). COPY the returned array before
-        # storing it: arm_joint_states() hands back a handle to one REUSED internal SDK
-        # buffer, so appending it by reference makes every recorded row alias the same
-        # object — at finalize they all collapse to the buffer's final value (frozen
-        # joints across the whole episode, while the scalar arm_joints_ts stays live).
-        # np.array() snapshots the current values. arm_joints_ts records each sample's
-        # timestamp for staleness checks.
-        arm_vals, arm_ts = self.robot.arm_joint_states()
-        rec['arm_joints'].append(np.array(arm_vals))
-        rec['arm_joints_ts'].append(arm_ts)
-        rec['gripper'].append(grip)
-        rec['timestamps'].append(t)
-
-        # --- Write camera frames (skip cameras that dropped this tick) ---
-        for name in RECORD_CAMERAS:
-            pair = frames.get(name)
-            if pair is None:
-                continue
-            frame = pair[-1]
-            if name not in rec['writers']:
-                h, w   = frame.shape[:2]
-                path   = str(rec['cameras_dir'] / f'{name}.mp4')
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                rec['writers'][name]   = cv2.VideoWriter(path, fourcc, self.record_hz, (w, h))
-                rec['needs_bgr'][name] = frame.ndim == 3
-                print(f"[HumanoidEnv]   opened cameras/{name}.mp4  ({w}x{h})")
-
-            rec['writers'][name].write(
-                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if rec['needs_bgr'][name] else frame
-            )
-
-    def _finalize(self, rec):
-        """Flush video files and write npz/metadata for a finished session."""
-        for w in rec['writers'].values():
-            w.release()
-
-        timestamps = rec['timestamps']
-        n = len(timestamps)
-        if n == 0:
-            print(f"[HumanoidEnv]   no frames recorded -> {rec['episode_dir']}")
-            return
-
-        left_a  = np.array(rec['left'],  dtype=np.float32)   # (N, 7)
-        right_a = np.array(rec['right'], dtype=np.float32)   # (N, 7)
-
-        # robot_states.npz — one array per signal (build_dataset.py reads
-        # timestamps/left_pos/left_quat/gripper). arm_joints_ts is additive.
-        np.savez(
-            rec['episode_dir'] / 'robot_states.npz',
-            timestamps    = np.array(timestamps,            dtype=np.float64),  # (N,)    seconds
-            left_pos      = left_a[:, :3],                                      # (N, 3)  metres
-            left_quat     = left_a[:, 3:],                                      # (N, 4)  [qx,qy,qz,qw]
-            right_pos     = right_a[:, :3],                                     # (N, 3)
-            right_quat    = right_a[:, 3:],                                     # (N, 4)
-            arm_joints    = np.array(rec['arm_joints'],    dtype=np.float32),   # (N, 14) radians
-            arm_joints_ts = np.array(rec['arm_joints_ts'], dtype=np.float64),   # (N,)    freeze diagnostic
-            gripper       = np.array(rec['gripper'],       dtype=np.float32),   # (N, 2)  0=open 1=closed
-        )
-
-        with open(rec['episode_dir'] / 'metadata.json', 'w') as f:
-            json.dump({
-                'fps':          self.record_hz,
-                'n_frames':     n,
-                'start_time':   rec['start_time'],
-                'camera_names': RECORD_CAMERAS,
-            }, f, indent=2)
-
-        print(f"[HumanoidEnv]   saved {n} frames -> {rec['episode_dir']}")
