@@ -6,9 +6,11 @@ temporal ensemble. Runs fully offline with the same fakes as test_safety_invaria
                              every step <= MAX_JOINT_STEP, row ids monotonic from obs_step_id.
   R2  master-ID drop      -> a chunk whose obs row id is BEHIND the current row id keeps only the
                              still-future rows (drops the part the arm already passed).
-  R3  concurrent ingest   -> ingest WHILE the release loop drains: smooth, right arm untouched.
-  E1  ensemble by id      -> rows sharing an absolute master id are averaged (recency-weighted);
-                             non-overlapping rows pass through (identity); gripper re-binarised.
+  R3  concurrent ingest   -> ingest WHILE the release loop drains: BOTH arms commanded (dual-arm),
+                             every per-substep joint step within the C5 cap on each arm.
+  E1  ensemble by id      -> _rebuild_buffer averages rows sharing an absolute master id
+                             (recency-weighted), passes non-overlapping rows through (identity), and
+                             re-binarises the gripper; _materialize returns the contiguous run.
 
 Run:
     .venv/bin/python tests/test_auto_splice.py
@@ -23,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_safety_invariants as T                                              # noqa: E402
-import real_world.humanoid_env as he                                           # noqa: E402
+import real_world.planner as planner_mod                                        # noqa: E402
 from real_world.humanoid_env import HumanoidEnv, MAX_JOINT_STEP, SUBSTEPS_PER_ROW  # noqa: E402
 from real_world.sim_backend import SimEnv                                       # noqa: E402
 
@@ -42,12 +44,15 @@ class _ClosedLoopFake:
     where the arm has actually moved.)"""
 
     def __init__(self, q0):
-        self._left = np.asarray(q0, dtype=float).copy()
-        self.moves = []
+        q0 = np.asarray(q0, dtype=float)
+        self._left = q0[:7].copy()
+        self._right = np.zeros(7)          # closed-loop on BOTH arms (dual-arm pipeline)
+        self.moves = []                    # left-arm waypoints
+        self.moves_r = []                  # right-arm waypoints
         self.right_touched = False
 
     def arm_joint_states(self):
-        return (np.concatenate([self._left, np.zeros(7)]).tolist(), 0)
+        return (np.concatenate([self._left, self._right]).tolist(), 0)
 
     def gripper_states(self):
         return ([0.0, 0.0], 0)
@@ -69,12 +74,15 @@ class _ClosedLoopFake:
         for a in robot_actions:
             if "right_arm" in a or "right_gripper" in a:
                 self.right_touched = True
-            self._left = np.asarray(a["left_arm"]["action_data"], dtype=float)   # closed loop
+                if "right_arm" in a:                                             # closed loop (right)
+                    self._right = np.asarray(a["right_arm"]["action_data"], dtype=float)
+                    self.moves_r.append(self._right.copy())
+            self._left = np.asarray(a["left_arm"]["action_data"], dtype=float)   # closed loop (left)
             self.moves.append(self._left.copy())
 
 
 def _env_with_sim():
-    he.WORKSPACE_AABB = ((-9, 9), (-9, 9), (-9, 9))      # isolate from the H4 envelope check
+    planner_mod.WORKSPACE_AABB = ((-9, 9), (-9, 9), (-9, 9))   # isolate from the H4 envelope check
     sim = SimEnv(direct=True)
     seed = np.clip(T.SAFE_SEED, sim.model.lower, sim.model.upper)
     fake = _ClosedLoopFake(seed)                         # one object as both robot + controller
@@ -130,7 +138,8 @@ def test_master_id_drop(verbose=True):
 
 
 def test_concurrent_ingest(verbose=True):
-    """R3: ingest several chunks WHILE the release loop drains; smooth + right arm untouched."""
+    """R3: ingest several chunks WHILE the release loop drains; the dual-arm pipeline commands
+    BOTH arms and every per-substep joint step stays within the C5 cap on each arm."""
     env, sim, seed = _env_with_sim()
     ctl = env.robot_controller
     actions = T._synthetic_actions(env, seed)
@@ -146,20 +155,27 @@ def test_concurrent_ingest(verbose=True):
         moves = np.array(ctl.moves)
         assert len(moves) > 10, "R3: robot barely moved (release loop not draining)"
         dmax = float(np.max(np.abs(np.diff(moves, axis=0))))
-        assert dmax <= MAX_JOINT_STEP + 1e-6, f"R3: concurrent step {dmax:.4f} > cap"
-        assert not ctl.right_touched, "R3: right arm was commanded"
+        assert dmax <= MAX_JOINT_STEP + 1e-6, f"R3: concurrent LEFT step {dmax:.4f} > cap"
+        # Dual-arm: the right arm IS commanded now, in lockstep with the left and equally bounded.
+        assert ctl.right_touched, "R3: right arm should be commanded (dual-arm pipeline)"
+        moves_r = np.array(ctl.moves_r)
+        dmax_r = float(np.max(np.abs(np.diff(moves_r, axis=0)))) if len(moves_r) > 1 else 0.0
+        assert dmax_r <= MAX_JOINT_STEP + 1e-6, f"R3: concurrent RIGHT step {dmax_r:.4f} > cap"
     finally:
         env.stop()
         sim.disconnect()
     if verbose:
-        print(f"[auto-ingest] R3 OK: {len(moves)} waypoints across 4 ingests, "
-              f"max step {dmax:.4f} <= {MAX_JOINT_STEP}, right untouched")
+        print(f"[auto-ingest] R3 OK: {len(moves)} waypoints across 4 ingests, both arms commanded, "
+              f"max step L {dmax:.4f} / R {dmax_r:.4f} <= {MAX_JOINT_STEP}")
 
 
 def test_ensemble_by_id(verbose=True):
-    """E1: master-id ensemble averages rows with equal absolute id; non-overlap = identity."""
-    from real_world.inference_controller import InferenceController, TE_M
-    ctl = InferenceController(env=object())              # _temporal_ensemble only touches _te_buffer
+    """E1: the master-id temporal ensemble (_rebuild_buffer -> _materialize) averages rows sharing
+    an absolute master id (recency-weighted), passes non-overlapping rows through unchanged, and
+    re-binarises the gripper. Radius 0 isolates the cross-chunk average from the along-id Gaussian."""
+    from real_world.inference_controller import InferenceController, TE_M, TE_SIGMA
+    ctl = InferenceController(env=object())              # only the ensemble buffers are exercised
+    ctl.set_smoothing(radius=0, sigma=TE_SIGMA, m=TE_M)  # disable along-id smoothing -> pure per-id avg
     n = 8
     # chunk A anchored at id 0; chunk B (newest) at id 3. col 0 encodes the row value; gripper col 9:
     # A all closed (1), B all open (0) -> tests linear avg + gripper re-binarisation.
@@ -167,17 +183,19 @@ def test_ensemble_by_id(verbose=True):
     b = np.zeros((n, 10)); b[:, 0] = np.arange(n);       b[:, 9] = 0.0
     ctl._te_buffer.append((0, a.copy()))
     ctl._te_buffer.append((3, b.copy()))
-    out = ctl._temporal_ensemble(3, b.copy())            # ensembling B (id_new=3)
-    # k=5 -> target id 8 -> A has no row 8 (only the newest covers it) -> identity.
-    assert np.allclose(out[5], b[5]), "E1: non-overlapping row should be identity"
-    # k=0 -> target id 3 -> A row 3 (=103) averaged with B row 0 (=0), recency-weighted (A 1 older).
+    ctl._rebuild_buffer(queued_through=-1)               # nothing frozen -> rebuild all ids
+    base_id, buf = ctl._materialize()                    # contiguous run master_id 0..10
+    assert base_id == 0, f"E1: base id {base_id} != 0"
+    # master id 8 -> only B covers it (B row 5 = 5) -> identity (no averaging).
+    assert np.allclose(buf[8], b[5]), "E1: non-overlapping row should be identity"
+    # master id 3 -> A row 3 (=103) averaged with B row 0 (=0), recency-weighted (A one older).
     w_a, w_b = np.exp(-TE_M * 1), np.exp(-TE_M * 0)
-    exp0 = (w_a * 103 + w_b * 0) / (w_a + w_b)
-    assert abs(out[0, 0] - exp0) < 1e-6, f"E1: overlap avg {out[0,0]:.3f} != {exp0:.3f}"
+    exp3 = (w_a * 103 + w_b * 0) / (w_a + w_b)
+    assert abs(buf[3, 0] - exp3) < 1e-5, f"E1: overlap avg {buf[3,0]:.3f} != {exp3:.3f}"
     # gripper (w_a*1 + w_b*0)/(w_a+w_b) ~0.495 < 0.5 -> 0
-    assert out[0, 9] == 0.0, "E1: gripper should re-binarise to 0"
+    assert buf[3, 9] == 0.0, "E1: gripper should re-binarise to 0"
     if verbose:
-        print(f"[auto-ingest] E1 OK: overlap avg {out[0,0]:.3f}, non-overlap identity, "
+        print(f"[auto-ingest] E1 OK: overlap avg {buf[3,0]:.3f}, non-overlap identity, "
               f"gripper re-binarised")
 
 
