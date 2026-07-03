@@ -28,9 +28,6 @@ import time
 
 import numpy as np
 
-from collections import deque
-
-from real_world.humanoid_env import GRIPPER_CLOSE_THRESH
 from real_world.timing import RECORD_HZ   # single source of timing truth (see timing.py)
 # Client-side inference preprocessing: image crop/resize/encode (MUST stay identical to training
 # build_dataset.py and the server decode) plus the obs -> /predict request assembly. encode_image
@@ -55,48 +52,11 @@ INFERENCE_HZ = 0  # TUNE (Hz): auto-inference cadence cap. <=0 -> run back-to-ba
                   # overlap, so TE has the most chunks to average (smoother). A positive cap slows
                   # the loop (less overlap, less smoothing) but cuts policy-server load.
 
-# --- Temporal ensemble (ACT-style) -------------------------------------------------
-# Chunk-level EE-space smoothing: each new chunk is averaged against recent overlapping chunks
-# before validation. Every action row carries an absolute MASTER ROW ID (the robot's own execution
-# clock — see real_world/timing.py / HumanoidEnv): row k of a chunk observed at master id S is at
-# id S + k. For each row of the newest chunk we gather every buffered chunk's row with the SAME
-# absolute id (exact integer match) and take a recency-weighted mean (weight exp(-TE_M * age), age
-# = inferences old, newest = 0). This only smooths once chunks actually OVERLAP in id space (when
-# horizon > inferences-worth-of-rows); below that it passes the newest chunk through (identity).
-# Aligning by master id (not wall-clock) tracks the arm's real progress, so the merge can't run
-# ahead of the arm when execution lags real-time (latency / slow-down / control-loop jitter).
-# ┌──────────────────────────────────────────────────────────────────────────────────────────┐
-# │ PERSISTED / LIVE-TUNABLE (tuning_config.json): the four constants below — TE_M, TE_BUFFER_LEN,│
-# │ TE_RADIUS, TE_SIGMA — are only DEFAULT SEEDS. The GUI restores the operator's saved values    │
-# │ from tuning_config.json at startup and tunes them live (InferenceController.set_smoothing /    │
-# │ set_buffer_len). Editing a literal here only changes the fallback used when there is no saved  │
-# │ JSON entry (e.g. a headless run that never loads the file). It is NOT the live runtime value:  │
-# │ that is inference.te_m / .te_buffer_len / .te_radius / .te_sigma.                              │
-# └──────────────────────────────────────────────────────────────────────────────────────────┘
-USE_TEMPORAL_ENSEMBLE = True   # TUNE: master on/off for ALL temporal-ensemble smoothing (bool).
-TE_M = 0.02            # [persisted: tuning_config.json] TUNE [~0.005..0.5]: recency decay of the
-                       # per-id cross-chunk mean. LARGER -> trust the newest chunk more (less
-                       # averaging, more reactive, rougher); SMALLER -> heavier averaging (smoother).
-TE_BUFFER_LEN = 8      # [persisted: tuning_config.json] TUNE [~2..16]: how many recent raw chunks are
-                       # kept = max overlap depth to average over. More -> deeper averaging (smoother).
-# Neighbor smoothing along the master-id axis (the second smoothing dimension). The smoothed buffer
-# is low-passed by a symmetric Gaussian of half-width TE_RADIUS so the long sequence stays smooth
-# id-to-id, not just averaged per id. TE_RADIUS doubles as how many already-committed ("frozen")
-# rows we RETAIN past the clock as fixed left-context, so the filter window is full right at the
-# seam to the rows already on the robot.
-TE_RADIUS = 6          # [persisted: tuning_config.json] TUNE [~1..8]: Gaussian half-width (ids) == #
-                       # of frozen rows retained for context. LARGER -> smoother id-to-id, but more
-                       # lag and blurs sharp intended motion (and widens the frozen-context window).
-TE_SIGMA = 1.5         # [persisted: tuning_config.json] TUNE [~0.5..TE_RADIUS]: Gaussian sigma (id
-                       # units) = in-window shape. LARGER -> stronger smoothing. Keep <= TE_RADIUS or
-                       # the kernel is clipped at the edges. (TE_GAUSS below is derived from this seed.)
-_te_ks = np.arange(-TE_RADIUS, TE_RADIUS + 1)
-TE_GAUSS = np.exp(-(_te_ks ** 2) / (2.0 * TE_SIGMA ** 2))
-TE_GAUSS = TE_GAUSS / TE_GAUSS.sum()   # normalized symmetric kernel, length 2*TE_RADIUS+1
-# Smoothness guard: warn when a per-row position step in the buffer exceeds this (m). The seam
-# between chunks is where roughness shows up, so this catches a bad merge before it reaches the arm.
-SMOOTHNESS_WARN_DPOS = 0.03    # TUNE (m): DIAGNOSTIC threshold only — logs a warning, never clamps.
-                               # Lower to surface smaller seams; not a smoothing knob.
+# Temporal-ensemble chunk merging (binarize + cross-chunk recency mean + along-id Gaussian) now lives
+# in real_world/postprocess.py (PostProcessor). The env owns one PostProcessor (env.pipeline); this
+# controller hands each server chunk to pipeline.merge and exposes the live-tunable knobs (set_smoothing
+# / set_buffer_len / te_radius / te_sigma / te_m / te_buffer_len) as delegators for the GUI. The four
+# TE_* seeds and USE_TEMPORAL_ENSEMBLE / SMOOTHNESS_WARN_DPOS defaults live in postprocess.py.
 PC4080_HOST = "10.12.11.144"
 PC4080_PORT = 9001
 
@@ -158,26 +118,9 @@ class InferenceController:
         self.is_auto_inference = False
         self._last_inference_obs_ts = 0.0
         self._infer_count = 0            # total inferences this process (per-inference trace id)
-        # Temporal-ensemble state: rolling buffer of recent RAW chunks (ts_obs, action[N,10]).
-        # Always averaged from raw — never re-buffer ensembled output, or smoothing compounds.
-        self.use_temporal_ensemble = USE_TEMPORAL_ENSEMBLE
-        self._te_buffer = deque(maxlen=TE_BUFFER_LEN)
-        # LIVE-TUNABLE smoothing config, held as ONE immutable snapshot (radius, sigma, m, kernel) so
-        # the inference thread reads a consistent set even while the GUI changes it (assignment of the
-        # dict reference is atomic under the GIL). Scalar mirrors (te_radius/te_sigma/te_m) are for
-        # display/readback only. Use set_smoothing() to change at runtime.
-        self.te_radius = TE_RADIUS
-        self.te_sigma = TE_SIGMA
-        self.te_m = TE_M
-        self._smooth = self._make_smoothing(TE_RADIUS, TE_SIGMA, TE_M)
-        # The long smoothed buffer fed to the robot: master_id -> EE row [pos3, rot6d6, grip1].
-        # Ids <= the env's queued_through are FROZEN (committed, read-only context); ids above it are
-        # MUTABLE and rebuilt every inference. Only the inference thread touches this -> no lock.
-        self._buffer = {}
-        # Last queued_through seen from the env. queued_through only climbs in normal streaming; a
-        # DROP (env re-anchored: E-stop lock_robot resets it to -1) means the live queue was cleared,
-        # so our buffer is stale and must be cleared too before rebuilding.
-        self._last_queued_through = -1
+        # The temporal-ensemble merge state (rolling raw-chunk buffer + smoothed master buffer +
+        # live-tunable smoothing config) lives in env.pipeline (a PostProcessor). This controller only
+        # delegates the GUI-facing knobs to it (see set_smoothing / te_radius etc. below).
         # Manual step-through cursor: index of the NEXT unexecuted action row in the
         # current chunk. Reset to 0 on every fresh inference; advanced by
         # execute_inference_result. cursor >= chunk length => the chunk is fully consumed
@@ -203,9 +146,8 @@ class InferenceController:
         """Prepare for inference. The injected env's threads are started by the
         caller (the GUI starts env before this), so we only reset our cursor."""
         self._last_inference_obs_ts = 0.0
-        self._te_buffer.clear()
-        self._buffer.clear()
-        self._last_queued_through = -1
+        if self.humanoid_env is not None and getattr(self.humanoid_env, "pipeline", None) is not None:
+            self.humanoid_env.pipeline.reset_merge()
         log.info("InferenceController ready (env owned by caller).")
 
     def stop(self):
@@ -276,58 +218,23 @@ class InferenceController:
         # still pass through unchanged for back-compat with a single-arm policy.)
         action = np.asarray(resp['action'], dtype=np.float32)
         log.debug("response received in %.3fs", time.time() - ts)
-        # Binarize the gripper column(s) HERE, as soon as the chunk arrives: the raw [0,~85] gripper
-        # signal is noisy (transient spikes), so only a (near-)fully-closed reading (>=
-        # GRIPPER_CLOSE_THRESH) becomes closed=1, else open=0. col 9 = left grip; col 19 = right grip
-        # (dual). Everything downstream — sim preview, validation, staging, release — then carries a
-        # clean {0,1} per arm, and the spikes no longer pollute the next inference's state context.
-        if action.ndim == 2:
-            for gc in (9, 19):
-                if action.shape[1] > gc:
-                    action[:, gc] = (action[:, gc] >= GRIPPER_CLOSE_THRESH).astype(action.dtype)
         self._last_inference_obs_ts = ts
         # A fresh chunk restarts the manual step-through from the first row.
         self._exec_cursor = 0
 
-        # Log the RAW chunk (pre-smoothing), keyed by the master id it's anchored to.
+        # POST-PROCESSING (stage 1: gripper binarize + temporal-ensemble merge). The pipeline binarizes
+        # the grippers in place and, for AUTO/streaming (submit=True), splices this chunk into its
+        # smoothed master buffer and returns the contiguous run to feed the robot; manual one-shots
+        # (submit=False) pass the raw chunk through. queue_status gives the live clock + commit frontier
+        # the merge aligns on. `base_id` is the run's first master id; `jerk` is the smoothness-guard
+        # diagnostic. See real_world/postprocess.py.
+        cur, queued_through = env.queue_status()
+        base_id, buf, jerk = env.pipeline.merge(action, sid, cur, queued_through, submit)
+
+        # Log the RAW chunk (post-binarize, pre-buffer would differ only by smoothing), keyed by the
+        # master id it's anchored to.
         if self._trace_files:
             self._trace("chunks", {"obs_ts": sid, "action": action.tolist()})
-
-        # Buffer + smoothing (AUTO/streaming only): append this raw chunk, then rebuild the long
-        # smoothed master buffer over its MUTABLE tail (id > queued_through). The BUFFER — not this
-        # chunk — is what feeds the robot, so we maintain one continuous, id-to-id smooth sequence
-        # instead of re-emitting per-inference chunks. queue_status gives the live clock + commit
-        # frontier for the split. Manual one-shots (submit=False) bypass this: they feed the raw
-        # chunk directly and never touch the streaming buffer (which would otherwise grow unbounded
-        # while queued_through sits at -1, and pollute the chunk that manual step-through reads).
-        cur, queued_through = env.queue_status()
-        use_buffer = submit and self.use_temporal_ensemble and action.ndim == 2 and action.shape[1] >= 10
-        if use_buffer:
-            if queued_through < self._last_queued_through:     # env re-anchored (E-stop) -> stale
-                self._buffer.clear()
-                self._te_buffer.clear()
-            self._last_queued_through = queued_through
-            self._te_buffer.append((sid, action.copy()))      # raw chunk, keyed on master row id
-            self._rebuild_buffer(queued_through)
-            base_id, buf = self._materialize()
-        else:                                                 # manual / TE off -> raw chunk direct
-            base_id, buf = sid, action
-
-        # Smoothness guard: the buffer feeds the robot, so any id-to-id jump becomes a fast seam.
-        # Measure the executed sequence's roughness in EE space over the STILL-MUTABLE rows (the part
-        # we can still influence; frozen rows are committed). |Δpos| is the per-row position step and
-        # |Δ²pos| the bend (jerk proxy); warn when a step is unusually large so a bad merge surfaces
-        # in the logs. Logged, not clamped — clamping committed EE would fight the env seam ramp.
-        jerk = 0.0
-        if use_buffer and buf.shape[0] >= 3:
-            mut0 = max(0, queued_through + 1 - int(base_id))   # index of first mutable row in buf
-            seg = buf[max(0, mut0 - 1):]                       # include one frozen anchor for the seam
-            if seg.shape[0] >= 3:
-                dpos = np.linalg.norm(np.diff(seg[:, :3], axis=0), axis=1)
-                jerk = float(np.linalg.norm(np.diff(seg[:, :3], n=2, axis=0), axis=1).max())
-                if dpos.max() > SMOOTHNESS_WARN_DPOS:
-                    log.warning("SMOOTHNESS WARN: buffer |Δpos|max=%.4f |Δ²pos|max=%.4f m "
-                                "near seam (clock=%s, qt=%s)", dpos.max(), jerk, cur, queued_through)
 
         # The robot-facing buffer as a plain list, computed ONCE and reused by the trace, the
         # robot_info publish, and append_actions (buf.tolist() is the single biggest per-cycle
@@ -379,160 +286,47 @@ class InferenceController:
                      "" if append_ok is None or append_ok else " | append SKIPPED")
         return True
 
-    @staticmethod
-    def _make_smoothing(radius, sigma, m):
-        """Build an immutable smoothing snapshot {radius, sigma, m, gauss} with the normalized
-        symmetric Gaussian kernel precomputed. radius>=0 int, sigma>0, m>=0."""
-        radius = max(0, int(radius))
-        sigma = max(1e-3, float(sigma))
-        ks = np.arange(-radius, radius + 1)
-        g = np.exp(-(ks ** 2) / (2.0 * sigma ** 2))
-        g = g / g.sum()
-        return {"radius": radius, "sigma": sigma, "m": max(0.0, float(m)), "gauss": g}
+    # ------------------------------------------------------------------ #
+    #  Live-tunable smoothing knobs — delegated to env.pipeline (the       #
+    #  PostProcessor owns the merge state). Kept here so the GUI's         #
+    #  existing self.inference.set_smoothing / .te_radius etc. still work. #
+    # ------------------------------------------------------------------ #
+    @property
+    def _pipeline(self):
+        return self.humanoid_env.pipeline
+
+    def set_smoothing(self, radius=None, sigma=None, m=None):
+        """Live-tunable temporal-ensemble smoothing (delegates to env.pipeline). Returns
+        (radius, sigma, m)."""
+        return self._pipeline.set_smoothing(radius=radius, sigma=sigma, m=m)
 
     def set_buffer_len(self, n):
-        """LIVE-tunable max number of recent raw chunks averaged (= overlap depth). Rebuilds the
-        deque preserving the most-recent contents. Returns the applied maxlen."""
-        n = max(1, int(n))
-        self._te_buffer = deque(self._te_buffer, maxlen=n)   # keeps newest n (deque drops from left)
-        log.info("te_buffer_len set: %d", n)
-        return n
+        """Live-tunable overlap depth = # recent raw chunks averaged (delegates to env.pipeline)."""
+        return self._pipeline.set_buffer_len(n)
 
     @property
     def te_buffer_len(self):
-        return self._te_buffer.maxlen
+        return self._pipeline.te_buffer_len
 
-    def set_smoothing(self, radius=None, sigma=None, m=None):
-        """LIVE-tunable smoothing update (safe to call from the GUI thread while inference runs).
-        Any arg left None keeps its current value. Rebuilds the kernel and swaps the whole config in
-        one atomic reference assignment, so _rebuild_buffer always reads a consistent (radius, kernel)
-        pair. Returns the applied (radius, sigma, m)."""
-        radius = self.te_radius if radius is None else radius
-        sigma = self.te_sigma if sigma is None else sigma
-        m = self.te_m if m is None else m
-        snap = self._make_smoothing(radius, sigma, m)
-        self._smooth = snap                               # atomic swap (single ref assignment)
-        self.te_radius, self.te_sigma, self.te_m = snap["radius"], snap["sigma"], snap["m"]
-        log.info("smoothing set: radius=%d sigma=%.2f m=%.3f",
-                 self.te_radius, self.te_sigma, self.te_m)
-        return self.te_radius, self.te_sigma, self.te_m
+    @property
+    def te_radius(self):
+        return self._pipeline.te_radius
 
-    def _rebuild_buffer(self, queued_through):
-        r"""Rebuild the long smoothed master buffer (self._buffer: master_id -> EE row
-        [pos3, rot6d6, grip1]) from the recent RAW chunks in self._te_buffer. Two smoothing
-        dimensions, in EE-pose space, all aligned by MASTER ROW ID (row j of a chunk anchored at S
-        is at id S + j — the robot's own execution clock; see real_world/timing.py / HumanoidEnv):
+    @property
+    def te_sigma(self):
+        return self._pipeline.te_sigma
 
-          (a) ACROSS CHUNKS (per id): for each mutable id, gather every buffered chunk's row at the
-              SAME absolute id and take a recency-weighted mean (w = exp(-TE_M * age), age = how many
-              inferences old, newest = 0). Exact integer alignment, no rounding — tracks the arm's
-              real progress regardless of inference latency. This is the old ACT temporal ensemble.
-          (b) ALONG THE ID AXIS (neighbors): low-pass the per-id estimate with a symmetric Gaussian
-              of half-width TE_RADIUS so the sequence is smooth id-to-id, not just averaged per id.
+    @property
+    def te_m(self):
+        return self._pipeline.te_m
 
-        The buffer is split by the env's commit frontier:
-          * FROZEN  (id <= queued_through): already committed to the robot. Kept (the last TE_RADIUS
-            of them) as READ-ONLY left-context for (b) so the seam to the rows already on the arm
-            stays continuous; never recomputed or rewritten.
-          * MUTABLE (id >  queued_through): rebuilt here every inference from passes (a) then (b).
+    @property
+    def use_temporal_ensemble(self):
+        return self._pipeline.use_temporal_ensemble
 
-        pos (0:3) and rot6d (3:9) smooth linearly (rot6d is re-orthonormalised downstream by
-        rot6d_to_quat); gripper (9), already {0,1}, is NOT low-passed along id (that would blur
-        open/close timing) — it carries the cross-chunk value, re-thresholded at 0.5. Assumes the new
-        raw chunk is already in self._te_buffer (deque(maxlen=TE_BUFFER_LEN), OLDEST -> NEWEST), each
-        element a (master_id, raw chunk (N,10)) tuple; a chunk leaves only by eviction / clear()."""
-        raw = list(self._te_buffer)                       # oldest -> newest
-        if not raw:
-            return
-        s = self._smooth                                  # atomic snapshot (live-tunable)
-        R, gauss, te_m = s["radius"], s["gauss"], s["m"]
-        newest_idx = len(raw) - 1
-        max_id = max(sid + a.shape[0] - 1 for sid, a in raw)
-        min_sid = min(sid for sid, _ in raw)
-        # First MUTABLE id (everything <= queued_through is frozen). Bounded below by the oldest
-        # buffered chunk: no id below any chunk can have a cross-chunk estimate, so don't iterate
-        # there (after an E-stop re-anchor queued_through+1 would otherwise be ~0 while max_id is the
-        # live clock, spinning over thousands of empty ids).
-        mut_lo = max(queued_through + 1, min_sid)
-        n_ids = max_id - mut_lo + 1                        # mutable id i <-> master id (mut_lo + i)
-        if n_ids <= 0:                                     # whole buffer already committed/frozen
-            self._prune_frozen(queued_through, R)         # nothing mutable to rebuild; just prune
-            return
-
-        # Column layout: W = 10 (left-only) or 20 (dual L++R). Gripper cols {9, 19} are binary and
-        # NOT low-passed along id (that would blur open/close timing); every other col (pos + rot6d,
-        # per arm) is smoothed linearly. Derived from the row width so the same code handles both.
-        W = raw[-1][1].shape[1]
-        grip_cols = [c for c in (9, 19) if c < W]
-        smooth_cols = [c for c in range(W) if c not in grip_cols]
-        ns = len(smooth_cols)
-
-        # (a) cross-chunk recency-weighted mean per mutable id (the ACT temporal ensemble).
-        # Each chunk overlaps a CONTIGUOUS span of mutable ids, so it scatter-adds in one vectorised
-        # slice (w*rows) instead of an id-by-id Python loop; per-id weight = sum of contributors.
-        acc = np.zeros((n_ids, W), dtype=np.float64)
-        wsum = np.zeros(n_ids, dtype=np.float64)
-        for idx, (sid, a) in enumerate(raw):
-            lo, hi = max(mut_lo, sid), min(max_id, sid + a.shape[0] - 1)
-            if lo > hi:                                    # chunk doesn't reach the mutable region
-                continue
-            wc = np.exp(-te_m * (newest_idx - idx))        # newest chunk -> age 0
-            acc[lo - mut_lo:hi - mut_lo + 1] += wc * a[lo - sid:hi - sid + 1]
-            wsum[lo - mut_lo:hi - mut_lo + 1] += wc
-        present = wsum > 0.0                               # ids that any chunk covered
-        tent = acc / np.where(present, wsum, 1.0)[:, None]  # normalized weighted mean (== old w/w.sum)
-
-        # (b) symmetric Gaussian along id over the SMOOTH (pos+rot6d, both arms) columns; frozen rows
-        # (<= queued_through) are fixed left-context. Read from a dense padded context array (2R wider
-        # than the mutable span) so the convolution is 2R+1 vectorised shifted adds.
-        ext = n_ids + 2 * R
-        ctxv = np.zeros((ext, ns), dtype=np.float64)       # neighbor smooth-col values, (mut_lo-R)..(max_id+R)
-        pres = np.zeros(ext, dtype=np.float64)             # 1 where that neighbor exists
-        ctxv[R:R + n_ids] = tent[:, smooth_cols]           # mutable estimates (pre-smoothing)
-        pres[R:R + n_ids] = present
-        for nid in range(mut_lo - R, mut_lo):              # frozen left-context (<= queued_through)
-            v = self._buffer.get(nid) if nid <= queued_through else None
-            if v is not None:
-                ctxv[nid - (mut_lo - R)] = np.asarray(v)[smooth_cols]
-                pres[nid - (mut_lo - R)] = 1.0
-        num = np.zeros((n_ids, ns), dtype=np.float64)
-        den = np.zeros(n_ids, dtype=np.float64)
-        for d in range(-R, R + 1):                         # neighbor offset; ext idx of id i is R+i+d
-            k = gauss[d + R]
-            sl = slice(R + d, R + d + n_ids)
-            num += k * ctxv[sl] * pres[sl][:, None]
-            den += k * pres[sl]
-        out = tent.copy()                                  # carries grippers + the (a) fallback
-        good = den > 0.0
-        smoothed = out[:, smooth_cols]                     # fancy-index copy; write back after filling
-        smoothed[good] = num[good] / den[good][:, None]    # pos + rot6d (linear) smoothed along id
-        out[:, smooth_cols] = smoothed
-        for gc in grip_cols:
-            out[:, gc] = (out[:, gc] >= 0.5)               # each gripper re-binarised (not low-passed)
-        for i in np.nonzero(present)[0]:                   # write MUTABLE ids only; frozen untouched
-            self._buffer[mut_lo + int(i)] = out[i]
-
-        self._prune_frozen(queued_through, R)
-
-    def _prune_frozen(self, queued_through, R):
-        """Drop frozen rows older than the retention window (keep the last TE_RADIUS for context)."""
-        cutoff = queued_through - R + 1
-        for k in [k for k in self._buffer if k < cutoff]:
-            del self._buffer[k]
-
-    def _materialize(self):
-        """The contiguous run of self._buffer starting at its lowest id, stopping at the first gap.
-        Returns (base_id, ndarray(M,10)); (-1, empty) when the buffer is empty. append_actions maps
-        master id -> row by index = id - base_id, so the run handed to it MUST be contiguous."""
-        if not self._buffer:
-            return -1, np.empty((0, 10), dtype=np.float32)
-        lo = min(self._buffer)
-        rows = []
-        i = lo
-        while i in self._buffer:                           # walk forward, stop at first missing id
-            rows.append(self._buffer[i])
-            i += 1
-        return lo, np.asarray(rows, dtype=np.float32)
+    @use_temporal_ensemble.setter
+    def use_temporal_ensemble(self, v):
+        self._pipeline.use_temporal_ensemble = v
 
     def inference_once(self) -> bool:
         """Predict + publish only (no execution).

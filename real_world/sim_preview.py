@@ -16,7 +16,7 @@ import threading
 import numpy as np
 
 from real_world.ik import IKQuery, decode_action_row, smooth_quat_step
-from real_world.planner import pos_in_workspace, QUAT_ALPHA
+from real_world.postprocess import pos_in_workspace, QUAT_ALPHA
 
 
 class SimPreview:

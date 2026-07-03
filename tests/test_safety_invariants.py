@@ -99,13 +99,13 @@ class _FakeCtl:
 
 def run(verbose=True):
     """Run all invariant checks. Returns True on success, raises AssertionError on a violation."""
-    import real_world.planner as planner_mod
+    import real_world.postprocess as planner_mod
     from real_world.humanoid_env import HumanoidEnv, MAX_JOINT_STEP
     from real_world.sim_backend import SimEnv
 
     # Isolate the RELEASE-pipeline invariants from the workspace-envelope check (H4 is config,
     # tested separately): widen BOTH arms' envelopes so synthetic FK targets aren't rejected by them.
-    # The envelopes now live in real_world.planner (ChunkPlanner.solve_chunk_ik reads them).
+    # The envelopes now live in real_world.postprocess (PostProcessor.solve_chunk_ik reads them).
     planner_mod.WORKSPACE_AABB = ((-9, 9), (-9, 9), (-9, 9))
     planner_mod.WORKSPACE_AABB_RIGHT = ((-9, 9), (-9, 9), (-9, 9))
 

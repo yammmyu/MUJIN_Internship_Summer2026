@@ -34,10 +34,15 @@ from real_world.recording import Recorder, RECORD_CAMERAS
 # object per camera, opened/closed on demand). KNOWN_CAMERAS / CAMERA_IDLE_TIMEOUT are the
 # hub's defaults, imported here for the env constructor's signature.
 from real_world.camera import CameraHub, KNOWN_CAMERAS, CAMERA_IDLE_TIMEOUT
-# Chunk IK-solve + sim-validation (#4) and the sim-only preview loop (#7) are their own
-# collaborators. Workspace envelopes + QUAT_ALPHA moved into planner with the code that uses them.
-from real_world.planner import ChunkPlanner
+# The sim-only preview loop (#7) is its own collaborator. Chunk IK-solve + sim-validation now live in
+# the post-inference pipeline (#8, real_world.postprocess) alongside the merge; the env delegates
+# _solve_chunk_ik / _validate_chunk to self.pipeline. Workspace envelopes + QUAT_ALPHA live there too.
 from real_world.sim_preview import SimPreview
+# Post-inference action pipeline (#8): raw policy chunk -> robot-ready substeps (gripper binarize +
+# temporal-ensemble merge; later stages absorb IK, sim validation, and the queue splice). The env
+# owns one PostProcessor (self.pipeline). GRIPPER_CLOSE_THRESH is re-exported here for back-compat
+# (scripts import it from this module).
+from real_world.postprocess import PostProcessor, GRIPPER_CLOSE_THRESH, APPEND_AHEAD_ROWS
 # Producer-side observation buffers + freshness + get_obs/inf_ready (#3). extract_pose is the
 # shared status-frame parser (obs right-EE + recorder both use it).
 from real_world.observer import ObsCollector, extract_pose
@@ -66,7 +71,7 @@ except ImportError:
 # ramp/bridge subdivision clamp to MAX_JOINT_STEP so a step-change target becomes a bounded ramp
 # instead of a snap (C5). Motion smoothness is set by CONTROL_HZ, NOT by this cap.
 # QUAT_ALPHA (orientation smoothing, H3) and the WORKSPACE_AABB / WORKSPACE_AABB_RIGHT envelopes
-# (H4) now live in real_world.planner, alongside the solve_chunk_ik code that applies them.
+# (H4) now live in real_world.postprocess, alongside the solve_chunk_ik code that applies them.
 # A live observation older than this (no real change in EE pose / camera) is "stale": the
 # auto-inference loop aborts rather than command the arm from frozen sensor data. (H2)
 STALE_TIMEOUT = 0.5             # seconds
@@ -79,18 +84,19 @@ STALE_TIMEOUT = 0.5             # seconds
 # rows are older predictions (less reactive). 4 rows is the default starting point — tune to latency.
 # TUNE [~2..12 rows]: latency-robustness knob (not directly smoothness). Constraint:
 # n * SUBSTEPS_PER_ROW * STEP_TIME  must exceed one inference round-trip, else the queue starves.
-APPEND_AHEAD_ROWS = 2
+# APPEND_AHEAD_ROWS is defined in real_world.postprocess (the pipeline owns append_actions) and
+# re-exported via the import above for back-compat.
 
 # STEP_TIME = 1/CONTROL_HZ (imported from timing.py): the release loop streams one sim-validated
 # substep per STEP_TIME, so the arm advances on the same uniform time grid the auto-splice f index
 # (f = round(elapsed / STEP_TIME)) assumes. Each policy row spans SUBSTEPS_PER_ROW such substeps.
 
 # Gripper is BINARY open/close. The policy emits a noisy raw [0,~85] gripper signal (transient
-# spikes exist), so at inference we binarize it to {0,1} (see InferenceController): only a
+# spikes exist), so the pipeline binarizes it to {0,1} (PostProcessor.binarize_grippers): only a
 # (near-)fully-closed reading counts as CLOSED. Everything downstream (sim preview, validation,
 # staging, release) then carries {0,1}; the LEFT gripper is then driven via the 'gripper' group of
 # trajectory_tracking_control (never move_gripper), so the right gripper is never addressed.
-GRIPPER_CLOSE_THRESH = 10.0     # raw gripper value at/above which we call it CLOSED (-> 1)
+# GRIPPER_CLOSE_THRESH itself is defined in real_world.postprocess and re-exported via the import above.
 # RECORD_CAMERAS (the cameras captured to disk during data collection) now lives in
 # real_world.recording and is imported/re-exported above.
 
@@ -170,10 +176,23 @@ class HumanoidEnv:
         # RIGHT-arm IK solver (dual-arm execution): its own URDF joints + FK calibration
         # (fk_calibration_right.json). Both arms are solved per row and streamed in lockstep.
         self.solver_r = build_solver(side="right")
-        # Chunk IK-solve + sim-validation (#4). Owns the nominal-posture IK fallback (median of the
-        # training recordings) that un-contorts a parked/out-of-distribution arm; references the
-        # env's LEFT/RIGHT solvers. The release pipeline calls solve_chunk_ik / validate_chunk.
-        self.planner = ChunkPlanner(self.solver, self.solver_r)
+        # Shared release-pipeline lock + latched E-stop, created BEFORE the pipeline so the SAME lock
+        # guards the robot queue whether it is touched by the pipeline (producer: append/auto-ingest)
+        # or the env (consumer: release loop; manual release; lock_robot). threading.Lock is NOT
+        # reentrant, so env code holding self._lock must never call a pipeline method that re-locks.
+        self._lock = threading.Lock()
+        self._estop = threading.Event()              # latched stop for the release path (C3)
+        # Post-inference action pipeline (#8): raw policy chunk -> robot-ready substeps, ALL in one
+        # place (real_world.postprocess). The inference controller hands each server chunk to
+        # self.pipeline.merge (gripper binarize + temporal-ensemble smoothing); the release path calls
+        # solve_chunk_ik / validate_chunk (dual-arm IK + sim validation); and the streaming splice
+        # (append_actions / auto_ingest_chunk) + the robot QUEUE live here too. The env injects the
+        # shared lock + callbacks (live pose read, E-stop predicate, current sim handle) and owns the
+        # release-loop CONSUMER that drains pipeline.pop_next_substep. Standalone-constructible.
+        self.pipeline = PostProcessor(
+            self.solver, self.solver_r,
+            lock=self._lock, read_arm14=self._read_arm14,
+            estopped=self._estop.is_set, get_sim=lambda: self.sim, real=real)
         # Left-arm joint limits (rad), captured once so the execution path can clamp commands
         # without reaching into the IK solver (it only needs the bounds, not the solver).
         self._jlower = np.asarray(self.solver.m.lower, dtype=np.float64).copy()
@@ -193,17 +212,18 @@ class HumanoidEnv:
         # run_trajectory_control). None until the first command / after an E-stop; re-seeded from the
         # live pose so the guard bounds the very first waypoint too.
         self._last_cmd_q14 = None
-        # Release pipeline state (guarded by self._lock):
+        # Release pipeline state. The robot QUEUE (self._robot_q), the master clock
+        # (self._current_row_id) and the streaming cursor (self._queued_through) now live in
+        # self.pipeline (guarded by the shared self._lock); the env reaches them via delegating
+        # properties (below). The MANUAL staging buffer + one-shot bookkeeping stay here:
         self._last_sim_traj = []                     # [(q7_achieved, grip)] last validated traj
         self._validation_id = 0                      # bumped on each successful validation
         self._released_id = -1                       # validation_id already released (one-shot, H1)
-        self._robot_q = deque()                      # released, sim-validated cmds pending on robot
         # Substep-by-substep release buffer: each successful validate_and_stage APPENDS its
-        # sim-achieved substeps here ("ready to release"). release_next_substep / release_remaining_substeps
-        # move substeps from here onto _robot_q, which _release_loop hands to trajectory_tracking_control.
+        # sim-achieved substeps here ("ready to release"). release_n_substeps / release_remaining_substeps
+        # move substeps from here onto the pipeline queue, which _release_loop hands to the controller.
         self._staged_release = deque()               # [(q7_achieved, grip)] validated, awaiting release
         self._release_thread = None
-        self._estop = threading.Event()              # latched stop for the release path (C3)
         self._last_good_arm14 = None                 # last finite 14-joint read (observation anchor)
 
         # Camera subscriptions are owned by a CameraHub (its own lock; one SDK camera object per
@@ -219,8 +239,7 @@ class HumanoidEnv:
         # comes from the temporal ensemble (TE_* in inference_controller).
         self.command_lifetime = command_lifetime
 
-        # ---- shared state (replaces robot_info.lock + scattered GUI buffers) ----
-        self._lock = threading.Lock()
+        # ---- shared state (self._lock is created above, before the pipeline, so both share it) ----
         self._log_ts = {}                                      # key -> last monotonic print time (throttling)
         # Producer-side observation (#3): rolling dual-arm EE-pose / gripper buffers + freshness +
         # get_obs/inf_ready live in the ObsCollector. The collect thread feeds it one ingest() per
@@ -228,25 +247,15 @@ class HumanoidEnv:
         self.obs = ObsCollector(
             self.solver, INFERENCE_CAMERAS, AGENT_CAMERA, HAND_CAMERA_LEFT, HAND_CAMERA_RIGHT,
             STALE_TIMEOUT)
-        # Master row clock (the robot's own execution timeline, in policy-row units, independent of
-        # wall-clock). _release_loop advances _current_row_id as substeps dispatch; _collect_loop
-        # snapshots it into the obs (obs._obs_row_id) so each prediction is anchored to the row the
-        # arm was actually on. Alignment (ensemble + ramp ingest) is keyed on this, not time.
-        self._current_row_id = 0
-        # Highest master id currently sitting in _robot_q (append_actions' streaming buffer cursor).
-        # -1 = nothing queued; reset to -1 whenever the queue is force-cleared (E-stop) so the next
-        # append re-anchors to the live clock instead of leaving a hole in the id stream.
-        self._queued_through = -1
+        # Master row clock (self.pipeline._current_row_id) + streaming cursor (._queued_through) + the
+        # robot queue live in the pipeline; _release_loop advances the clock as substeps dispatch and
+        # _collect_loop snapshots it (via the self._current_row_id property) into the obs so each
+        # prediction is anchored to the row the arm was actually on. Alignment is keyed on this, not time.
 
-        # LIVE-TUNABLE execution knobs (overridable from the GUI). Defaults come from timing.py.
-        #   speed_scale      -> substeps_per_row (= K) and ramp_joint_step (recomputed together).
-        #   append_ahead_rows -> how many rows append_actions keeps queued ahead of the clock.
-        # substeps_per_row is the SINGLE source for both the sim expansion (passed into sim.validate)
-        # and the master-id tagging (K), so they can never diverge when speed_scale changes live.
+        # LIVE-TUNABLE execution knobs. speed_scale is env-owned (set_speed_scale recomputes the
+        # pipeline's substeps_per_row (= K) + ramp_joint_step from it); substeps_per_row / ramp_joint_step
+        # / append_ahead_rows are owned by the pipeline and reached via the delegating properties below.
         self.speed_scale = SPEED_SCALE
-        self.substeps_per_row = SUBSTEPS_PER_ROW
-        self.ramp_joint_step = RAMP_JOINT_STEP
-        self.append_ahead_rows = APPEND_AHEAD_ROWS
 
         # Episode recording is delegated to a Recorder (owns its own lock + session state +
         # disk I/O). It reads arm joints via the robot and reuses this env's status-frame pose
@@ -436,25 +445,25 @@ class HumanoidEnv:
         """True when no preview actions are pending (used by runners to detect drain)."""
         return self.preview.queue_empty()
 
-    # ===================== chunk IK-solve + sim-validation (delegated to ChunkPlanner) =====================
+    # ===================== chunk IK-solve + sim-validation (delegated to the pipeline) =====================
     def _solve_chunk_ik(self, action_chunk, seed_q, skip_unreachable=False):
         """Solve IK for an ENTIRE chunk (workspace check H4 + orientation smoothing H3 + dual-arm IK
-        with nominal-posture fallback) on the caller's thread. Delegated to ChunkPlanner; returns
+        with nominal-posture fallback) on the caller's thread. Delegated to the pipeline; returns
         (configs, ok, reason) with configs = [(q14, [gl,gr]), ...] for the sim to validate."""
-        return self.planner.solve_chunk_ik(action_chunk, seed_q, skip_unreachable=skip_unreachable)
+        return self.pipeline.solve_chunk_ik(action_chunk, seed_q, skip_unreachable=skip_unreachable)
 
     def _validate_chunk(self, configs, seed_q, fast=False, substeps_per_row=None):
         """Run PRE-SOLVED configs through self.sim from seed_q (substep + self-collision + joint
         readback) -> (traj, ok, reason), traj = sim-ACHIEVED [(q14, grip), ...]. The single
         validation primitive shared by manual validate_and_stage and auto-inference. Owns the
-        no-sim / empty-chunk guards (env owns the sim); the kinematic check is ChunkPlanner's.
+        no-sim / empty-chunk guards (env owns the sim); the kinematic check is the pipeline's.
         substeps_per_row: the SAME K the caller uses for master-id tagging; None -> current value."""
         if self.sim is None:
             return [], False, "no sim running — press 启动仿真预览 first"
         if not configs:
             return [], False, "empty action chunk"
         K = self.substeps_per_row if substeps_per_row is None else substeps_per_row
-        return self.planner.validate_chunk(self.sim, configs, seed_q, K, fast=fast)
+        return self.pipeline.validate_chunk(self.sim, configs, seed_q, K, fast=fast)
 
     def calibrate_collisions(self, action_chunk):
         """Learn this coarse URDF's inherent self-collision overlaps from a KNOWN-SAFE action
@@ -568,8 +577,8 @@ class HumanoidEnv:
         if arm14 is None:
             print("[HumanoidEnv] release refused: cannot read arm_joint_states (ramp-in start).")
             return 0
-        ramp = self._ramp(arm14, traj[0][0], self.ramp_joint_step, traj[0][1])   # C5 ramp-in (both arms)
-        full = self._subdivide_points(ramp + traj)       # <= MAX_JOINT_STEP for the live per-tick drain
+        ramp = self.pipeline._ramp(arm14, traj[0][0], self.ramp_joint_step, traj[0][1])  # C5 ramp-in
+        full = self.pipeline._subdivide_points(ramp + traj)   # <= MAX_JOINT_STEP for the per-tick drain
         with self._lock:
             self._robot_q.clear()
             self._robot_q.extend(full)
@@ -595,16 +604,10 @@ class HumanoidEnv:
                 for (q, g) in items]
 
     def robot_q_preview(self, n=10):
-        """The next up-to-n commands queued for the robot (_robot_q) as (7-joint array, grip)
-        pairs (copies), in execution order. This is the buffer the AUTO-inference path appends to
-        (append_actions) and the release loop drains, so it reflects upcoming real motion in BOTH
-        manual-release and auto-inference modes — unlike staged_preview, which only sees the manual
-        pre-release buffer. _robot_q items are (q14, [gl, gr][, row_id]); grip may be None on a ramp
-        substep, passed through as None for the caller to render. Cheap snapshot under the lock."""
-        with self._lock:
-            items = list(self._robot_q)[:n]
-        return [(np.asarray(sub[0], dtype=np.float64).copy(),
-                 (None if sub[1] is None else [float(sub[1][0]), float(sub[1][1])])) for sub in items]
+        """The next up-to-n commands queued for the robot as (14-joint array, grip) pairs (copies), in
+        execution order. Reflects upcoming real motion in BOTH manual-release and auto-inference modes.
+        Delegated to the pipeline (which owns the queue)."""
+        return self.pipeline.robot_q_preview(n)
 
     def release_n_substeps(self, n):
         """Release up to N staged substeps to the robot: pops the next n from the ready-to-release
@@ -671,158 +674,26 @@ class HumanoidEnv:
             # queue itself clean.
             anchor = (np.asarray(self._robot_q[-1][0], dtype=np.float64)
                       if self._robot_q else arm14)
-            ramp = self._ramp(anchor, subs[0][0], self.ramp_joint_step, subs[0][1])
+            ramp = self.pipeline._ramp(anchor, subs[0][0], self.ramp_joint_step, subs[0][1])
             full = ramp + list(subs)[1:]                 # ramp's last point IS subs[0]
-            self._robot_q.extend(self._subdivide_points(full))
+            self._robot_q.extend(self.pipeline._subdivide_points(full))
             staged_substep_remaining = len(self._staged_release)
         print(f"[HumanoidEnv] queued {len(full)} cmd(s) to robot ({staged_substep_remaining} substep(s) still staged).")
         return len(full)
 
-    # ===================== auto-inference: validate + master-ID ramp ingest (no manual accept) =====================
+    # ===================== auto-inference: validate + master-ID splice (delegated to the pipeline) =====================
     def auto_ingest_chunk(self, action_chunk, obs_step_id):
-        """Auto-inference entry point: validate a predicted chunk on the preview sim (the SAME
-        sim-before-robot self-collision check the manual path uses) and, on success, REPLACE the
-        live robot queue with a fresh ramp-in from the arm's current pose to the chunk's still-future
-        rows, ALIGNED by the master row id `obs_step_id` (the row the arm was on when this chunk's
-        obs was sampled). Row j of the chunk targets master id obs_step_id + j; we execute only the
-        rows the arm has NOT yet passed (id >= the current row id), so the part the inference latency
-        already overtook is dropped. No shape-match splice — once alignment is exact (master id), a
-        plain ramp from the live pose is enough. Refused while E-stopped / without a sim. Validation
-        failure or a fully-elapsed chunk just skips this inference. Returns (ok, reason)."""
-        if not self._real:
-            return False, "env built with real=False"
-        if self.sim is None:
-            return False, "no sim running — launch the preview first"
-        if self._estop.is_set():
-            return False, "E-stop latched"
-        # Seed IK + validation from a FRESH real left-arm read so the self-collision check and IK
-        # plan from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
-        arm14 = self._read_arm14()                        # read outside the lock (DDS I/O)
-        seed = arm14 if arm14 is not None else self._last_q14      # 14-vec dual seed
-        # Solve IK for the chunk OUTSIDE the sim job (pure Pinocchio, caller's thread), then run
-        # the resulting joint configs through the sim for the kinematic self-collision check.
-        configs, ok, reason = self._solve_chunk_ik(action_chunk, seed)
-        if not ok:
-            return False, reason
-        K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
-        traj, ok, reason = self._validate_chunk(configs, seed, fast=True, substeps_per_row=K)
-        if not ok or not traj:
-            return False, reason or "empty validated trajectory"
-        # Tag each validated substep with its ABSOLUTE master row id. _validate_impl emits traj[0]
-        # for row 0 and then K substeps per subsequent row, so substep s belongs to
-        # row 0 (s==0) else ceil(s / K); its master id = obs_step_id + that row. q14 = both arms;
-        # grip = [gl, gr].
-        tagged = [(np.asarray(q14, dtype=np.float64), grip,
-                   int(obs_step_id) + (0 if s == 0 else int(np.ceil(s / K))))
-                  for s, (q14, grip) in enumerate(traj)]
-        with self._lock:
-            cur = self._current_row_id
-            kept = [t for t in tagged if t[2] >= cur]      # drop rows the arm already passed
-            if not kept:
-                return False, (f"chunk fully elapsed (obs_row {obs_step_id}, now {cur})")
-            # Ramp from the live pose to the first future row, then follow the rest. The ramp's
-            # substeps carry that row's id so the clock reads correctly while catching up. Read the
-            # start pose FRESH inside the lock: validation took time during which the release loop
-            # drained substeps, so the arm14 read before it is stale — ramping from it would inject a
-            # >cap jump from where the arm actually is to the ramp's start. Holding the lock keeps the
-            # release loop from advancing between this read and the queue swap.
-            live = self._read_arm14()
-            start = live if live is not None else kept[0][0]   # 14-vec both-arm start pose
-            fq, fg, fid = kept[0]
-            ramp = [(q, g, fid) for (q, g) in self._ramp(start, fq, self.ramp_joint_step, fg)]
-            self._robot_q.clear()
-            self._robot_q.extend(ramp + kept[1:])          # ramp ends AT kept[0]
-            qlen = len(self._robot_q)
-            self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
-        if self._throttled("auto_ramp", 1.0):
-            print(f"[HumanoidEnv] auto-ramp: obs_row={obs_step_id}, now={cur}, "
-                  f"kept={len(kept)}/{len(tagged)} (+{len(ramp)} ramp) -> queue {qlen}")
-        return True, ""
-    
+        """Auto-inference entry point (queue-REPLACE variant): validate a predicted chunk on the
+        preview sim and, on success, replace the live robot queue with a fresh ramp-in from the arm's
+        current pose to the chunk's still-future rows, aligned by master row id. Delegated to the
+        pipeline (which owns the queue + the splice); returns (ok, reason)."""
+        return self.pipeline.auto_ingest_chunk(action_chunk, obs_step_id)
+
     def append_actions(self, action_chunk, obs_step_id, n_rows=None):
         """Streaming auto-inference entry point: keep n_rows policy rows queued ahead of the master
-        clock, appending only the ids not yet queued. _queued_through tracks the highest master id in
-        the queue, so the append window is just [_queued_through+1 .. clock+n_rows]; in the steady
-        state the clock has advanced by one row since the last call and exactly ONE new row is added.
-        Rows are only ever appended (never cleared) and the release loop only ever pops the head, so
-        the arm runs one master id at a time, in order — overlapping chunks can't re-queue or reorder
-        a row. Substeps are tagged with their absolute master id; the release loop advances the clock
-        from the popped tag. Refused while E-stopped / without a sim. ok=True with a no-op reason when
-        the buffer is already full or the chunk doesn't cover the next needed id."""
-        if not self._real:
-            return False, "env built with real=False"
-        if self.sim is None:
-            return False, "no sim running — launch the preview first"
-        if self._estop.is_set():
-            return False, "E-stop latched"
-        if n_rows is None:
-            n_rows = self.append_ahead_rows                 # live-tunable commit-ahead distance
-        with self._lock:
-            cur = self._current_row_id
-            start_id = max(self._queued_through + 1, cur)   # first master id not yet queued
-            # Continuity seed: continue from the queue TAIL (where these rows attach), not the arm's
-            # transient live pose. None -> queue empty, read the live pose below.
-            seed = (np.asarray(self._robot_q[-1][0], dtype=np.float64).copy()
-                    if self._robot_q else None)
-        last_id = cur + n_rows                              # keep n_rows rows queued ahead of clock
-        if start_id > last_id:
-            return True, f"buffer full (queued through {start_id - 1}, clock {cur})"
-        # Slice THIS chunk to the rows covering [start_id, last_id]. A chunk that starts AFTER
-        # start_id can't fill the next needed id without leaving a hole in the id stream -> skip it.
-        lo = start_id - int(obs_step_id)
-        if lo < 0:
-            return True, f"chunk starts at {obs_step_id}, past next needed id {start_id} — skipped"
-        hi = min(last_id - int(obs_step_id), len(action_chunk) - 1)
-        if hi < lo:
-            return True, "chunk does not reach the append window"
-
-        if seed is None:                                    # queue empty -> continue from live pose
-            arm14 = self._read_arm14()
-            seed = arm14 if arm14 is not None else self._last_q14   # 14-vec dual seed
-        configs, ok, reason = self._solve_chunk_ik(action_chunk[lo:hi + 1], seed)
-        if not ok:
-            return False, reason
-        K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
-        traj, ok, reason = self._validate_chunk(configs, seed, fast=True, substeps_per_row=K)
-        if not ok or not traj:
-            return False, reason or "empty validated trajectory"
-        # Tag substeps with absolute master ids: traj[0] is the slice's first row (start_id), then
-        # K substeps per subsequent row.
-        tagged = [(np.asarray(q14, dtype=np.float64), grip,     # q14 = both arms; grip = [gl, gr]
-                   start_id + (0 if s == 0 else int(np.ceil(s / K))))
-                  for s, (q14, grip) in enumerate(traj)]
-        with self._lock:
-            cur = self._current_row_id
-            # Validation took time; drop any row the clock has since passed or that's already queued.
-            new = [t for t in tagged if t[2] >= cur and t[2] > self._queued_through]
-            if not new:
-                return True, f"fell behind during validation (clock now {cur})"
-            # Seam ramp: bridge the queue tail (or live pose when idle) to the first new row at the
-            # SPEED_SCALE'd cruise step (RAMP_JOINT_STEP), tagged with that row's id. C1 at BOTH ends
-            # by matching the endpoint per-substep velocities (= consecutive waypoints):
-            #   v_in  = how the queue tail is already moving (last two queued substeps)
-            #   v_out = how the new rows want to start (first two substeps of the validated slice)
-            # so the splice has no velocity step, not just no position step. Falls back to a plain
-            # (position-only) ramp at the queue start, or when the slice is a single row (no v_out).
-            seam_from = (np.asarray(self._robot_q[-1][0], dtype=np.float64)
-                         if self._robot_q else seed)
-            fq, fg, fid = new[0]
-            if len(self._robot_q) >= 2 and len(new) >= 2:
-                v_in = np.asarray(self._robot_q[-1][0], dtype=np.float64) - \
-                       np.asarray(self._robot_q[-2][0], dtype=np.float64)
-                v_out = np.asarray(new[1][0], dtype=np.float64) - np.asarray(fq, dtype=np.float64)
-                bridge = self._hermite_ramp(seam_from, fq, v_in, v_out, self.ramp_joint_step)
-            else:
-                bridge = [q for q, _g in self._ramp(seam_from, fq, self.ramp_joint_step, fg)]
-            ramp = [(q, fg, fid) for q in bridge]
-            self._robot_q.extend(ramp + new[1:])    # ramp ends AT new[0]; queue is NEVER cleared
-            self._queued_through = new[-1][2]
-            qlen = len(self._robot_q)
-            self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
-        if len(ramp) > 0 or self._throttled("append", 1.0):     # always show seam ramps; else 1/s
-            print(f"[HumanoidEnv] append: obs_row={obs_step_id}, clock={cur}, "
-                  f"appended ids {new[0][2]}..{new[-1][2]} (+{len(ramp)} ramp) -> queue {qlen}")
-        return True, ""
+        clock, appending only the not-yet-queued ids with a velocity-matched seam ramp. Delegated to
+        the pipeline (which owns the queue + the splice); returns (ok, reason)."""
+        return self.pipeline.append_actions(action_chunk, obs_step_id, n_rows=n_rows)
 
     def lock_robot(self):
         """E-STOP (latched). Drop pending robot commands and ACTIVELY hold the arm at its
@@ -881,62 +752,72 @@ class HumanoidEnv:
         return self.speed_scale, self.substeps_per_row
 
     def queue_status(self):
-        """(current_row_id, queued_through) read atomically under the lock. The inference
-        controller uses this to split its smoothed buffer into the FROZEN region (id <=
-        queued_through, already committed to the robot) and the MUTABLE region (id >
-        queued_through, still re-smoothable), and to know the live clock for pruning."""
-        with self._lock:
-            return self._current_row_id, self._queued_through
+        """(current_row_id, queued_through) — the live master clock + streaming cursor. Delegated to
+        the pipeline (which owns them). The inference controller uses this to split its smoothed buffer
+        into the FROZEN (id <= queued_through) and MUTABLE (id > queued_through) regions."""
+        return self.pipeline.queue_status()
 
     def set_seed(self, q7):
         """Set the sim-preview IK warm-start seed (e.g. to the robot's current left-arm joints).
         Delegated to the SimPreview, which owns that seed."""
         self.preview.set_seed(q7)
 
-    @staticmethod
-    def _ramp(q_from, q_to, cap, grip):
-        """Joint-space ramp from q_from to q_to with every step <= cap (rad). Includes q_to,
-        excludes q_from. Used so the first released command starts at the current pose (C5)."""
-        q_from = np.asarray(q_from, dtype=np.float64)
-        q_to = np.asarray(q_to, dtype=np.float64)
-        n = int(np.ceil(np.max(np.abs(q_to - q_from)) / cap))
-        n = max(n, 1)
-        # grip is carried opaquely (a [gl, gr] pair for dual-arm release, or None); do NOT coerce.
-        return [(q_from + (q_to - q_from) * (i / n), grip) for i in range(1, n+1)]
-        # this gives the points that provides a smooth transition BETWEEN q_from and q_to (incl. q_to)
+    # ------------------------------------------------------------------ #
+    #  Delegating accessors: the robot queue + master clock + streaming    #
+    #  cursor + dual IK seed + execution knobs live in self.pipeline. These #
+    #  keep the env's (and tests'/GUI's) existing attribute API working.    #
+    # ------------------------------------------------------------------ #
+    @property
+    def _robot_q(self):
+        return self.pipeline._robot_q            # the deque itself (mutated in place under self._lock)
 
-    @staticmethod
-    def _hermite_ramp(q_from, q_to, v_from, v_to, cap):
-        """Velocity-matched seam bridge: a cubic Hermite q_from -> q_to (excl. q_from, incl. q_to)
-        whose endpoint per-substep velocities are v_from (how the arm is already moving INTO the seam)
-        and v_to (how the next rows want to START). Unlike _ramp (linear, constant velocity, so its
-        velocity STEPS at both ends), this is C1 at both ends -> no jerk spike at the splice.
+    @property
+    def _current_row_id(self):
+        return self.pipeline._current_row_id
 
-        v_from / v_to are per-substep joint deltas (= consecutive waypoints q[i]-q[i-1]); the release
-        loop drains one point per STEP_TIME, so a per-substep delta IS the joint velocity in these
-        units. Step count n is sized so neither the per-substep POSITION step nor the per-substep
-        VELOCITY change exceeds `cap` (the latter an implicit acceleration bound), then grown if the
-        sampled cubic peaks over the position cap. When positions ~coincide but velocities differ the
-        curve bulges to swing the velocity around; the cruise-speed tangents keep that bulge tiny."""
-        q_from = np.asarray(q_from, dtype=np.float64); q_to = np.asarray(q_to, dtype=np.float64)
-        v_from = np.asarray(v_from, dtype=np.float64); v_to = np.asarray(v_to, dtype=np.float64)
-        pos_span = float(np.max(np.abs(q_to - q_from)))
-        vel_jump = float(np.max(np.abs(v_to - v_from)))
-        n = max(int(np.ceil(pos_span / cap)), int(np.ceil(vel_jump / cap)), 1)
-        for _ in range(5):                                 # grow n until the curve respects the pos cap
-            m0, m1 = v_from * n, v_to * n                  # unit-parameter tangents (per-substep * span)
-            out, prev, worst = [], q_from, 0.0
-            for i in range(1, n + 1):
-                s = i / n
-                q = ((2*s**3 - 3*s**2 + 1) * q_from + (s**3 - 2*s**2 + s) * m0 +
-                     (-2*s**3 + 3*s**2) * q_to + (s**3 - s**2) * m1)
-                worst = max(worst, float(np.max(np.abs(q - prev))))
-                out.append(q)
-                prev = q
-            if worst <= cap + 1e-9:
-                return out
-            n *= 2
-        return out
+    @_current_row_id.setter
+    def _current_row_id(self, v):
+        self.pipeline._current_row_id = v
+
+    @property
+    def _queued_through(self):
+        return self.pipeline._queued_through
+
+    @_queued_through.setter
+    def _queued_through(self, v):
+        self.pipeline._queued_through = v
+
+    @property
+    def _last_q14(self):
+        return self.pipeline._last_q14
+
+    @_last_q14.setter
+    def _last_q14(self, v):
+        self.pipeline._last_q14 = v
+
+    @property
+    def substeps_per_row(self):
+        return self.pipeline.substeps_per_row
+
+    @substeps_per_row.setter
+    def substeps_per_row(self, v):
+        self.pipeline.substeps_per_row = v
+
+    @property
+    def ramp_joint_step(self):
+        return self.pipeline.ramp_joint_step
+
+    @ramp_joint_step.setter
+    def ramp_joint_step(self, v):
+        self.pipeline.ramp_joint_step = v
+
+    @property
+    def append_ahead_rows(self):
+        return self.pipeline.append_ahead_rows
+
+    @append_ahead_rows.setter
+    def append_ahead_rows(self, v):
+        self.pipeline.append_ahead_rows = v
 
     def _read_arm14(self):
         """Return a finite 14-vector of arm joints, caching the last good read. Falls back to
@@ -962,25 +843,24 @@ class HumanoidEnv:
             self._stop_event.wait(self.dt)
 
     def _release_loop(self):
-        """The ONLY driver of real-robot motion. Drains self._robot_q ONE substep per STEP_TIME,
-        LIVE (popleft under the lock each tick), so an auto-inference splice into the queue takes
-        effect on the very next tick. Substeps are pre-subdivided to <= MAX_JOINT_STEP at
-        enqueue/splice time, so per-tick streaming stays velocity-bounded (C5). Each substep is its
-        own single-waypoint trajectory, so an E-stop halts the arm within ~STEP_TIME (C3)."""
+        """The ONLY driver of real-robot motion. Drains the pipeline's robot queue ONE substep per
+        STEP_TIME via pipeline.pop_next_substep (which pops under the shared lock and advances the
+        master clock), so an auto-inference splice into the queue takes effect on the very next tick.
+        Substeps are pre-subdivided to <= MAX_JOINT_STEP at enqueue/splice time, so per-tick streaming
+        stays velocity-bounded (C5). Each substep is its own single-waypoint trajectory, so an E-stop
+        halts the arm within ~STEP_TIME (C3). The env is the CONSUMER; the pipeline is the producer."""
         while not self._stop_event.is_set():
             if self._estop.is_set():
                 self._stop_event.wait(STEP_TIME)
                 continue
-            with self._lock:
-                sub = self._robot_q.popleft() if self._robot_q else None
+            sub = self.pipeline.pop_next_substep()       # pops + advances the master clock under the lock
             if sub is None:
                 self._stop_event.wait(STEP_TIME)
                 continue
-            # Advance the master row clock to the row this substep realizes (auto path tags a row id
-            # as the 3rd element; the manual release path is a 2-tuple and leaves the clock alone).
+            # The master row this substep realized (auto path tags a row id as the 3rd element; the
+            # manual release path is a 2-tuple). pop_next_substep already advanced the clock; we read
+            # the id here only for the diagnostic recorders below.
             row_id = int(sub[2]) if len(sub) > 2 and sub[2] is not None else None
-            if row_id is not None:
-                self._current_row_id = row_id
 
             # Diagnostic recorders (debug aid; NEVER allowed to kill the release loop — this is the
             # ONLY robot-motion driver). Recorder 1: the exact substep popped/dispatched this tick —
@@ -1100,24 +980,8 @@ class HumanoidEnv:
                 self._stop_event.wait(STEP_TIME)             # pace; interruptible by stop_event
         return True
 
-    @staticmethod
-    def _subdivide_points(points):
-        """Insert linearly-interpolated LEFT-arm waypoints so every consecutive gap <= MAX_JOINT_STEP
-        (C5 velocity bound under trajectory control). grip carries from each segment's target point.
-        A single point (or already-fine spacing) passes through unchanged."""
-        pts = list(points)
-        if len(pts) < 2:
-            return pts
-        out = [pts[0]]
-        prev = np.asarray(pts[0][0], dtype=np.float64)
-        for q, grip in pts[1:]:
-            q = np.asarray(q, dtype=np.float64)
-            d = q - prev
-            n = max(int(np.ceil(np.max(np.abs(d)) / MAX_JOINT_STEP)), 1) if MAX_JOINT_STEP > 0 else 1
-            for i in range(1, n + 1):
-                out.append((prev + d * (i / n), grip))
-            prev = q
-        return out
+    # _subdivide_points, _ramp, _hermite_ramp now live in the pipeline (real_world.postprocess); the
+    # manual-release path calls self.pipeline._subdivide_points / self.pipeline._ramp.
 
     # ===================== data-collection recording (delegated to Recorder) =====================
     def start_recording(self, episode_name=None):

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_safety_invariants as T                                              # noqa: E402
-import real_world.planner as planner_mod                                        # noqa: E402
+import real_world.postprocess as planner_mod                                    # noqa: E402 (workspace envelopes live here now)
 from real_world.humanoid_env import HumanoidEnv, MAX_JOINT_STEP, SUBSTEPS_PER_ROW  # noqa: E402
 from real_world.sim_backend import SimEnv                                       # noqa: E402
 
@@ -173,18 +173,18 @@ def test_ensemble_by_id(verbose=True):
     """E1: the master-id temporal ensemble (_rebuild_buffer -> _materialize) averages rows sharing
     an absolute master id (recency-weighted), passes non-overlapping rows through unchanged, and
     re-binarises the gripper. Radius 0 isolates the cross-chunk average from the along-id Gaussian."""
-    from real_world.inference_controller import InferenceController, TE_M, TE_SIGMA
-    ctl = InferenceController(env=object())              # only the ensemble buffers are exercised
-    ctl.set_smoothing(radius=0, sigma=TE_SIGMA, m=TE_M)  # disable along-id smoothing -> pure per-id avg
+    from real_world.postprocess import PostProcessor, TE_M, TE_SIGMA
+    pp = PostProcessor()                                 # the merge lives here now (no env needed)
+    pp.set_smoothing(radius=0, sigma=TE_SIGMA, m=TE_M)   # disable along-id smoothing -> pure per-id avg
     n = 8
     # chunk A anchored at id 0; chunk B (newest) at id 3. col 0 encodes the row value; gripper col 9:
     # A all closed (1), B all open (0) -> tests linear avg + gripper re-binarisation.
     a = np.zeros((n, 10)); a[:, 0] = 100 + np.arange(n); a[:, 9] = 1.0
     b = np.zeros((n, 10)); b[:, 0] = np.arange(n);       b[:, 9] = 0.0
-    ctl._te_buffer.append((0, a.copy()))
-    ctl._te_buffer.append((3, b.copy()))
-    ctl._rebuild_buffer(queued_through=-1)               # nothing frozen -> rebuild all ids
-    base_id, buf = ctl._materialize()                    # contiguous run master_id 0..10
+    pp._te_buffer.append((0, a.copy()))
+    pp._te_buffer.append((3, b.copy()))
+    pp._rebuild_buffer(queued_through=-1)                # nothing frozen -> rebuild all ids
+    base_id, buf = pp._materialize()                     # contiguous run master_id 0..10
     assert base_id == 0, f"E1: base id {base_id} != 0"
     # master id 8 -> only B covers it (B row 5 = 5) -> identity (no averaging).
     assert np.allclose(buf[8], b[5]), "E1: non-overlapping row should be identity"
