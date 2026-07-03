@@ -48,9 +48,9 @@ def pos_in_workspace(pos, side="left"):
 
 
 def load_nominal_config():
-    """Nominal per-arm training posture (real_world/nominal_arm_config.json) as a 14-vec
+    """Nominal per-arm training posture (real_world/config/nominal_arm_config.json) as a 14-vec
     [left7, right7] — the IK FALLBACK seed. Zeros if the file is absent (fallback disabled-ish)."""
-    path = pathlib.Path(__file__).parent / "nominal_arm_config.json"
+    path = pathlib.Path(__file__).parent / "config" / "nominal_arm_config.json"
     try:
         d = json.loads(path.read_text())
         return np.asarray(list(d["left"]) + list(d["right"]), dtype=np.float64)

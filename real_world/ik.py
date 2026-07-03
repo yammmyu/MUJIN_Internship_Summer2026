@@ -40,11 +40,12 @@ DEFAULT_URDF = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "assets", "A2D_Omnipicker", "A2D.urdf",
 )
-DEFAULT_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fk_calibration.json")
+# FK calibration + nominal-posture config live under real_world/config/.
+_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+DEFAULT_CALIBRATION = os.path.join(_CONFIG_DIR, "fk_calibration.json")
 # Right-arm FK calibration (mirror of the left, produced by scripts/fk_consistency_check.py --side
 # right). Separate file so each arm carries its own base_offset / ee_frame / joint-slice.
-DEFAULT_CALIBRATION_RIGHT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "fk_calibration_right.json")
+DEFAULT_CALIBRATION_RIGHT = os.path.join(_CONFIG_DIR, "fk_calibration_right.json")
 
 LEFT_ARM_JOINTS = ["Joint1_l", "Joint2_l", "Joint3_l", "Joint4_l",
                    "Joint5_l", "Joint6_l", "Joint7_l"]
