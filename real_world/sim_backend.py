@@ -313,22 +313,6 @@ class SimEnv:
             p.stepSimulation()
             time.sleep(self.sim_dt)
 
-    # cached view/projection keyed by (w, h) so we don't rebuild the matrices every frame
-    _RENDER_CAM = dict(eye=[1.15, -0.95, 1.35], target=[0.20, 0.0, 0.95], up=[0, 0, 1], fov=60.0)
-
-    def render(self, width=320, height=240):
-        """Off-screen RGB snapshot (H, W, 3) uint8 of the current sim pose, via the CPU TinyRenderer
-        (works headless, direct=True). Owning-thread only (like step). Lets the GUI show the preview
-        as an in-window tile instead of opening a separate PyBullet OpenGL window."""
-        width = max(64, int(width)); height = max(48, int(height))
-        c = self._RENDER_CAM
-        view = p.computeViewMatrix(c["eye"], c["target"], c["up"])
-        proj = p.computeProjectionMatrixFOV(c["fov"], width / height, 0.05, 6.0)
-        _, _, rgba, _, _ = p.getCameraImage(width, height, view, proj,
-                                            renderer=p.ER_TINY_RENDERER)
-        rgb = np.reshape(np.asarray(rgba, dtype=np.uint8), (height, width, 4))[:, :, :3]
-        return np.ascontiguousarray(rgb)
-
     def _cur_arm_q(self):
         return np.array([p.getJointState(self.body, k)[0] for k in self.arm_idx])
 

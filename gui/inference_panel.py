@@ -175,6 +175,13 @@ class InferenceMixin:
     # ------------------------------------------------------------------ #
     #  平滑参数（实时可调）                                                 #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _bind_spinbox_apply(spinbox, apply_fn):
+        """ttk.Spinbox 的 command 只在点箭头时触发，键入数值不会。补绑回车/失焦，让手动键入的值
+        也能应用（否则输入后无反应，像“按钮/控件失灵”）。"""
+        spinbox.bind("<Return>", lambda _e: apply_fn())
+        spinbox.bind("<FocusOut>", lambda _e: apply_fn())
+
     def _apply_smoothing(self, *_, announce=True):
         """Read the smoothing widgets (radius/σ/m/buffer) and push them to the inference controller
         live. Tolerates a partially-typed Spinbox value (TclError) by ignoring that update.
@@ -492,6 +499,7 @@ class InferenceMixin:
         ttk.Label(grid, text="TE 半径 (radius):", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
         self._tuning_widgets.append(ttk.Spinbox(grid, from_=0, to=8, increment=1, width=6,
                     textvariable=self._sm_radius_var, command=self._apply_smoothing))
+        self._bind_spinbox_apply(self._tuning_widgets[-1], self._apply_smoothing)  # 键入回车/失焦也应用
         self._tuning_widgets[-1].grid(row=1, column=2, sticky="e", padx=4)
 
         # TE σ：窗口内高斯形状。越大窗口内平滑越强（建议 <= radius）。
@@ -511,6 +519,7 @@ class InferenceMixin:
         self._sm_buflen_var = tk.IntVar(value=self.inference.te_buffer_len)
         self._tuning_widgets.append(ttk.Spinbox(grid, from_=1, to=16, increment=1, width=6,
                     textvariable=self._sm_buflen_var, command=self._apply_smoothing))
+        self._bind_spinbox_apply(self._tuning_widgets[-1], self._apply_smoothing)  # 键入回车/失焦也应用
         self._tuning_widgets[-1].grid(row=4, column=2, sticky="e", padx=4)
 
         self._sm_readout_var = tk.StringVar()
@@ -536,6 +545,7 @@ class InferenceMixin:
         self._ex_ahead_var = tk.IntVar(value=self.env.append_ahead_rows)
         self._tuning_widgets.append(ttk.Spinbox(egrid, from_=1, to=20, increment=1, width=6,
                     textvariable=self._ex_ahead_var, command=self._apply_exec_knobs))
+        self._bind_spinbox_apply(self._tuning_widgets[-1], self._apply_exec_knobs)  # 键入回车/失焦也应用
         self._tuning_widgets[-1].grid(row=1, column=2, sticky="e", padx=4)
 
         self._ex_readout_var = tk.StringVar()

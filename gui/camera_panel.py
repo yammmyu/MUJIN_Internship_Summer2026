@@ -30,7 +30,6 @@ class CameraMixin:
             "hand_left": "左手相机",
             "hand_right": "右手相机",
             "head_center_fisheye": "头部鱼眼相机",
-            "sim": "仿真预览",         # in-window PyBullet preview, shown as a camera-style tile
         }
 
         # ---- 相机勾选条：选择要显示的相机 ----
@@ -78,11 +77,11 @@ class CameraMixin:
         """按显示区的 **实际** 可用尺寸与当前网格规模，算出保持 4:3 的单格图像尺寸，写入
         self.camera_tile_size（相机线程/仿真渲染下一帧据此缩放）。不再依赖“窗口宽减固定偏移”的
         魔数，故开关相机与缩放窗口都能正确自适应。area_w/h 缺省时读取显示区当前尺寸。"""
-        tiles = self._display_tiles()
-        if not tiles:
+        selected = self._selected_display_cameras()
+        if not selected:
             self.camera_tile_size = (320, 240)
             return
-        n = len(tiles)
+        n = len(selected)
         ncols = 1 if n == 1 else 2 if n <= 4 else 3
         nrows = math.ceil(n / ncols)
         if area_w is None or area_h is None:
@@ -102,23 +101,16 @@ class CameraMixin:
         tile_h = int(tile_w * 3 / 4)
         self.camera_tile_size = (max(120, tile_w), max(90, tile_h))
 
-    def _display_tiles(self):
-        """要平铺显示的图块（固定顺序）：勾选的真实相机，外加运行中的仿真预览（伪相机 "sim"）。"""
-        tiles = self._selected_display_cameras()
-        if getattr(self, "_sim_frame", None) is not None:
-            tiles = tiles + ["sim"]
-        return tiles
-
     def _rebuild_camera_display(self):
-        """根据勾选的相机（外加运行中的仿真预览）重建显示区：动态网格排版 + 自适应缩放尺寸。"""
-        # 当前要显示的图块（真实相机 + 仿真预览），按固定顺序
-        tiles = self._display_tiles()
+        """根据用户勾选的相机重建显示区：动态网格排版 + 自适应缩放尺寸。"""
+        # 当前选中的相机（按固定顺序）
+        selected = self._selected_display_cameras()
 
         # 同步缓存字典的键：新增的置 None，取消的移除（停止抓取）
-        for name in tiles:
+        for name in selected:
             self.camera_images.setdefault(name, None)
         for name in list(self.camera_images.keys()):
-            if name not in tiles:
+            if name not in selected:
                 self.camera_images.pop(name, None)
 
         # 清空旧控件并重置标签字典
@@ -126,12 +118,12 @@ class CameraMixin:
             child.destroy()
         self.camera_labels = {}
 
-        if not tiles:
+        if not selected:
             self.camera_tile_size = (320, 240)
             return
 
         # 计算网格列数（1→1，2~4→2，5→3）与每格缩放尺寸（按实际显示区尺寸）
-        n = len(tiles)
+        n = len(selected)
         ncols = 1 if n == 1 else 2 if n <= 4 else 3
         nrows = math.ceil(n / ncols)
         self._recompute_tile_size()
@@ -147,7 +139,7 @@ class CameraMixin:
         for r in range(nrows, nrows + 5):
             self.camera_display_area.rowconfigure(r, weight=0, uniform="")
 
-        for idx, name in enumerate(tiles):
+        for idx, name in enumerate(selected):
             r, c = divmod(idx, ncols)
             card = ttk.Frame(self.camera_display_area)
             card.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
@@ -196,13 +188,9 @@ class CameraMixin:
         def update_camera_images():
             while True:
                 try:
-                    for camera_name in self._display_tiles():
-                        # 仿真预览是伪相机：帧来自仿真线程离屏渲染的 self._sim_frame；
-                        # 真实相机则向 env 请求（保活）并取最新帧。首帧/刚开机时可能为 None。
-                        if camera_name == "sim":
-                            image = getattr(self, "_sim_frame", None)
-                        else:
-                            image = self.env.get_frame(camera_name)
+                    for camera_name in self._selected_display_cameras():
+                        # 向 env 请求该相机（保活）并取最新帧；首帧或刚开机时可能为 None
+                        image = self.env.get_frame(camera_name)
                         if image is not None:
                             # 镜像最近一帧（list 结构），供保存图片消费
                             self.camera_images[camera_name] = [image.copy(), image.copy()]
