@@ -449,16 +449,19 @@ class PostProcessor:
             seedL, seedR = qL, qR
         return configs, True, None
 
-    def validate_chunk(self, sim, configs, seed_q, substeps_per_row, fast=False):
+    def validate_chunk(self, sim, configs, seed_q, substeps_per_row, fast=False, seed_gap=False):
         """Run PRE-SOLVED joint configs through `sim` from seed_q (substep + self-collision + joint
-        readback) and return (traj, ok, reason) where traj is the sim-ACHIEVED [(q14, grip), ...]. The
-        single validation primitive shared by the manual validate_and_stage and auto-inference paths.
+        readback) and return (traj, ok, reason, rows): traj is the sim-ACHIEVED [(q14, grip), ...] and
+        rows[i] is the config-row index traj[i] realizes (for exact master-id tagging). The single
+        validation primitive shared by the manual validate_and_stage and auto-inference paths.
         Assumes `sim` is not None and `configs` non-empty (the env wrapper checks both).
         fast=True (auto path): skip the per-substep real-time sleep (operator-preview only).
         substeps_per_row: the SAME K the caller uses for master-id tagging, so a live speed_scale change
-        between expansion and tagging can't desync them."""
+        between expansion and tagging can't desync them.
+        seed_gap=True (streaming append): expand the seed->row0 gap too, so traj is continuous with the
+        queue tail and every row (row 0 included) contributes exactly K substeps."""
         return sim.validate(configs, seed_q, MAX_JOINT_STEP, fast=fast,
-                            substeps_per_row=substeps_per_row)
+                            substeps_per_row=substeps_per_row, seed_gap=seed_gap)
 
     # ------------------------------------------------------------------ #
     #  Stage 5: master-id tagging + seam ramp + subdivide + queue splice    #
@@ -485,35 +488,31 @@ class PostProcessor:
         return [(q_from + (q_to - q_from) * (i / n), grip) for i in range(1, n + 1)]
 
     @staticmethod
-    def _hermite_ramp(q_from, q_to, v_from, v_to, cap):
-        """Velocity-matched seam bridge: a cubic Hermite q_from -> q_to (excl. q_from, incl. q_to)
-        whose endpoint per-substep velocities are v_from (how the arm is already moving INTO the seam)
-        and v_to (how the next rows want to START). Unlike _ramp (linear, constant velocity, so its
-        velocity STEPS at both ends), this is C1 at both ends -> no jerk spike at the splice.
+    def _bridge(q_from, q_to, v_from, v_to, fallback_step, cap):
+        """Velocity-merged seam bridge: a LINEAR joint-space ramp q_from -> q_to (excl. q_from, incl.
+        q_to) whose per-substep speed is the MEAN of the two rows it links — v_from (how the previous
+        row is moving as it ends) and v_to (how the next row starts). The step count is
+        span / merged-speed, so the bridge cruises at the SAME speed as the motion on either side
+        instead of darting at a fixed cap: the seam gains no velocity spike.
 
         v_from / v_to are per-substep joint deltas (= consecutive waypoints q[i]-q[i-1]); the release
         loop drains one point per STEP_TIME, so a per-substep delta IS the joint velocity in these
-        units. Step count n is sized so neither the per-substep POSITION step nor the per-substep
-        VELOCITY change exceeds `cap`, then grown if the sampled cubic peaks over the position cap."""
-        q_from = np.asarray(q_from, dtype=np.float64); q_to = np.asarray(q_to, dtype=np.float64)
-        v_from = np.asarray(v_from, dtype=np.float64); v_to = np.asarray(v_to, dtype=np.float64)
-        pos_span = float(np.max(np.abs(q_to - q_from)))
-        vel_jump = float(np.max(np.abs(v_to - v_from)))
-        n = max(int(np.ceil(pos_span / cap)), int(np.ceil(vel_jump / cap)), 1)
-        for _ in range(5):                                 # grow n until the curve respects the pos cap
-            m0, m1 = v_from * n, v_to * n                  # unit-parameter tangents (per-substep * span)
-            out, prev, worst = [], q_from, 0.0
-            for i in range(1, n + 1):
-                s = i / n
-                q = ((2*s**3 - 3*s**2 + 1) * q_from + (s**3 - 2*s**2 + s) * m0 +
-                     (-2*s**3 + 3*s**2) * q_to + (s**3 - s**2) * m1)
-                worst = max(worst, float(np.max(np.abs(q - prev))))
-                out.append(q)
-                prev = q
-            if worst <= cap + 1e-9:
-                return out
-            n *= 2
-        return out
+        units. Pass None for a side with no motion context (queue < 2 pts, or a single-row slice); the
+        mean is taken over whatever is moving, and `fallback_step` is used only when NEITHER side moves
+        (a hold-to-hold jump). `cap` (MAX_JOINT_STEP) is a SAFETY ceiling — it can only ADD substeps,
+        never speed the bridge up. Returns [q_to] when already there (n collapses to 1)."""
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        span = float(np.max(np.abs(q_to - q_from)))
+        speeds = []
+        for v in (v_from, v_to):
+            if v is not None:
+                s = float(np.max(np.abs(v)))
+                if s > 0.0:
+                    speeds.append(s)
+        cruise = min((sum(speeds) / len(speeds)) if speeds else fallback_step, cap)
+        n = max(1, int(np.ceil(span / cruise)))
+        return [q_from + (q_to - q_from) * (i / n) for i in range(1, n + 1)]
 
     @staticmethod
     def _subdivide_points(points):
@@ -613,13 +612,17 @@ class PostProcessor:
         if not ok:
             return False, reason
         K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
-        traj, ok, reason = self.validate_chunk(sim, configs, seed, K, fast=True)
+        # seed_gap=True: the sim also expands the seed(=queue tail)->row0 gap, so traj is CONTINUOUS
+        # with the tail and every row — row 0 included — contributes its substeps.
+        traj, ok, reason, rows = self.validate_chunk(sim, configs, seed, K, fast=True, seed_gap=True)
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
-        # Tag substeps with absolute master ids: traj[0] is the slice's first row (start_id), then K
-        # substeps per subsequent row.
+        # Tag each substep with its absolute master id from the sim's EXACT per-substep row index
+        # (rows[s] = the config row it realizes): config row j -> master id start_id + j. Using the
+        # returned index (not an s//K guess) keeps alignment exact even if a velocity-capped row emits
+        # more than K substeps.
         tagged = [(np.asarray(q14, dtype=np.float64), grip,     # q14 = both arms; grip = [gl, gr]
-                   start_id + (0 if s == 0 else int(np.ceil(s / K))))
+                   start_id + int(rows[s]))
                   for s, (q14, grip) in enumerate(traj)]
         with self._lock:
             cur = self._current_row_id
@@ -627,31 +630,34 @@ class PostProcessor:
             new = [t for t in tagged if t[2] >= cur and t[2] > self._queued_through]
             if not new:
                 return True, f"fell behind during validation (clock now {cur})"
-            # Seam ramp: bridge the queue tail (or live pose when idle) to the first new row at the
-            # SPEED_SCALE'd cruise step (ramp_joint_step), tagged with that row's id. C1 at BOTH ends by
-            # matching the endpoint per-substep velocities (= consecutive waypoints):
-            #   v_in  = how the queue tail is already moving (last two queued substeps)
-            #   v_out = how the new rows want to start (first two substeps of the validated slice)
-            # so the splice has no velocity step, not just no position step. Falls back to a plain
-            # (position-only) ramp at the queue start, or when the slice is a single row (no v_out).
-            seam_from = (np.asarray(self._robot_q[-1][0], dtype=np.float64)
-                         if self._robot_q else seed)
-            fq, fg, fid = new[0]
-            if len(self._robot_q) >= 2 and len(new) >= 2:
-                v_in = np.asarray(self._robot_q[-1][0], dtype=np.float64) - \
-                       np.asarray(self._robot_q[-2][0], dtype=np.float64)
-                v_out = np.asarray(new[1][0], dtype=np.float64) - np.asarray(fq, dtype=np.float64)
-                bridge = self._hermite_ramp(seam_from, fq, v_in, v_out, self.ramp_joint_step)
+            if new[0][2] == start_id:
+                # CONTIGUOUS (steady state): the clock stayed at/behind our start_id, so no leading
+                # substeps were dropped and — because seed_gap expanded seed(=queue tail)->row0 — the
+                # validated traj already flows continuously from the tail. Append it as-is; no bridge.
+                self._robot_q.extend(new)
+                n_bridge = 0
             else:
-                bridge = [q for q, _g in self._ramp(seam_from, fq, self.ramp_joint_step, fg)]
-            ramp = [(q, fg, fid) for q in bridge]
-            self._robot_q.extend(ramp + new[1:])    # ramp ends AT new[0]; queue is NEVER cleared
+                # CATCH-UP: the clock advanced PAST start_id during validation, so new[0] jumped several
+                # rows ahead of the tail. Bridge that gap velocity-merged (mean of the tail's exit
+                # velocity v_in and the new rows' entry velocity v_out) so the catch-up isn't a jump.
+                # v_in/v_out are None when there's no context (queue < 2 pts, or a single-row slice).
+                seam_from = (np.asarray(self._robot_q[-1][0], dtype=np.float64)
+                             if self._robot_q else seed)
+                fq, fg, fid = new[0]
+                v_in = (np.asarray(self._robot_q[-1][0], dtype=np.float64) -
+                        np.asarray(self._robot_q[-2][0], dtype=np.float64)) \
+                    if len(self._robot_q) >= 2 else None
+                v_out = (np.asarray(new[1][0], dtype=np.float64) - np.asarray(fq, dtype=np.float64)) \
+                    if len(new) >= 2 else None
+                bridge = self._bridge(seam_from, fq, v_in, v_out, self.ramp_joint_step, MAX_JOINT_STEP)
+                self._robot_q.extend([(q, fg, fid) for q in bridge] + new[1:])  # bridge ends AT new[0]
+                n_bridge = len(bridge)
             self._queued_through = new[-1][2]
             qlen = len(self._robot_q)
             self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
-        if len(ramp) > 0 or self._throttled("append", 1.0):     # always show seam ramps; else 1/s
+        if n_bridge > 0 or self._throttled("append", 1.0):      # always surface a real catch-up bridge
             print(f"[pipeline] append: obs_row={obs_step_id}, clock={cur}, "
-                  f"appended ids {new[0][2]}..{new[-1][2]} (+{len(ramp)} ramp) -> queue {qlen}")
+                  f"appended ids {new[0][2]}..{new[-1][2]} (+{n_bridge} catch-up) -> queue {qlen}")
         return True, ""
 
     def auto_ingest_chunk(self, action_chunk, obs_step_id):
@@ -675,13 +681,15 @@ class PostProcessor:
         if not ok:
             return False, reason
         K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
-        traj, ok, reason = self.validate_chunk(sim, configs, seed, K, fast=True)
+        traj, ok, reason, rows = self.validate_chunk(sim, configs, seed, K, fast=True)
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
-        # Tag each validated substep with its ABSOLUTE master row id: traj[0] for row 0, then K substeps
-        # per subsequent row, so substep s belongs to row 0 (s==0) else ceil(s / K).
+        # Tag each validated substep with its ABSOLUTE master row id from the sim's EXACT per-substep
+        # row index (rows[s] = the config row it realizes): config row j -> master id obs_step_id + j.
+        # No seed_gap here (queue-REPLACE ramps from the live pose), so row 0 is a lone point (rows[0]=0)
+        # and the release ramp bridges live->row0 below.
         tagged = [(np.asarray(q14, dtype=np.float64), grip,
-                   int(obs_step_id) + (0 if s == 0 else int(np.ceil(s / K))))
+                   int(obs_step_id) + int(rows[s]))
                   for s, (q14, grip) in enumerate(traj)]
         with self._lock:
             cur = self._current_row_id
@@ -695,9 +703,14 @@ class PostProcessor:
             live = self.read_arm14()
             start = live if live is not None else kept[0][0]   # 14-vec both-arm start pose
             fq, fg, fid = kept[0]
-            ramp = [(q, g, fid) for (q, g) in self._ramp(start, fq, self.ramp_joint_step, fg)]
+            # Ramp in from the live pose at the speed the chunk STARTS at (v_out); the queue is being
+            # replaced, so there's no previous-row velocity -> v_in is None and cruise = the entry speed.
+            v_out = (np.asarray(kept[1][0], dtype=np.float64) - np.asarray(fq, dtype=np.float64)) \
+                if len(kept) >= 2 else None
+            bridge = self._bridge(start, fq, None, v_out, self.ramp_joint_step, MAX_JOINT_STEP)
+            ramp = [(q, fg, fid) for q in bridge]
             self._robot_q.clear()
-            self._robot_q.extend(ramp + kept[1:])          # ramp ends AT kept[0]
+            self._robot_q.extend(ramp + kept[1:])          # bridge ends AT kept[0]
             qlen = len(self._robot_q)
             self._last_q14 = np.asarray(traj[-1][0], dtype=np.float64).copy()   # dual IK warm-start
         if self._throttled("auto_ramp", 1.0):

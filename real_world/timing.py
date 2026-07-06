@@ -80,3 +80,12 @@ RAMP_JOINT_STEP = min(MAX_JOINT_STEP, MAX_JOINT_STEP * SPEED_SCALE)   # per-subs
 # ABOVE the C5 safety cap — auto-path ramps go straight to the queue without a _subdivide_points re-clamp.
 # ^ DERIVED: sets how fast the seam bridge cruises (smoothness of the chunk-to-chunk seam). Lower
 #   multiplier -> slower, smoother ramp; always <= MAX_JOINT_STEP so the C5 safety bound is untouched.
+
+# --- trace output location -------------------------------------------------------------------
+# One folder that ALL inference/release JSONL traces are written to, so a run's logs stay together
+# instead of scattering into the process CWD: buffer/requests/chunks (inference controller) and
+# released_substeps/live_joints (env release loop). Relative to CWD by default; override with the
+# HUMANOID_TRACE_DIR env var. Callers mkdir(parents=True, exist_ok=True) once before opening files.
+import os as _os
+import pathlib as _pathlib
+TRACE_DIR = _pathlib.Path(_os.environ.get("HUMANOID_TRACE_DIR", "infer_logs"))

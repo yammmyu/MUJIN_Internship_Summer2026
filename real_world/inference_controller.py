@@ -28,7 +28,7 @@ import time
 
 import numpy as np
 
-from real_world.timing import RECORD_HZ   # single source of timing truth (see timing.py)
+from real_world.timing import RECORD_HZ, TRACE_DIR   # single source of timing truth (see timing.py)
 # Client-side inference preprocessing: image crop/resize/encode (MUST stay identical to training
 # build_dataset.py and the server decode) plus the obs -> /predict request assembly. encode_image
 # is re-exported here so callers doing `from real_world.inference_controller import encode_image`
@@ -127,14 +127,19 @@ class InferenceController:
         # and the manual validate buttons become no-ops (see steps_remaining).
         self._exec_cursor = 0
         # Open trace-file handles, kept open for the controller's life so the hot loop never
-        # re-opens per inference. Empty (and every _trace call a no-op) unless TRACE_JSONL is set.
-        self._trace_files = {}
+        # re-opens per inference. The emitted-buffer trace is ALWAYS on: the smoothed run fed to the
+        # robot is logged to buffer.jsonl every inference so it can be joined (by master row id) to
+        # the always-on released_substeps.jsonl / live_joints.jsonl recorders in the env release loop.
+        # The verbose extras (raw request + raw chunk) stay gated behind TRACE_JSONL.
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)   # all traces land in one folder (see timing.py)
+        self._trace_files = {"buffer": open(TRACE_DIR / "buffer.jsonl", "a")}
         if TRACE_JSONL:
-            self._trace_files = {name: open(f"{name}.jsonl", "a")
-                                 for name in ("requests", "chunks", "buffer")}
+            self._trace_files.update({name: open(TRACE_DIR / f"{name}.jsonl", "a")
+                                      for name in ("requests", "chunks")})
 
     def _trace(self, name, obj):
-        """Append one JSON line to the named trace file (no-op unless TRACE_JSONL is set)."""
+        """Append one JSON line to the named trace file (no-op if that file's handle isn't open:
+        buffer is always open; requests/chunks only under TRACE_JSONL)."""
         f = self._trace_files.get(name)
         if f is not None:
             f.write(json.dumps(obj) + "\n")
@@ -199,7 +204,7 @@ class InferenceController:
         # Images (agentview/eye_in_hand) are omitted — large base64 JPEGs, not needed here.
         # GUARDED: build the dict only when tracing is on — it reads request fields, and building
         # it unconditionally (with stale keys) would raise on every inference. Logs BOTH arms' EE.
-        if self._trace_files:
+        if TRACE_JSONL:
             self._trace("requests", {"obs_ts": sid,
                                      "robotl_eef_pos": req.get("robotl_eef_pos"),
                                      "robotr_eef_pos": req.get("robotr_eef_pos"),
@@ -233,7 +238,7 @@ class InferenceController:
 
         # Log the RAW chunk (post-binarize, pre-buffer would differ only by smoothing), keyed by the
         # master id it's anchored to.
-        if self._trace_files:
+        if TRACE_JSONL:
             self._trace("chunks", {"obs_ts": sid, "action": action.tolist()})
 
         # The robot-facing buffer as a plain list, computed ONCE and reused by the trace, the

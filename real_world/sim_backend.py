@@ -336,8 +336,11 @@ class SimEnv:
                                             forces=[20.0] * len(gidx))
 
     # ===================== validation (run on the owning thread) =====================
-    def validate(self, configs, seed_q, max_joint_step, learn=False, fast=False, substeps_per_row=None):
-        """Run PRE-SOLVED joint configs through the sim; return (validated_traj, ok, reason).
+    def validate(self, configs, seed_q, max_joint_step, learn=False, fast=False, substeps_per_row=None,
+                 seed_gap=False):
+        """Run PRE-SOLVED joint configs through the sim; return (validated_traj, ok, reason, rows),
+        where rows[i] is the config-row index that validated_traj[i] realizes (for exact master-id
+        tagging regardless of per-row substep count). rows is [] on the error returns.
         Thread-safe entry (marshals to the owning thread via submit_job).
 
         configs: [(q14, [gl, gr]), ...] — the raw IK joints (BOTH arms: [left7, right7]) + both
@@ -355,12 +358,16 @@ class SimEnv:
         fast=True: skip the per-substep real-time sleep (auto-inference latency path).
         substeps_per_row: LIVE override of the per-row substep count (= SPEED_SCALE knob); None ->
         the module default. The caller (HumanoidEnv) passes its own value so the sim expansion and the
-        env's master-id tagging (K) always use the SAME count, even when SPEED_SCALE changes live."""
+        env's master-id tagging (K) always use the SAME count, even when SPEED_SCALE changes live.
+        seed_gap=True (streaming auto path): also expand the SEED->row0 gap as a Catmull-Rom segment,
+        so the returned traj is continuous with the seed (= queue tail) and the splice layer needs no
+        separate ramp. Default False keeps row 0 a lone point (manual/learn paths ramp it themselves)."""
         return self.submit_job(
-            lambda: self._validate_impl(configs, seed_q, max_joint_step, learn, fast, substeps_per_row))
+            lambda: self._validate_impl(configs, seed_q, max_joint_step, learn, fast, substeps_per_row,
+                                        seed_gap))
 
     def _validate_impl(self, configs, seed_q, max_joint_step, learn=False, fast=False,
-                       substeps_per_row=None):
+                       substeps_per_row=None, seed_gap=False):
         K = int(substeps_per_row) if substeps_per_row else SUBSTEPS_PER_ROW
         seed = np.asarray(seed_q, dtype=np.float64).copy()      # 14-vec [left7, right7]
         # Deterministic start (so learn & validate see the same path, and repeat runs agree):
@@ -377,15 +384,30 @@ class SimEnv:
              for (q14, _g) in configs]
         grips = [(float(g[0]), float(g[1])) for (_q, g) in configs]   # [gl, gr] per row
         out = []
+        # rows[i] = the row index k the substep out[i] belongs to, carried explicitly so the caller's
+        # master-id tagging is EXACT even when a velocity-capped row emits != K substeps (no s//K guess).
+        rows = []
         for k in range(len(P)):
             q7, grip = P[k], grips[k]      # q7 is a 14-vec here; grip is (gl, gr)
             # Time-uniform expansion: each row gap becomes a FIXED SUBSTEPS_PER_ROW substeps (uniform
             # in time), so inter-row wall-clock is always ROW_DT regardless of motion size and the
             # splice's f=elapsed/STEP_TIME stays exact. Smoothness is set by CONTROL_HZ (=>
-            # SUBSTEPS_PER_ROW), NOT by joint displacement. Row 0 emits a single config: the
-            # seed->row0 transient is the ramp-in, added (velocity-bounded) by the release/splice layer.
-            if k == 0:
+            # SUBSTEPS_PER_ROW), NOT by joint displacement. Row 0 normally emits a single config (the
+            # seed->row0 transient is the ramp-in, added by the release/splice layer); with seed_gap it
+            # instead expands seed->row0 as an ordinary segment so the traj is continuous with the seed.
+            if k == 0 and not seed_gap:
                 subs = [q7]
+            elif k == 0:
+                # Streaming seam: expand SEED->row0 like any inter-row gap, so the chunk boundary is a
+                # normal K-substep spline at motion speed (no separate ramp). One-sided tangent (before
+                # == seed, mirrored inside _catmull_rom_segment); row 1 is the 'after' context.
+                after = P[k + 1] if k + 1 < len(P) else P[k]
+                subs = self._catmull_rom_segment(seed, seed, P[k], after, K)
+                if not learn:                          # same velocity ceiling as the k>=1 gaps: a big
+                    per_sub = float(np.max(np.abs(np.diff(np.vstack([seed[None], subs]), axis=0))))
+                    if per_sub > max_joint_step + 1e-9:  # seed->row0 (startup / catch-up) ramps slower
+                        factor = int(np.ceil(per_sub / max_joint_step))
+                        subs = self._catmull_rom_segment(seed, seed, P[k], after, K * factor)
             else:
                 # Centripetal Catmull-Rom through row k-1 -> k, with the rows on either side as
                 # tangent context (duplicated at the chunk ends). Curving through the waypoints with
@@ -404,11 +426,9 @@ class SimEnv:
                         # fast policy row) is executed SLOWER, not dropped — re-expand this segment with
                         # enough substeps that the per-substep joint delta respects the velocity cap.
                         # The extra substeps are STILL self-collision-checked in the loop below, so the
-                        # ramp is validated, not blind. (NOTE: this makes the row emit more than K
-                        # substeps; the auto master-id tagging in append_actions assumes a fixed K, so
-                        # for streaming AUTO a heavily-ramped row can nudge id alignment — the manual /
-                        # single-step path has no ids and is unaffected. The dispatch guard in
-                        # run_trajectory_control is the final velocity floor regardless.)
+                        # ramp is validated, not blind. This makes the row emit more than K substeps, but
+                        # the returned `rows` list tags each substep with its true row k, so the caller's
+                        # master-id alignment stays EXACT (no fixed-K s//K assumption to break).
                         factor = int(np.ceil(per_sub / max_joint_step))
                         subs = self._catmull_rom_segment(before, P[k - 1], P[k], after, K * factor)
                         print(f"[SimEnv] action {k}: {np.degrees(per_sub * CONTROL_HZ):.0f} deg/s > cap "
@@ -436,9 +456,10 @@ class SimEnv:
                     else:
                         a, b = sorted(new)[0]
                         return [], False, (f"action {k}: self-collision "
-                                           f"{self.link_name.get(a, a)} <-> {self.link_name.get(b, b)}")
+                                           f"{self.link_name.get(a, a)} <-> {self.link_name.get(b, b)}"), []
                 out.append((self._cur_arms_q().copy(), grip))   # sim-ACHIEVED 14-vec + (gl, gr)
-        return out, True, None
+                rows.append(k)                                   # this substep realizes row k
+        return out, True, None, rows
 
     @staticmethod
     def _resample_uniform(q_from, q_to, k):

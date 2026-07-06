@@ -51,7 +51,7 @@ from real_world.observer import ObsCollector, extract_pose
 # Re-exported below for back-compat — scripts and tests import these names from humanoid_env.
 from real_world.timing import (
     RECORD_HZ, ROW_DT, CONTROL_HZ, STEP_TIME, SUBSTEPS_PER_ROW, MAX_JOINT_VEL, MAX_JOINT_STEP,
-    RAMP_JOINT_STEP, SPEED_SCALE,
+    RAMP_JOINT_STEP, SPEED_SCALE, TRACE_DIR,
 )
 
 # a2d_sdk only exists on the robot machine. A sim-only machine (pybullet but no SDK) still
@@ -193,6 +193,9 @@ class HumanoidEnv:
             self.solver, self.solver_r,
             lock=self._lock, read_arm14=self._read_arm14,
             estopped=self._estop.is_set, get_sim=lambda: self.sim, real=real)
+        # All release-loop / inference traces land in one folder (see timing.TRACE_DIR). Create it
+        # once here so the per-tick recorders in _release_loop can just open files inside it.
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)
         # Left-arm joint limits (rad), captured once so the execution path can clamp commands
         # without reaching into the IK solver (it only needs the bounds, not the solver).
         self._jlower = np.asarray(self.solver.m.lower, dtype=np.float64).copy()
@@ -454,14 +457,15 @@ class HumanoidEnv:
 
     def _validate_chunk(self, configs, seed_q, fast=False, substeps_per_row=None):
         """Run PRE-SOLVED configs through self.sim from seed_q (substep + self-collision + joint
-        readback) -> (traj, ok, reason), traj = sim-ACHIEVED [(q14, grip), ...]. The single
-        validation primitive shared by manual validate_and_stage and auto-inference. Owns the
-        no-sim / empty-chunk guards (env owns the sim); the kinematic check is the pipeline's.
+        readback) -> (traj, ok, reason, rows): traj = sim-ACHIEVED [(q14, grip), ...], rows[i] = the
+        config row traj[i] realizes. The single validation primitive shared by manual
+        validate_and_stage and auto-inference. Owns the no-sim / empty-chunk guards (env owns the sim);
+        the kinematic check is the pipeline's.
         substeps_per_row: the SAME K the caller uses for master-id tagging; None -> current value."""
         if self.sim is None:
-            return [], False, "no sim running — press 启动仿真预览 first"
+            return [], False, "no sim running — press 启动仿真预览 first", []
         if not configs:
-            return [], False, "empty action chunk"
+            return [], False, "empty action chunk", []
         K = self.substeps_per_row if substeps_per_row is None else substeps_per_row
         return self.pipeline.validate_chunk(self.sim, configs, seed_q, K, fast=fast)
 
@@ -500,8 +504,8 @@ class HumanoidEnv:
         # Solve IK for the whole chunk first (outside the sim job), then validate the resulting
         # joint configs kinematically. On an IK/envelope failure there's nothing to validate.
         configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14)
-        traj, ok, reason = (self._validate_chunk(configs, self._last_q14)
-                            if ok else ([], False, reason))
+        traj, ok, reason, _rows = (self._validate_chunk(configs, self._last_q14)
+                                   if ok else ([], False, reason, []))
         with self._lock:
             if ok and traj:
                 self._last_sim_traj = traj
@@ -870,7 +874,7 @@ class HumanoidEnv:
             # block is wrapped so a disk/IO error logs once and motion continues.
             try:
                 q14_cmd, grip_cmd = sub[0], sub[1]
-                with open("released_substeps.jsonl", "a") as f:
+                with open(TRACE_DIR / "released_substeps.jsonl", "a") as f:
                     f.write(json.dumps({
                         "step_id": row_id,
                         "q14": np.asarray(q14_cmd, dtype=np.float64).tolist(),   # [left7, right7]
@@ -882,7 +886,7 @@ class HumanoidEnv:
                     live_joints = np.asarray(live_vals, dtype=np.float64).tolist()
                 except Exception:
                     live_joints = None
-                with open("live_joints.jsonl", "a") as f:
+                with open(TRACE_DIR / "live_joints.jsonl", "a") as f:
                     f.write(json.dumps({"step_id": row_id, "joints": live_joints}) + "\n")
             except Exception as e:
                 print(f"[HumanoidEnv] substep recorder failed (continuing): {e}")
