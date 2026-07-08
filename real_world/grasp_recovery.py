@@ -37,7 +37,7 @@ INTEGRATION (see the three call-ins in InferenceController):
         if rec: rec.note_action(action)                    # track the grip command
 
 python robot_control_gui.py 
-Init glog with processor name:python3.10, pid:619818
+Init glog with processor name:python3.10, pid:622872
 /home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/google/protobuf/__init__.py:37: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
   __import__('pkg_resources').declare_namespace(__name__)
 pybullet build time: Jan 29 2025 23:16:28
@@ -52,10 +52,24 @@ right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
 [HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
 [HumanoidEnv] sim-validated 1381 points (id 1); 1381 substep(s) staged for release.
 [HumanoidEnv] released 1381 validated pts (+89 ramp-in) to robot.
+[release-timing] 1 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 113 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 113 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 113 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 113 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 114 substeps/s | per-substep avg: total 8.8ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 113 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 113 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 114 substeps/s | per-substep avg: total 8.8ms = recorder 0.2 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 114 substeps/s | per-substep avg: total 8.8ms = recorder 0.2 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 114 substeps/s | per-substep avg: total 8.8ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 112 substeps/s | per-substep avg: total 8.9ms = recorder 0.3 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
+[release-timing] 112 substeps/s | per-substep avg: total 8.9ms = recorder 0.4 + firmware 0.0 + dispatch 8.6 (STEP_TIME=8.3ms)
 [HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
 [HumanoidEnv] sim-validated 1381 points (id 2); 2762 substep(s) staged for release.
 [HumanoidEnv] released 1381 validated pts (+91 ramp-in) to robot.
 [HumanoidEnv] dispatch-ramp: |Δq|=0.632 rad exceeds cap 0.033 -> streaming 19 bounded substeps
+[release-timing] 112 substeps/s | per-substep avg: total 10.2ms = recorder 0.3 + firmware 0.0 + dispatch 10.0 (STEP_TIME=8.3ms)
 [HumanoidEnv] E-STOP: latched; dropped 4228 pending/staged cmds; holding pose.
 [HumanoidEnv] release refused: E-stop latched (press 复位 to reset).
 [HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).
@@ -63,7 +77,7 @@ right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
 [startup] safety pre-flight passed.
 
 SLAM 模块初始化成功（已解冻关节状态）
-[INFO] [1783496618.202571282] [wheel_controller_example]: Wheel Controller Example node started. Publishing a target pose for the robot base.
+[INFO] [1783498000.914322428] [wheel_controller_example]: Wheel Controller Example node started. Publishing a target pose for the robot base.
 Exception in thread Thread-3 (_run):
 Traceback (most recent call last):
   File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
@@ -79,24 +93,24 @@ Traceback (most recent call last):
   File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 213, in __init__
     self.node = _AGIBOTDDS.new_PyNode(name)
 SystemError: <built-in function new_PyNode> returned NULL without setting an exception
-Exception ignored in: <function Node.__del__ at 0x7a5e71cdb520>
+Exception ignored in: <function Node.__del__ at 0x7fb9017df520>
 Traceback (most recent call last):
   File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
     for publisher in self.list_publisher:
 AttributeError: 'Node' object has no attribute 'list_publisher'
 HTTP/JSON listening on http://0.0.0.0:9000/robot_info  (Ctrl-C to stop)
-15:43:42 INFO real_world.grasp_recovery: GraspRecoveryMonitor ready: settle=5.0s closed_grip_min=60.0 roi=(330, 265, 625, 480) thr=0.50 device=cpu
-15:43:42 INFO real_world.postprocess: smoothing set: radius=4 sigma=0.85 m=0.500
-15:43:42 INFO real_world.postprocess: te_buffer_len set: 6
+16:06:45 INFO real_world.grasp_recovery: GraspRecoveryMonitor ready: settle=5.0s closed_grip_min=60.0 roi=(330, 265, 625, 480) thr=0.50 device=cpu
+16:06:45 INFO real_world.postprocess: smoothing set: radius=4 sigma=0.85 m=0.500
+16:06:45 INFO real_world.postprocess: te_buffer_len set: 6
 [HumanoidEnv] speed_scale=2.540 -> substeps_per_row=5, ramp_joint_step=0.0333
 [tuning] restored from /home/mujin/workspaces/humanoid/tuning_config.json
-15:43:43 INFO real_world.postprocess: smoothing set: radius=4 sigma=0.85 m=0.500
-15:43:43 INFO real_world.postprocess: te_buffer_len set: 6
+16:06:46 INFO real_world.postprocess: smoothing set: radius=4 sigma=0.85 m=0.500
+16:06:46 INFO real_world.postprocess: te_buffer_len set: 6
 [HumanoidEnv] speed_scale=2.540 -> substeps_per_row=5, ramp_joint_step=0.0333
 [HumanoidEnv]: started (collect=on, exec=on, real=on).
-15:43:43 INFO real_world.inference_controller: InferenceController ready (env owned by caller).
-15:43:43 INFO xr_examples.pico_vr_server.server: Downstream listening on 0.0.0.0:5555
-15:43:43 INFO xr_examples.pico_vr_server.server: Upstream listening on 0.0.0.0:5556
+16:06:46 INFO real_world.inference_controller: InferenceController ready (env owned by caller).
+16:06:46 INFO xr_examples.pico_vr_server.server: Downstream listening on 0.0.0.0:5555
+16:06:46 INFO xr_examples.pico_vr_server.server: Upstream listening on 0.0.0.0:5556
 startThreads creating 1 threads.
 starting thread 0
 started thread 0 
@@ -145,143 +159,145 @@ b3Printf: b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126
 b3Printf: right_gripper_center
 ven = Intel
 Workaround for some crash in the Intel OpenGL driver on Linux/Ubuntu
-15:44:44 INFO real_world.inference_controller: [auto] START -> robot | server 10.12.11.144:9000 | uncapped (latency-bound) | temporal-ensemble ON | grasp-recovery ON
+16:07:06 INFO real_world.inference_controller: [auto] START -> robot | server 10.12.11.144:9000 | uncapped (latency-bound) | temporal-ensemble ON | grasp-recovery ON
 [CameraHub] camera ON: head -> ['head']
 [CameraHub] camera ON: hand_left -> ['hand_left', 'head']
 [CameraHub] camera ON: hand_right -> ['hand_left', 'hand_right', 'head']
 [ObsCollector] warming up: waiting for cameras ['head', 'hand_left', 'hand_right']…
+[CameraHub] camera subscribed (ON): hand_right
 [CameraHub] camera subscribed (ON): head
 [CameraHub] camera subscribed (ON): hand_left
-[CameraHub] camera subscribed (ON): hand_right
-15:44:45 INFO real_world.grasp_recovery: [grasp-check] right grip=0.6 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=0, clock=0, appended ids 0..6 (+0 catch-up) -> queue 45
-15:44:45 INFO real_world.inference_controller: [infer] #1 | start 15:44:45.161 end 15:44:45.582 | took 420.9 ms | carried ids 0..13 | robot@id 0 (queued->6, lead 6) | srv 121 ms | L-gap 2.6cm R-gap 0.9cm
-15:44:45 INFO real_world.inference_controller: [infer] #2 | start 15:44:45.588 end 15:44:45.789 | took 201.1 ms | carried ids 3..16 | robot@id 0 (queued->6, lead 6) | srv 98 ms | anchor idx -3 OOR (buf (11, 20))
-15:44:46 INFO real_world.inference_controller: [infer] #3 | start 15:44:45.790 end 15:44:46.102 | took 311.5 ms | carried ids 3..16 | robot@id 2 (queued->7, lead 5) | srv 118 ms | anchor idx -1 OOR (buf (11, 20))
-[pipeline] append: obs_row=4, clock=5, appended ids 8..9 (+0 catch-up) -> queue 71
-15:44:46 INFO real_world.inference_controller: [infer] #4 | start 15:44:46.103 end 15:44:46.918 | took 815.2 ms | carried ids 4..17 | robot@id 5 (queued->9, lead 4) | srv 100 ms | L-gap 4.0cm R-gap 1.8cm
-15:44:47 INFO real_world.inference_controller: [infer] #5 | start 15:44:46.923 end 15:44:47.456 | took 533.6 ms | carried ids 6..19 | robot@id 8 (queued->13, lead 5) | srv 116 ms | L-gap 2.1cm R-gap 2.3cm
-15:44:47 INFO real_world.grasp_recovery: [grasp-check] right grip=0.5 (close>=60.0) closed=False armed=False checked=False
-15:44:47 INFO real_world.inference_controller: [infer] #6 | start 15:44:47.460 end 15:44:47.762 | took 301.8 ms | carried ids 10..23 | robot@id 8 (queued->14, lead 6) | srv 111 ms | anchor idx -2 OOR (buf (12, 20))
-15:44:47 INFO real_world.inference_controller: [infer] #7 | start 15:44:47.763 end 15:44:47.981 | took 218.6 ms | carried ids 11..24 | robot@id 8 (queued->14, lead 6) | srv 98 ms | anchor idx -3 OOR (buf (11, 20))
-15:44:48 INFO real_world.inference_controller: [infer] #8 | start 15:44:47.983 end 15:44:48.281 | took 297.6 ms | carried ids 11..24 | robot@id 8 (queued->14, lead 6) | srv 129 ms | anchor idx -3 OOR (buf (11, 20))
-15:44:48 INFO real_world.inference_controller: [infer] #9 | start 15:44:48.281 end 15:44:48.532 | took 250.7 ms | carried ids 11..24 | robot@id 8 (queued->14, lead 6) | srv 115 ms | anchor idx -3 OOR (buf (11, 20))
-15:44:48 INFO real_world.inference_controller: [infer] #10 | start 15:44:48.532 end 15:44:48.812 | took 279.4 ms | carried ids 11..24 | robot@id 8 (queued->14, lead 6) | srv 118 ms | anchor idx -3 OOR (buf (11, 20))
-15:44:49 INFO real_world.inference_controller: [infer] #11 | start 15:44:48.814 end 15:44:49.084 | took 270.1 ms | carried ids 11..24 | robot@id 8 (queued->14, lead 6) | srv 122 ms | anchor idx -3 OOR (buf (11, 20))
-[pipeline] append: obs_row=11, clock=9, appended ids 15..15 (+0 catch-up) -> queue 31
-15:44:49 INFO real_world.inference_controller: [infer] #12 | start 15:44:49.085 end 15:44:49.468 | took 383.0 ms | carried ids 11..24 | robot@id 9 (queued->15, lead 6) | srv 97 ms | anchor idx -2 OOR (buf (11, 20))
-15:44:49 INFO real_world.grasp_recovery: [grasp-check] right grip=2.3 (close>=60.0) closed=False armed=False checked=False
-15:44:49 INFO real_world.inference_controller: [infer] #13 | start 15:44:49.469 end 15:44:49.902 | took 432.7 ms | carried ids 12..25 | robot@id 12 (queued->17, lead 5) | srv 94 ms | L-gap 1.7cm R-gap 2.3cm
-15:44:50 INFO real_world.inference_controller: [infer] #14 | start 15:44:49.903 end 15:44:50.384 | took 481.9 ms | carried ids 14..27 | robot@id 14 (queued->20, lead 6) | srv 126 ms | L-gap 2.6cm R-gap 2.3cm
-[pipeline] append: obs_row=17, clock=17, appended ids 21..22 (+0 catch-up) -> queue 29
-15:44:50 INFO real_world.inference_controller: [infer] #15 | start 15:44:50.385 end 15:44:50.801 | took 415.6 ms | carried ids 17..30 | robot@id 17 (queued->22, lead 5) | srv 118 ms | L-gap 3.2cm R-gap 2.5cm
-15:44:51 INFO real_world.inference_controller: [infer] #16 | start 15:44:50.802 end 15:44:51.308 | took 506.8 ms | carried ids 19..32 | robot@id 20 (queued->25, lead 5) | srv 126 ms | L-gap 1.6cm R-gap 3.3cm
-15:44:51 INFO real_world.inference_controller: [infer] #17 | start 15:44:51.314 end 15:44:51.710 | took 396.2 ms | carried ids 22..35 | robot@id 22 (queued->27, lead 5) | srv 141 ms | L-gap 1.1cm R-gap 3.6cm
-15:44:52 INFO real_world.grasp_recovery: [grasp-check] right grip=5.0 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=24, clock=24, appended ids 28..30 (+0 catch-up) -> queue 30
-15:44:52 INFO real_world.inference_controller: [infer] #18 | start 15:44:51.732 end 15:44:52.229 | took 497.1 ms | carried ids 24..37 | robot@id 24 (queued->30, lead 6) | srv 127 ms | L-gap 1.5cm R-gap 3.4cm
-15:44:52 INFO real_world.inference_controller: [infer] #19 | start 15:44:52.246 end 15:44:52.676 | took 430.3 ms | carried ids 27..40 | robot@id 27 (queued->32, lead 5) | srv 134 ms | L-gap 1.7cm R-gap 3.3cm
-[pipeline] append: obs_row=29, clock=30, appended ids 33..35 (+0 catch-up) -> queue 26
-15:44:53 INFO real_world.inference_controller: [infer] #20 | start 15:44:52.682 end 15:44:53.245 | took 563.4 ms | carried ids 29..42 | robot@id 30 (queued->35, lead 5) | srv 154 ms | L-gap 2.0cm R-gap 4.2cm
-15:44:53 INFO real_world.inference_controller: [infer] #21 | start 15:44:53.246 end 15:44:53.644 | took 397.6 ms | carried ids 32..45 | robot@id 32 (queued->37, lead 5) | srv 122 ms | L-gap 0.5cm R-gap 3.9cm
-15:44:54 INFO real_world.inference_controller: [infer] #22 | start 15:44:53.649 end 15:44:54.156 | took 506.4 ms | carried ids 34..47 | robot@id 34 (queued->40, lead 6) | srv 119 ms | L-gap 0.9cm R-gap 4.0cm
-15:44:54 INFO real_world.grasp_recovery: [grasp-check] right grip=3.2 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=37, clock=36, appended ids 41..42 (+0 catch-up) -> queue 30
-15:44:54 INFO real_world.inference_controller: [infer] #23 | start 15:44:54.159 end 15:44:54.587 | took 428.1 ms | carried ids 37..50 | robot@id 36 (queued->42, lead 6) | srv 130 ms | anchor idx -1 OOR (buf (11, 20))
-15:44:55 INFO real_world.inference_controller: [infer] #24 | start 15:44:54.588 end 15:44:55.041 | took 452.2 ms | carried ids 39..52 | robot@id 39 (queued->44, lead 5) | srv 112 ms | L-gap 1.8cm R-gap 3.7cm
-15:44:55 INFO real_world.inference_controller: [infer] #25 | start 15:44:55.041 end 15:44:55.535 | took 493.7 ms | carried ids 41..54 | robot@id 42 (queued->47, lead 5) | srv 119 ms | L-gap 1.2cm R-gap 4.5cm
-[pipeline] append: obs_row=44, clock=44, appended ids 48..49 (+0 catch-up) -> queue 29
-15:44:56 INFO real_world.inference_controller: [infer] #26 | start 15:44:55.541 end 15:44:56.019 | took 478.3 ms | carried ids 44..57 | robot@id 44 (queued->49, lead 5) | srv 127 ms | L-gap 1.1cm R-gap 4.8cm
-15:44:56 INFO real_world.inference_controller: [infer] #27 | start 15:44:56.023 end 15:44:56.474 | took 451.1 ms | carried ids 46..59 | robot@id 46 (queued->51, lead 5) | srv 113 ms | L-gap 1.0cm R-gap 5.0cm
-15:44:56 INFO real_world.grasp_recovery: [grasp-check] right grip=6.5 (close>=60.0) closed=False armed=False checked=False
-15:44:57 INFO real_world.inference_controller: [infer] #28 | start 15:44:56.476 end 15:44:56.979 | took 502.7 ms | carried ids 48..61 | robot@id 49 (queued->54, lead 5) | srv 121 ms | L-gap 1.1cm R-gap 4.8cm
-[pipeline] append: obs_row=51, clock=51, appended ids 55..57 (+0 catch-up) -> queue 30
-15:44:57 INFO real_world.inference_controller: [infer] #29 | start 15:44:57.008 end 15:44:57.575 | took 566.5 ms | carried ids 51..64 | robot@id 51 (queued->57, lead 6) | srv 118 ms | L-gap 1.3cm R-gap 5.2cm
-15:44:58 INFO real_world.inference_controller: [infer] #30 | start 15:44:57.579 end 15:44:58.055 | took 475.9 ms | carried ids 54..67 | robot@id 54 (queued->59, lead 5) | srv 108 ms | L-gap 1.4cm R-gap 5.4cm
-15:44:58 INFO real_world.inference_controller: [infer] #31 | start 15:44:58.110 end 15:44:58.570 | took 459.8 ms | carried ids 56..69 | robot@id 57 (queued->62, lead 5) | srv 121 ms | L-gap 1.8cm R-gap 5.6cm
-15:44:58 INFO real_world.grasp_recovery: [grasp-check] right grip=1.1 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=59, clock=59, appended ids 63..65 (+0 catch-up) -> queue 30
-15:44:59 INFO real_world.inference_controller: [infer] #32 | start 15:44:58.584 end 15:44:59.120 | took 536.2 ms | carried ids 59..72 | robot@id 59 (queued->65, lead 6) | srv 119 ms | L-gap 1.5cm R-gap 5.8cm
-15:44:59 INFO real_world.inference_controller: [infer] #33 | start 15:44:59.128 end 15:44:59.550 | took 422.4 ms | carried ids 62..75 | robot@id 62 (queued->67, lead 5) | srv 118 ms | L-gap 1.5cm R-gap 5.7cm
-15:45:00 INFO real_world.inference_controller: [infer] #34 | start 15:44:59.558 end 15:45:00.039 | took 481.5 ms | carried ids 64..77 | robot@id 64 (queued->69, lead 5) | srv 119 ms | L-gap 2.3cm R-gap 5.3cm
-[pipeline] append: obs_row=66, clock=67, appended ids 70..72 (+0 catch-up) -> queue 28
-15:45:00 INFO real_world.inference_controller: [infer] #35 | start 15:45:00.042 end 15:45:00.608 | took 566.3 ms | carried ids 66..79 | robot@id 67 (queued->72, lead 5) | srv 128 ms | L-gap 0.7cm R-gap 6.0cm
-15:45:00 INFO real_world.grasp_recovery: [grasp-check] right grip=0.7 (close>=60.0) closed=False armed=False checked=False
-15:45:01 INFO real_world.inference_controller: [infer] #36 | start 15:45:00.624 end 15:45:01.264 | took 639.9 ms | carried ids 69..82 | robot@id 69 (queued->75, lead 6) | srv 143 ms | L-gap 1.3cm R-gap 5.9cm
+16:07:06 INFO real_world.grasp_recovery: [grasp-check] right grip=0.4 (close>=60.0) closed=False armed=False checked=False
+[pipeline] append: obs_row=0, clock=0, appended ids 0..6 (+0 catch-up) -> queue 35
+16:07:06 INFO real_world.inference_controller: [infer] #1 | start 16:07:06.354 end 16:07:06.778 | took 423.5 ms | carried ids 0..13 | robot@id 0 (queued->6, lead 6) | srv 125 ms | L-gap 0.4cm R-gap 1.1cm
+[release-timing] 1 substeps/s | per-substep avg: total 25.5ms = recorder 8.3 + firmware 0.7 + dispatch 16.4 (STEP_TIME=8.3ms)
+16:07:07 INFO real_world.inference_controller: [infer] #2 | start 16:07:06.781 end 16:07:07.046 | took 265.1 ms | carried ids 3..16 | robot@id 2 (queued->7, lead 5) | srv 117 ms | anchor idx -1 OOR (buf (11, 20))
+16:07:07 INFO real_world.inference_controller: [infer] #3 | start 16:07:07.047 end 16:07:07.369 | took 322.8 ms | carried ids 4..17 | robot@id 4 (queued->9, lead 5) | srv 109 ms | L-gap 0.1cm R-gap 2.2cm
+[release-timing] 35 substeps/s | per-substep avg: total 28.7ms = recorder 11.8 + firmware 0.6 + dispatch 16.4 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=6, clock=7, appended ids 10..12 (+0 catch-up) -> queue 28
+16:07:07 INFO real_world.inference_controller: [infer] #4 | start 16:07:07.374 end 16:07:07.874 | took 499.8 ms | carried ids 6..19 | robot@id 7 (queued->12, lead 5) | srv 110 ms | L-gap 0.3cm R-gap 2.9cm
+16:07:08 INFO real_world.inference_controller: [infer] #5 | start 16:07:07.875 end 16:07:08.239 | took 363.6 ms | carried ids 9..22 | robot@id 9 (queued->14, lead 5) | srv 110 ms | L-gap 0.4cm R-gap 3.4cm
+16:07:08 INFO real_world.inference_controller: [infer] #6 | start 16:07:08.240 end 16:07:08.620 | took 380.2 ms | carried ids 11..24 | robot@id 11 (queued->16, lead 5) | srv 143 ms | L-gap 0.9cm R-gap 3.2cm
+[release-timing] 28 substeps/s | per-substep avg: total 36.1ms = recorder 16.5 + firmware 1.8 + dispatch 17.8 (STEP_TIME=8.3ms)
+16:07:08 INFO real_world.grasp_recovery: [grasp-check] right grip=1.2 (close>=60.0) closed=False armed=False checked=False
+[pipeline] append: obs_row=13, clock=13, appended ids 17..19 (+0 catch-up) -> queue 32
+16:07:09 INFO real_world.inference_controller: [infer] #7 | start 16:07:08.640 end 16:07:09.092 | took 452.0 ms | carried ids 13..26 | robot@id 13 (queued->19, lead 6) | srv 113 ms | L-gap 0.5cm R-gap 3.2cm
+16:07:09 INFO real_world.inference_controller: [infer] #8 | start 16:07:09.105 end 16:07:09.487 | took 382.4 ms | carried ids 16..29 | robot@id 16 (queued->21, lead 5) | srv 128 ms | L-gap 0.3cm R-gap 2.8cm
+[release-timing] 26 substeps/s | per-substep avg: total 40.1ms = recorder 20.5 + firmware 2.7 + dispatch 16.9 (STEP_TIME=8.3ms)
+16:07:09 INFO real_world.inference_controller: [infer] #9 | start 16:07:09.493 end 16:07:09.915 | took 422.0 ms | carried ids 18..31 | robot@id 18 (queued->23, lead 5) | srv 119 ms | L-gap 0.1cm R-gap 3.0cm
+[pipeline] append: obs_row=20, clock=19, appended ids 24..25 (+0 catch-up) -> queue 31
+16:07:10 INFO real_world.inference_controller: [infer] #10 | start 16:07:09.918 end 16:07:10.284 | took 366.0 ms | carried ids 20..33 | robot@id 19 (queued->25, lead 6) | srv 107 ms | anchor idx -1 OOR (buf (12, 20))
+16:07:10 INFO real_world.inference_controller: [infer] #11 | start 16:07:10.285 end 16:07:10.678 | took 393.1 ms | carried ids 22..35 | robot@id 21 (queued->27, lead 6) | srv 123 ms | anchor idx -1 OOR (buf (11, 20))
+[release-timing] 26 substeps/s | per-substep avg: total 38.4ms = recorder 20.1 + firmware 1.0 + dispatch 17.3 (STEP_TIME=8.3ms)
+16:07:10 INFO real_world.grasp_recovery: [grasp-check] right grip=0.1 (close>=60.0) closed=False armed=False checked=False
+16:07:11 INFO real_world.inference_controller: [infer] #12 | start 16:07:10.678 end 16:07:11.079 | took 400.5 ms | carried ids 24..37 | robot@id 24 (queued->29, lead 5) | srv 137 ms | L-gap 0.5cm R-gap 3.2cm
+[pipeline] append: obs_row=26, clock=26, appended ids 30..31 (+0 catch-up) -> queue 28
+16:07:11 INFO real_world.inference_controller: [infer] #13 | start 16:07:11.080 end 16:07:11.511 | took 431.0 ms | carried ids 26..39 | robot@id 26 (queued->31, lead 5) | srv 142 ms | L-gap 0.5cm R-gap 3.4cm
+16:07:11 INFO real_world.inference_controller: [infer] #14 | start 16:07:11.513 end 16:07:11.902 | took 389.0 ms | carried ids 28..41 | robot@id 28 (queued->33, lead 5) | srv 129 ms | L-gap 0.3cm R-gap 3.8cm
+[release-timing] 26 substeps/s | per-substep avg: total 39.2ms = recorder 18.4 + firmware 2.0 + dispatch 18.8 (STEP_TIME=8.3ms)
+16:07:12 INFO real_world.inference_controller: [infer] #15 | start 16:07:11.905 end 16:07:12.402 | took 496.7 ms | carried ids 30..43 | robot@id 31 (queued->36, lead 5) | srv 102 ms | L-gap 0.5cm R-gap 3.6cm
+[pipeline] append: obs_row=33, clock=33, appended ids 37..38 (+0 catch-up) -> queue 29
+16:07:12 INFO real_world.inference_controller: [infer] #16 | start 16:07:12.404 end 16:07:12.782 | took 378.1 ms | carried ids 33..46 | robot@id 33 (queued->38, lead 5) | srv 126 ms | L-gap 0.6cm R-gap 3.5cm
+[release-timing] 25 substeps/s | per-substep avg: total 40.3ms = recorder 22.7 + firmware 0.8 + dispatch 16.7 (STEP_TIME=8.3ms)
+16:07:13 INFO real_world.grasp_recovery: [grasp-check] right grip=0.4 (close>=60.0) closed=False armed=False checked=False
+16:07:13 INFO real_world.inference_controller: [infer] #17 | start 16:07:12.784 end 16:07:13.329 | took 545.1 ms | carried ids 35..48 | robot@id 35 (queued->41, lead 6) | srv 174 ms | L-gap 0.7cm R-gap 3.2cm
+[pipeline] append: obs_row=38, clock=37, appended ids 42..43 (+0 catch-up) -> queue 30
+16:07:13 INFO real_world.inference_controller: [infer] #18 | start 16:07:13.331 end 16:07:13.787 | took 455.5 ms | carried ids 38..51 | robot@id 37 (queued->43, lead 6) | srv 133 ms | anchor idx -1 OOR (buf (11, 20))
+[release-timing] 26 substeps/s | per-substep avg: total 39.1ms = recorder 18.8 + firmware 1.4 + dispatch 18.9 (STEP_TIME=8.3ms)
+16:07:14 INFO real_world.inference_controller: [infer] #19 | start 16:07:13.790 end 16:07:14.306 | took 515.9 ms | carried ids 40..53 | robot@id 40 (queued->45, lead 5) | srv 146 ms | L-gap 0.3cm R-gap 3.3cm
+[pipeline] append: obs_row=42, clock=42, appended ids 46..48 (+0 catch-up) -> queue 30
+16:07:14 INFO real_world.inference_controller: [infer] #20 | start 16:07:14.309 end 16:07:14.836 | took 527.3 ms | carried ids 42..55 | robot@id 42 (queued->48, lead 6) | srv 128 ms | L-gap 0.1cm R-gap 3.3cm
+[release-timing] 24 substeps/s | per-substep avg: total 41.8ms = recorder 21.2 + firmware 3.0 + dispatch 17.6 (STEP_TIME=8.3ms)
+16:07:15 INFO real_world.inference_controller: [infer] #21 | start 16:07:14.837 end 16:07:15.265 | took 428.7 ms | carried ids 45..58 | robot@id 45 (queued->50, lead 5) | srv 142 ms | L-gap 0.3cm R-gap 3.2cm
+16:07:15 INFO real_world.grasp_recovery: [grasp-check] right grip=11.7 (close>=60.0) closed=False armed=False checked=False
+16:07:15 INFO real_world.inference_controller: [infer] #22 | start 16:07:15.266 end 16:07:15.711 | took 445.5 ms | carried ids 47..60 | robot@id 47 (queued->52, lead 5) | srv 158 ms | L-gap 0.4cm R-gap 3.7cm
+[release-timing] 26 substeps/s | per-substep avg: total 39.7ms = recorder 19.3 + firmware 1.5 + dispatch 18.8 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=49, clock=49, appended ids 53..55 (+0 catch-up) -> queue 30
+16:07:16 INFO real_world.inference_controller: [infer] #23 | start 16:07:15.712 end 16:07:16.292 | took 579.9 ms | carried ids 49..62 | robot@id 49 (queued->55, lead 6) | srv 186 ms | L-gap 0.6cm R-gap 3.5cm
+16:07:16 INFO real_world.inference_controller: [infer] #24 | start 16:07:16.294 end 16:07:16.892 | took 598.5 ms | carried ids 52..65 | robot@id 53 (queued->58, lead 5) | srv 215 ms | L-gap 0.2cm R-gap 3.3cm
+[release-timing] 26 substeps/s | per-substep avg: total 39.5ms = recorder 19.1 + firmware 1.7 + dispatch 18.6 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=55, clock=55, appended ids 59..61 (+0 catch-up) -> queue 30
+16:07:17 INFO real_world.inference_controller: [infer] #25 | start 16:07:16.894 end 16:07:17.417 | took 522.2 ms | carried ids 55..68 | robot@id 56 (queued->61, lead 5) | srv 157 ms | L-gap 0.2cm R-gap 3.3cm
+16:07:17 INFO real_world.grasp_recovery: [grasp-check] right grip=0.7 (close>=60.0) closed=False armed=False checked=False
+16:07:17 INFO real_world.inference_controller: [infer] #26 | start 16:07:17.422 end 16:07:17.991 | took 569.4 ms | carried ids 58..71 | robot@id 58 (queued->64, lead 6) | srv 154 ms | L-gap 0.9cm R-gap 3.5cm
+[release-timing] 26 substeps/s | per-substep avg: total 42.0ms = recorder 21.0 + firmware 1.4 + dispatch 19.7 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=61, clock=61, appended ids 65..66 (+0 catch-up) -> queue 28
+16:07:18 INFO real_world.inference_controller: [infer] #27 | start 16:07:17.994 end 16:07:18.522 | took 528.1 ms | carried ids 61..74 | robot@id 61 (queued->66, lead 5) | srv 127 ms | L-gap 0.5cm R-gap 3.7cm
+16:07:19 INFO real_world.inference_controller: [infer] #28 | start 16:07:18.525 end 16:07:19.001 | took 476.0 ms | carried ids 63..76 | robot@id 63 (queued->68, lead 5) | srv 108 ms | L-gap 0.3cm R-gap 3.2cm
+[release-timing] 24 substeps/s | per-substep avg: total 43.3ms = recorder 22.3 + firmware 4.0 + dispatch 16.9 (STEP_TIME=8.3ms)
+16:07:19 INFO real_world.inference_controller: [infer] #29 | start 16:07:19.003 end 16:07:19.468 | took 465.4 ms | carried ids 65..78 | robot@id 65 (queued->70, lead 5) | srv 132 ms | L-gap 0.2cm R-gap 3.6cm
+[pipeline] append: obs_row=67, clock=68, appended ids 71..73 (+0 catch-up) -> queue 28
+16:07:19 INFO real_world.inference_controller: [infer] #30 | start 16:07:19.474 end 16:07:19.984 | took 510.4 ms | carried ids 67..80 | robot@id 68 (queued->73, lead 5) | srv 111 ms | L-gap 0.4cm R-gap 3.8cm
+[release-timing] 26 substeps/s | per-substep avg: total 39.2ms = recorder 19.8 + firmware 3.0 + dispatch 16.4 (STEP_TIME=8.3ms)
+16:07:20 INFO real_world.grasp_recovery: [grasp-check] right grip=0.3 (close>=60.0) closed=False armed=False checked=False
+16:07:20 INFO real_world.inference_controller: [infer] #31 | start 16:07:19.985 end 16:07:20.432 | took 447.7 ms | carried ids 70..83 | robot@id 70 (queued->75, lead 5) | srv 125 ms | L-gap 0.4cm R-gap 3.5cm
 [pipeline] append: obs_row=72, clock=72, appended ids 76..77 (+0 catch-up) -> queue 29
-15:45:01 INFO real_world.inference_controller: [infer] #37 | start 15:45:01.271 end 15:45:01.745 | took 474.0 ms | carried ids 72..85 | robot@id 72 (queued->77, lead 5) | srv 139 ms | L-gap 2.6cm R-gap 6.1cm
-15:45:02 INFO real_world.inference_controller: [infer] #38 | start 15:45:01.754 end 15:45:02.354 | took 600.4 ms | carried ids 74..87 | robot@id 75 (queued->80, lead 5) | srv 105 ms | L-gap 2.2cm R-gap 7.1cm
-[pipeline] append: obs_row=77, clock=77, appended ids 81..82 (+0 catch-up) -> queue 27
-15:45:02 INFO real_world.inference_controller: [infer] #39 | start 15:45:02.356 end 15:45:02.815 | took 458.9 ms | carried ids 77..90 | robot@id 77 (queued->82, lead 5) | srv 155 ms | L-gap 1.7cm R-gap 5.3cm
-15:45:02 INFO real_world.inference_controller: [auto] STOP requested — draining queue (39 inferences this run).
-15:45:03 INFO real_world.grasp_recovery: [grasp-check] right grip=0.8 (close>=60.0) closed=False armed=False checked=False
-15:45:03 INFO real_world.inference_controller: [infer] #40 | start 15:45:02.819 end 15:45:03.448 | took 628.9 ms | carried ids 79..92 | robot@id 80 (queued->85, lead 5) | srv 119 ms | L-gap 1.2cm R-gap 5.5cm
-[CameraHub] camera unsubscribed (OFF): head
-[CameraHub] camera unsubscribed (OFF): hand_left
-[CameraHub] camera unsubscribed (OFF): hand_right
-[HumanoidEnv] E-STOP: latched; dropped 0 pending/staged cmds; holding pose.
-[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).
-15:45:15 INFO real_world.inference_controller: [auto] START -> robot | server 10.12.11.144:9000 | uncapped (latency-bound) | temporal-ensemble ON | grasp-recovery ON
-[CameraHub] camera ON: head -> ['head']
-[CameraHub] camera ON: hand_left -> ['hand_left', 'head']
-[CameraHub] camera ON: hand_right -> ['hand_left', 'hand_right', 'head']
-[ObsCollector] warming up: waiting for cameras ['head', 'hand_left', 'hand_right']…
-[CameraHub] camera subscribed (ON): head
-[CameraHub] camera subscribed (ON): hand_left
-[CameraHub] camera subscribed (ON): hand_right
-15:45:15 INFO real_world.grasp_recovery: [grasp-check] right grip=1.1 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=85, clock=85, appended ids 85..91 (+0 catch-up) -> queue 35
-15:45:16 INFO real_world.inference_controller: [infer] #41 | start 15:45:15.749 end 15:45:16.353 | took 603.7 ms | carried ids 85..98 | robot@id 85 (queued->91, lead 6) | srv 134 ms | L-gap 0.8cm R-gap 2.2cm
-15:45:16 INFO real_world.inference_controller: [infer] #42 | start 15:45:16.353 end 15:45:16.726 | took 372.3 ms | carried ids 88..101 | robot@id 86 (queued->92, lead 6) | srv 118 ms | anchor idx -2 OOR (buf (11, 20))
-15:45:17 INFO real_world.inference_controller: [infer] #43 | start 15:45:16.726 end 15:45:17.271 | took 545.0 ms | carried ids 89..102 | robot@id 88 (queued->94, lead 6) | srv 127 ms | anchor idx -1 OOR (buf (11, 20))
-[pipeline] append: obs_row=91, clock=91, appended ids 95..96 (+0 catch-up) -> queue 29
-15:45:17 INFO real_world.inference_controller: [infer] #44 | start 15:45:17.272 end 15:45:17.750 | took 477.2 ms | carried ids 91..104 | robot@id 91 (queued->96, lead 5) | srv 135 ms | L-gap 2.3cm R-gap 4.3cm
-15:45:18 INFO real_world.grasp_recovery: [grasp-check] right grip=1.1 (close>=60.0) closed=False armed=False checked=False
-15:45:18 INFO real_world.inference_controller: [infer] #45 | start 15:45:17.751 end 15:45:18.232 | took 482.0 ms | carried ids 93..106 | robot@id 93 (queued->98, lead 5) | srv 112 ms | L-gap 0.5cm R-gap 4.1cm
-[pipeline] append: obs_row=95, clock=96, appended ids 99..101 (+0 catch-up) -> queue 29
-15:45:18 INFO real_world.inference_controller: [infer] #46 | start 15:45:18.237 end 15:45:18.864 | took 627.1 ms | carried ids 95..108 | robot@id 96 (queued->101, lead 5) | srv 174 ms | L-gap 0.8cm R-gap 4.8cm
-15:45:19 INFO real_world.inference_controller: [infer] #47 | start 15:45:18.864 end 15:45:19.525 | took 660.7 ms | carried ids 98..111 | robot@id 99 (queued->104, lead 5) | srv 124 ms | L-gap 1.5cm R-gap 4.6cm
-[pipeline] append: obs_row=101, clock=101, appended ids 105..106 (+0 catch-up) -> queue 26
-15:45:20 INFO real_world.inference_controller: [infer] #48 | start 15:45:19.526 end 15:45:20.092 | took 565.8 ms | carried ids 101..114 | robot@id 101 (queued->106, lead 5) | srv 135 ms | L-gap 0.9cm R-gap 4.5cm
-15:45:20 INFO real_world.grasp_recovery: [grasp-check] right grip=0.5 (close>=60.0) closed=False armed=False checked=False
-15:45:20 INFO real_world.inference_controller: [infer] #49 | start 15:45:20.097 end 15:45:20.712 | took 614.6 ms | carried ids 103..116 | robot@id 104 (queued->109, lead 5) | srv 149 ms | L-gap 0.6cm R-gap 5.0cm
-[pipeline] append: obs_row=106, clock=107, appended ids 110..112 (+0 catch-up) -> queue 29
-15:45:21 INFO real_world.inference_controller: [infer] #50 | start 15:45:20.717 end 15:45:21.216 | took 499.6 ms | carried ids 106..119 | robot@id 107 (queued->112, lead 5) | srv 146 ms | L-gap 0.7cm R-gap 4.1cm
-15:45:21 INFO real_world.inference_controller: [infer] #51 | start 15:45:21.217 end 15:45:21.697 | took 480.7 ms | carried ids 109..122 | robot@id 108 (queued->114, lead 6) | srv 144 ms | anchor idx -1 OOR (buf (11, 20))
-15:45:22 INFO real_world.inference_controller: [infer] #52 | start 15:45:21.699 end 15:45:22.176 | took 476.8 ms | carried ids 111..124 | robot@id 110 (queued->116, lead 6) | srv 128 ms | anchor idx -1 OOR (buf (11, 20))
-15:45:22 INFO real_world.grasp_recovery: [grasp-check] right grip=0.7 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=113, clock=113, appended ids 117..118 (+0 catch-up) -> queue 29
-15:45:22 INFO real_world.inference_controller: [infer] #53 | start 15:45:22.177 end 15:45:22.662 | took 484.7 ms | carried ids 113..126 | robot@id 113 (queued->118, lead 5) | srv 97 ms | L-gap 0.3cm R-gap 4.4cm
-15:45:23 INFO real_world.inference_controller: [infer] #54 | start 15:45:22.663 end 15:45:23.143 | took 479.9 ms | carried ids 115..128 | robot@id 115 (queued->120, lead 5) | srv 100 ms | L-gap 0.2cm R-gap 4.9cm
-[pipeline] append: obs_row=117, clock=118, appended ids 121..123 (+0 catch-up) -> queue 28
-15:45:23 INFO real_world.inference_controller: [infer] #55 | start 15:45:23.159 end 15:45:23.718 | took 558.7 ms | carried ids 117..130 | robot@id 118 (queued->123, lead 5) | srv 157 ms | L-gap 0.4cm R-gap 4.7cm
-15:45:24 INFO real_world.inference_controller: [infer] #56 | start 15:45:23.728 end 15:45:24.201 | took 472.8 ms | carried ids 120..133 | robot@id 120 (queued->125, lead 5) | srv 126 ms | L-gap 0.1cm R-gap 3.9cm
-15:45:24 INFO real_world.grasp_recovery: [grasp-check] right grip=0.7 (close>=60.0) closed=False armed=False checked=False
-[pipeline] append: obs_row=122, clock=124, appended ids 126..129 (+0 catch-up) -> queue 29
-15:45:24 INFO real_world.inference_controller: [infer] #57 | start 15:45:24.230 end 15:45:24.881 | took 651.3 ms | carried ids 122..135 | robot@id 124 (queued->129, lead 5) | srv 115 ms | L-gap 0.5cm R-gap 4.0cm
-15:45:25 INFO real_world.inference_controller: [infer] #58 | start 15:45:24.882 end 15:45:25.372 | took 489.5 ms | carried ids 126..139 | robot@id 126 (queued->131, lead 5) | srv 112 ms | L-gap 0.6cm R-gap 4.4cm
-15:45:25 INFO real_world.inference_controller: [infer] #59 | start 15:45:25.372 end 15:45:25.792 | took 420.0 ms | carried ids 128..141 | robot@id 128 (queued->133, lead 5) | srv 110 ms | L-gap 0.3cm R-gap 5.2cm
-[pipeline] append: obs_row=130, clock=131, appended ids 134..136 (+0 catch-up) -> queue 29
-15:45:26 INFO real_world.inference_controller: [infer] #60 | start 15:45:25.798 end 15:45:26.430 | took 632.6 ms | carried ids 130..143 | robot@id 131 (queued->136, lead 5) | srv 136 ms | L-gap 0.3cm R-gap 4.8cm
-15:45:26 INFO real_world.grasp_recovery: [grasp-check] right grip=0.5 (close>=60.0) closed=False armed=False checked=False
-15:45:26 INFO real_world.inference_controller: [infer] #61 | start 15:45:26.440 end 15:45:26.888 | took 448.4 ms | carried ids 133..146 | robot@id 133 (queued->138, lead 5) | srv 127 ms | L-gap 0.5cm R-gap 4.5cm
-[pipeline] append: obs_row=135, clock=135, appended ids 139..141 (+0 catch-up) -> queue 30
-15:45:27 INFO real_world.inference_controller: [infer] #62 | start 15:45:26.889 end 15:45:27.445 | took 556.3 ms | carried ids 135..148 | robot@id 135 (queued->141, lead 6) | srv 136 ms | L-gap 0.1cm R-gap 4.0cm
-15:45:28 INFO real_world.inference_controller: [infer] #63 | start 15:45:27.459 end 15:45:28.079 | took 620.6 ms | carried ids 138..151 | robot@id 139 (queued->144, lead 5) | srv 139 ms | L-gap 0.2cm R-gap 4.4cm
-[pipeline] append: obs_row=141, clock=141, appended ids 145..146 (+0 catch-up) -> queue 27
-15:45:28 INFO real_world.inference_controller: [infer] #64 | start 15:45:28.080 end 15:45:28.581 | took 500.8 ms | carried ids 141..154 | robot@id 141 (queued->146, lead 5) | srv 117 ms | L-gap 0.3cm R-gap 4.9cm
-15:45:28 INFO real_world.grasp_recovery: [grasp-check] right grip=0.8 (close>=60.0) closed=False armed=False checked=False
-15:45:29 INFO real_world.inference_controller: [infer] #65 | start 15:45:28.582 end 15:45:29.109 | took 526.6 ms | carried ids 143..156 | robot@id 143 (queued->149, lead 6) | srv 124 ms | L-gap 0.7cm R-gap 5.5cm
-15:45:29 INFO real_world.inference_controller: [auto] STOP requested — draining queue (65 inferences this run).
-[pipeline] append: obs_row=146, clock=146, appended ids 150..151 (+0 catch-up) -> queue 27
-15:45:29 INFO real_world.inference_controller: [infer] #66 | start 15:45:29.110 end 15:45:29.584 | took 474.0 ms | carried ids 146..159 | robot@id 146 (queued->151, lead 5) | srv 128 ms | L-gap 0.1cm R-gap 5.0cm
-[CameraHub] camera unsubscribed (OFF): head
-[CameraHub] camera unsubscribed (OFF): hand_left
-[CameraHub] camera unsubscribed (OFF): hand_right
+16:07:21 INFO real_world.inference_controller: [infer] #32 | start 16:07:20.433 end 16:07:21.020 | took 587.2 ms | carried ids 72..85 | robot@id 72 (queued->77, lead 5) | srv 130 ms | L-gap 1.0cm R-gap 3.1cm
+[release-timing] 20 substeps/s | per-substep avg: total 51.0ms = recorder 27.8 + firmware 2.1 + dispatch 21.1 (STEP_TIME=8.3ms)
+16:07:21 INFO real_world.inference_controller: [infer] #33 | start 16:07:21.021 end 16:07:21.586 | took 565.2 ms | carried ids 74..87 | robot@id 74 (queued->80, lead 6) | srv 205 ms | L-gap 0.2cm R-gap 2.9cm
+16:07:21 INFO real_world.grasp_recovery: [grasp-check] open->close (grip=87.4) -> attempt ARMED, detector check in 5.0s
+[pipeline] append: obs_row=77, clock=77, appended ids 81..82 (+0 catch-up) -> queue 29
+16:07:22 INFO real_world.inference_controller: [infer] #34 | start 16:07:21.594 end 16:07:22.144 | took 549.8 ms | carried ids 77..90 | robot@id 77 (queued->82, lead 5) | srv 132 ms | L-gap 0.8cm R-gap 3.2cm
+16:07:22 INFO real_world.grasp_recovery: [grasp-check] grasp armed, settling 0.3/5.0s before detector runs
+[release-timing] 22 substeps/s | per-substep avg: total 46.9ms = recorder 20.8 + firmware 4.1 + dispatch 22.0 (STEP_TIME=8.3ms)
+16:07:22 INFO real_world.grasp_recovery: [grasp-check] right grip=0.2 (close>=60.0) closed=False armed=True checked=False
+16:07:22 INFO real_world.grasp_recovery: [grasp-check] released before the 5.0s check -> attempt cancelled
+16:07:22 INFO real_world.inference_controller: [infer] #35 | start 16:07:22.162 end 16:07:22.691 | took 529.2 ms | carried ids 79..92 | robot@id 79 (queued->84, lead 5) | srv 134 ms | L-gap 0.1cm R-gap 3.5cm
+[pipeline] append: obs_row=81, clock=82, appended ids 85..87 (+0 catch-up) -> queue 29
+16:07:23 INFO real_world.inference_controller: [infer] #36 | start 16:07:22.691 end 16:07:23.167 | took 475.6 ms | carried ids 81..94 | robot@id 82 (queued->87, lead 5) | srv 103 ms | L-gap 0.4cm R-gap 3.6cm
+[release-timing] 26 substeps/s | per-substep avg: total 39.5ms = recorder 16.5 + firmware 3.5 + dispatch 19.6 (STEP_TIME=8.3ms)
+16:07:23 INFO real_world.inference_controller: [infer] #37 | start 16:07:23.169 end 16:07:23.697 | took 527.8 ms | carried ids 84..97 | robot@id 84 (queued->90, lead 6) | srv 123 ms | L-gap 0.2cm R-gap 3.5cm
+[pipeline] append: obs_row=87, clock=87, appended ids 91..92 (+0 catch-up) -> queue 28
+16:07:24 INFO real_world.inference_controller: [infer] #38 | start 16:07:23.700 end 16:07:24.210 | took 510.3 ms | carried ids 87..100 | robot@id 87 (queued->92, lead 5) | srv 111 ms | L-gap 0.2cm R-gap 3.5cm
+[release-timing] 25 substeps/s | per-substep avg: total 39.8ms = recorder 19.5 + firmware 1.5 + dispatch 18.8 (STEP_TIME=8.3ms)
+16:07:24 INFO real_world.inference_controller: [infer] #39 | start 16:07:24.212 end 16:07:24.567 | took 355.4 ms | carried ids 89..102 | robot@id 88 (queued->94, lead 6) | srv 116 ms | anchor idx -1 OOR (buf (12, 20))
+16:07:24 INFO real_world.grasp_recovery: [grasp-check] right grip=0.1 (close>=60.0) closed=False armed=False checked=False
+16:07:25 INFO real_world.inference_controller: [infer] #40 | start 16:07:24.571 end 16:07:25.090 | took 519.0 ms | carried ids 91..104 | robot@id 90 (queued->96, lead 6) | srv 162 ms | anchor idx -1 OOR (buf (11, 20))
+[release-timing] 21 substeps/s | per-substep avg: total 48.2ms = recorder 26.7 + firmware 1.2 + dispatch 20.3 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=93, clock=93, appended ids 97..98 (+0 catch-up) -> queue 28
+16:07:25 INFO real_world.inference_controller: [infer] #41 | start 16:07:25.091 end 16:07:25.569 | took 477.7 ms | carried ids 93..106 | robot@id 93 (queued->98, lead 5) | srv 131 ms | L-gap 0.6cm R-gap 3.6cm
+16:07:26 INFO real_world.inference_controller: [infer] #42 | start 16:07:25.573 end 16:07:26.166 | took 593.4 ms | carried ids 95..108 | robot@id 96 (queued->101, lead 5) | srv 127 ms | L-gap 0.5cm R-gap 3.6cm
+[release-timing] 26 substeps/s | per-substep avg: total 38.9ms = recorder 15.9 + firmware 3.3 + dispatch 19.6 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=98, clock=98, appended ids 102..103 (+0 catch-up) -> queue 27
+16:07:26 INFO real_world.inference_controller: [infer] #43 | start 16:07:26.168 end 16:07:26.688 | took 520.0 ms | carried ids 98..111 | robot@id 98 (queued->103, lead 5) | srv 109 ms | L-gap 0.2cm R-gap 3.8cm
+16:07:26 INFO real_world.grasp_recovery: [grasp-check] right grip=1.1 (close>=60.0) closed=False armed=False checked=False
+16:07:27 INFO real_world.inference_controller: [infer] #44 | start 16:07:26.715 end 16:07:27.224 | took 509.2 ms | carried ids 100..113 | robot@id 100 (queued->106, lead 6) | srv 117 ms | L-gap 0.5cm R-gap 3.8cm
+[release-timing] 22 substeps/s | per-substep avg: total 46.3ms = recorder 24.2 + firmware 2.3 + dispatch 19.8 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=103, clock=103, appended ids 107..108 (+0 catch-up) -> queue 29
+16:07:27 INFO real_world.inference_controller: [infer] #45 | start 16:07:27.232 end 16:07:27.717 | took 484.8 ms | carried ids 103..116 | robot@id 103 (queued->108, lead 5) | srv 128 ms | L-gap 0.5cm R-gap 3.1cm
+16:07:28 INFO real_world.inference_controller: [infer] #46 | start 16:07:27.718 end 16:07:28.098 | took 379.7 ms | carried ids 105..118 | robot@id 104 (queued->110, lead 6) | srv 119 ms | anchor idx -1 OOR (buf (11, 20))
+[release-timing] 23 substeps/s | per-substep avg: total 43.4ms = recorder 20.1 + firmware 2.7 + dispatch 20.7 (STEP_TIME=8.3ms)
+16:07:28 INFO real_world.inference_controller: [infer] #47 | start 16:07:28.100 end 16:07:28.675 | took 574.5 ms | carried ids 107..120 | robot@id 108 (queued->113, lead 5) | srv 148 ms | L-gap 0.3cm R-gap 2.9cm
+[pipeline] append: obs_row=110, clock=111, appended ids 114..116 (+0 catch-up) -> queue 28
+16:07:29 INFO real_world.inference_controller: [infer] #48 | start 16:07:28.676 end 16:07:29.325 | took 649.2 ms | carried ids 110..123 | robot@id 111 (queued->116, lead 5) | srv 129 ms | L-gap 0.4cm R-gap 2.9cm
+[release-timing] 27 substeps/s | per-substep avg: total 37.4ms = recorder 13.5 + firmware 2.1 + dispatch 21.9 (STEP_TIME=8.3ms)
+16:07:29 INFO real_world.grasp_recovery: [grasp-check] right grip=0.0 (close>=60.0) closed=False armed=False checked=False
+16:07:29 INFO real_world.inference_controller: [infer] #49 | start 16:07:29.329 end 16:07:29.933 | took 603.7 ms | carried ids 113..126 | robot@id 113 (queued->119, lead 6) | srv 108 ms | L-gap 0.6cm R-gap 3.1cm
+16:07:30 INFO real_world.grasp_recovery: [grasp-check] open->close (grip=84.2) -> attempt ARMED, detector check in 5.0s
+[release-timing] 21 substeps/s | per-substep avg: total 48.9ms = recorder 23.2 + firmware 3.3 + dispatch 22.3 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=116, clock=115, appended ids 120..121 (+0 catch-up) -> queue 30
+16:07:30 INFO real_world.inference_controller: [infer] #50 | start 16:07:29.940 end 16:07:30.493 | took 553.4 ms | carried ids 116..129 | robot@id 115 (queued->121, lead 6) | srv 115 ms | anchor idx -1 OOR (buf (11, 20))
+16:07:30 INFO real_world.grasp_recovery: [grasp-check] grasp armed, settling 0.3/5.0s before detector runs
+16:07:30 INFO real_world.grasp_recovery: [grasp-check] released before the 5.0s check -> attempt cancelled
+16:07:31 INFO real_world.inference_controller: [infer] #51 | start 16:07:30.494 end 16:07:31.084 | took 589.5 ms | carried ids 118..131 | robot@id 118 (queued->123, lead 5) | srv 168 ms | L-gap 0.7cm R-gap 3.2cm
+16:07:31 INFO real_world.grasp_recovery: [grasp-check] open->close (grip=99.6) -> attempt ARMED, detector check in 5.0s
+[release-timing] 25 substeps/s | per-substep avg: total 41.4ms = recorder 18.1 + firmware 3.7 + dispatch 19.6 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=120, clock=121, appended ids 124..126 (+0 catch-up) -> queue 28
+16:07:31 INFO real_world.inference_controller: [infer] #52 | start 16:07:31.085 end 16:07:31.653 | took 568.6 ms | carried ids 120..133 | robot@id 121 (queued->126, lead 5) | srv 117 ms | L-gap 0.2cm R-gap 3.6cm
+16:07:31 INFO real_world.grasp_recovery: [grasp-check] grasp armed, settling 0.4/5.0s before detector runs
+[HumanoidEnv] arm_joint_states bad read (shape (0,)); using last good.
+16:07:31 INFO real_world.grasp_recovery: [grasp-check] right grip=1.2 (close>=60.0) closed=False armed=True checked=False
+16:07:31 INFO real_world.grasp_recovery: [grasp-check] released before the 5.0s check -> attempt cancelled
+16:07:32 INFO real_world.inference_controller: [infer] #53 | start 16:07:31.667 end 16:07:32.134 | took 467.0 ms | carried ids 123..136 | robot@id 123 (queued->128, lead 5) | srv 116 ms | L-gap 0.3cm R-gap 3.5cm
+16:07:32 INFO real_world.inference_controller: [auto] STOP requested — draining queue (53 inferences this run).
+[release-timing] 21 substeps/s | per-substep avg: total 48.4ms = recorder 23.4 + firmware 2.7 + dispatch 22.3 (STEP_TIME=8.3ms)
+[pipeline] append: obs_row=125, clock=125, appended ids 129..131 (+0 catch-up) -> queue 30
+16:07:32 INFO real_world.inference_controller: [infer] #54 | start 16:07:32.153 end 16:07:32.753 | took 600.6 ms | carried ids 125..138 | robot@id 125 (queued->131, lead 6) | srv 134 ms | L-gap 0.4cm R-gap 3.5cm
+[release-timing] 31 substeps/s | per-substep avg: total 32.9ms = recorder 12.7 + firmware 1.4 + dispatch 18.7 (STEP_TIME=8.3ms)
 
 
 
-"""
+""
 
 import logging
 import time

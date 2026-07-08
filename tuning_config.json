@@ -1,0 +1,9 @@
+{
+  "_note": "Live tuning overrides for robot_control_gui. Loaded ONCE at GUI startup; the code constants (TE_* in inference_controller.py, APPEND_AHEAD_ROWS in humanoid_env.py, SPEED_SCALE in timing.py) are only defaults when a key is absent here. Hand-edits take effect on the next launch. Delete this file to reset to code defaults.",
+  "te_radius": 6,
+  "te_sigma": 1.3967857142857143,
+  "te_m": 0.12321428571428572,
+  "te_buffer_len": 8,
+  "speed_scale": 2.53,
+  "append_ahead_rows": 6
+}
