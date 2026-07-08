@@ -89,7 +89,7 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         self._sim_stop = threading.Event()
 
         # 策略推理控制器（复用注入的 env）
-        self.inference = InferenceController(self.env, self.robot_info)
+        self.inference = InferenceController(self.env, self.robot_info, grasp_detector_path="data/grasp_detector/detector.pt")
 
         # 恢复上次保存的调参（平滑/执行参数），在搭建界面前应用，使控件初值与运行时一致。
         self._load_and_apply_tuning()
