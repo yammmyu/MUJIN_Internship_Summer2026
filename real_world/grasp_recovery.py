@@ -36,75 +36,6 @@ INTEGRATION (see the three call-ins in InferenceController):
     _run_inference (after `action`):
         if rec: rec.note_action(action)                    # track the grip command
 
-(ros2) mujin@PF3784S4:~/workspaces/humanoid$ python robot_control_gui.py 
-Init glog with processor name:python3.10, pid:550046
-/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/google/protobuf/__init__.py:37: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
-  __import__('pkg_resources').declare_namespace(__name__)
-pybullet build time: Jan 29 2025 23:16:28
-[startup] running safety pre-flight (tests/test_safety_invariants.py)…
-b3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-link-armb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-gripper_centerb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-No inertial data for link, using mass=1, localinertiadiagonal = 1,1,1, identity local inertial frameb3Warning[examples/Importers/ImportURDFDemo/BulletUrdfImporter.cpp,126]:
-right_gripper_center[HumanoidEnv]: started (collect=off, exec=on, real=on).
-[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
-[HumanoidEnv] sim-validated 1381 points (id 1); 1381 substep(s) staged for release.
-[HumanoidEnv] released 1381 validated pts (+89 ramp-in) to robot.
-[HumanoidEnv] release refused: nothing sim-validated (run 执行 first).
-[HumanoidEnv] sim-validated 1381 points (id 2); 2762 substep(s) staged for release.
-[HumanoidEnv] released 1381 validated pts (+91 ramp-in) to robot.
-[HumanoidEnv] dispatch-ramp: |Δq|=0.632 rad exceeds cap 0.033 -> streaming 19 bounded substeps
-[HumanoidEnv] E-STOP: latched; dropped 4229 pending/staged cmds; holding pose.
-[HumanoidEnv] release refused: E-stop latched (press 复位 to reset).
-[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).
-[safety] ALL INVARIANTS PASS (C1 C2 C3 C4 C5 H1)
-[startup] safety pre-flight passed.
-
-SLAM 模块初始化成功（已解冻关节状态）
-[INFO] [1783483424.279491321] [wheel_controller_example]: Wheel Controller Example node started. Publishing a target pose for the robot base.
-Exception in thread Thread-3 (_run):
-Traceback (most recent call last):
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
-    self.run()
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/threading.py", line 953, in run
-    self._target(*self._args, **self._kwargs)
-  File "/home/mujin/workspaces/humanoid/examples/control_wheel_example.py", line 33, in _run
-    self.slam = Slam()
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/a2d_sdk/robot.py", line 167, in __init__
-    self._slam = SlamCore()
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/a2d_sdk/core/slam/slam_core.py", line 53, in __init__
-    self.node_ = agibotdds.Node("A2DRosSlam")
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 213, in __init__
-    self.node = _AGIBOTDDS.new_PyNode(name)
-SystemError: <built-in function new_PyNode> returned NULL without setting an exception
-Exception ignored in: <function Node.__del__ at 0x701c995e3520>
-Traceback (most recent call last):
-  File "/home/mujin/miniconda3/envs/ros2/lib/python3.10/site-packages/cosine_bus/agibotdds_py3/agibotdds.py", line 225, in __del__
-    for publisher in self.list_publisher:
-AttributeError: 'Node' object has no attribute 'list_publisher'
-HTTP/JSON listening on http://0.0.0.0:9000/robot_info  (Ctrl-C to stop)
-12:03:48 INFO real_world.grasp_recovery: GraspRecoveryMonitor ready: settle=5.0s closed_grip_min=60.0 roi=(330, 265, 625, 480) thr=0.50 device=cpu
-12:03:48 INFO real_world.postprocess: smoothing set: radius=6 sigma=1.09 m=0.120
-12:03:48 INFO real_world.postprocess: te_buffer_len set: 8
-[HumanoidEnv] speed_scale=3.000 -> substeps_per_row=4, ramp_joint_step=0.0333
-[tuning] restored from /home/mujin/workspaces/humanoid/tuning_config.json
-12:03:49 INFO real_world.postprocess: smoothing set: radius=6 sigma=1.09 m=0.120
-12:03:49 INFO real_world.postprocess: te_buffer_len set: 8
-[HumanoidEnv] speed_scale=3.000 -> substeps_per_row=4, ramp_joint_step=0.0333
-[HumanoidEnv]: started (collect=on, exec=on, real=on).
-12:03:49 INFO real_world.inference_controller: InferenceController ready (env owned by caller).
-12:03:49 INFO xr_examples.pico_vr_server.server: Downstream listening on 0.0.0.0:5555
-12:03:49 INFO xr_examples.pico_vr_server.server: Upstream listening on 0.0.0.0:5556
-^Z[2]   Killed                  python robot_control_gui.py
-[3]   Killed                  python robot_control_gui.py
-
-[5]+  Stopped                 python robot_control_gui.py
-(ros2) mujin@PF3784S4:~/workspaces/humanoid$ python -c "import torch,torchvision; print("torch.__version__","torchvision.__version__")"
-2.12.1+cpu 0.27.1+cpu
-(ros2) mujin@PF3784S4:~/workspaces/humanoid$ 
-
 """
 
 import logging
@@ -290,6 +221,12 @@ class GraspRecoveryMonitor:
             env._robot_q.clear()
             env._staged_release.clear()
             env._queued_through = -1                       # next append re-anchors to the clock
+        # The retreat streams straight to append_actions, BYPASSING pipeline.merge(), so its master
+        # ids never enter the smoothed buffer. Clear that buffer now so the FIRST post-retreat merge
+        # re-anchors from the live clock instead of materializing a stale pre-miss run that stops at
+        # the retreat-id gap — which would starve append_actions and freeze the arm until an E-stop
+        # re-anchor (exactly the "only lock_robot+reset revives it" symptom).
+        env.pipeline.reset_merge()
         cur, _ = env.queue_status()
         left = np.asarray(obs["robotl_eef_pos"][-1], dtype=float)     # [pos3, rot6d6] held
         left_grip = float(obs["robot0_grip"][-1][0])
