@@ -117,44 +117,73 @@ class GraspRecoveryMonitor:
         self._anchor_id = None        # master id of retreat row 0
         self._end_id = None           # master id of the last retreat row
         self._retreat_deadline = None
-        log.info("GraspRecoveryMonitor ready: settle=%.1fs roi=%s thr=%.2f",
-                 settle_sec, self.det.roi, self.det.threshold)
+        self._log_ts = {}             # key -> last monotonic log time (rate-limits hot-loop logs)
+        log.info("GraspRecoveryMonitor ready: settle=%.1fs closed_grip_min=%.1f roi=%s thr=%.2f "
+                 "device=%s", settle_sec, self.closed_grip_min, self.det.roi, self.det.threshold,
+                 self.det.device)
+
+    def _throttled(self, key, interval=2.0):
+        """True at most once per `interval` s for `key` — keeps the per-chunk diagnostics readable."""
+        now = time.monotonic()
+        if now - self._log_ts.get(key, 0.0) >= interval:
+            self._log_ts[key] = now
+            return True
+        return False
 
     # -- hook 1: every policy chunk, to track the right-grip command ------------
     def note_action(self, action_chunk):
         a = np.asarray(action_chunk, dtype=float)
         if a.ndim != 2 or a.shape[1] <= R_GRIP:
+            if self._throttled("shape", 5.0):
+                log.warning("[grasp-check] action chunk shape %s has no right-grip col (need 2-D with "
+                            ">%d cols, i.e. a 20-col dual-arm row) -> grip tracking OFF, detector will "
+                            "never fire", a.shape, R_GRIP)
             return
-        closed_now = bool(a[-1, R_GRIP] >= self.closed_grip_min)
+        rgrip = float(a[-1, R_GRIP])
+        closed_now = bool(rgrip >= self.closed_grip_min)
+        if self._throttled("grip", 2.0):                  # heartbeat: proves note_action is running
+            log.info("[grasp-check] right grip=%.1f (close>=%.1f) closed=%s armed=%s checked=%s",
+                     rgrip, self.closed_grip_min, closed_now, self._close_t is not None, self._checked)
         if closed_now and not self._prev_closed:          # open -> close: attempt starts
             self._close_t = time.monotonic()
             self._checked = False
+            log.info("[grasp-check] open->close (grip=%.1f) -> attempt ARMED, detector check in %.1fs",
+                     rgrip, self.settle_sec)
         elif not closed_now and self._prev_closed and not self._checked:
             self._close_t = None                          # released before the check -> cancel it
+            log.info("[grasp-check] released before the %.1fs check -> attempt cancelled", self.settle_sec)
         self._prev_closed = closed_now
 
     # -- hook 2: every loop BEFORE predict. True => entered recovery (skip predict)
     def maybe_start(self, env, obs) -> bool:
         if self._retreating or self._close_t is None or self._checked:
             return False
-        if time.monotonic() - self._close_t < self.settle_sec:
+        waited = time.monotonic() - self._close_t
+        if waited < self.settle_sec:
+            if self._throttled("settle", 1.0):
+                log.info("[grasp-check] grasp armed, settling %.1f/%.1fs before detector runs",
+                         waited, self.settle_sec)
             return False
         self._checked = True
+        log.info("[grasp-check] settle elapsed -> running detector on right wrist frame")
 
         frame = obs.get("handr_imgs")
         if isinstance(frame, (list, tuple)):
             frame = frame[-1] if frame else None
         if frame is None:
-            log.warning("[grasp-check] no right wrist frame in obs")
+            log.warning("[grasp-check] no 'handr_imgs' right-wrist frame in obs (keys=%s) -> "
+                        "cannot run detector", list(obs.keys()))
             return False
 
         p = self.det.p_empty(frame)
         if p < self.det.threshold:
-            log.info("[grasp-check] P_empty=%.2f -> held", p)
+            log.info("[grasp-check] detector P_empty=%.2f < thr=%.2f -> grasp HELD, no recovery",
+                     p, self.det.threshold)
             return False
 
         self._begin_retreat(env, obs)
-        log.warning("[recovery] missed grasp (P_empty=%.2f) -> streaming retreat", p)
+        log.warning("[recovery] missed grasp (P_empty=%.2f >= thr=%.2f) -> streaming retreat",
+                    p, self.det.threshold)
         return True
 
     @property

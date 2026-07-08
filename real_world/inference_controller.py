@@ -507,6 +507,8 @@ class InferenceController:
             self.inference_thread = threading.Thread(target=_run_auto_inference, daemon=True)
             cadence = f"{self.inference_hz:.1f} Hz cap" if self.inference_hz and self.inference_hz > 0 \
                 else "uncapped (latency-bound)"
-            log.info("[auto] START -> robot | server %s:%s | %s | temporal-ensemble %s",
-                     self.host, self.port, cadence, "ON" if self.use_temporal_ensemble else "OFF")
+            rec_state = "ON" if getattr(self, "recovery", None) is not None \
+                else "OFF (no detector checkpoint — set grasp_detector_path or HUMANOID_GRASP_DETECTOR)"
+            log.info("[auto] START -> robot | server %s:%s | %s | temporal-ensemble %s | grasp-recovery %s",
+                     self.host, self.port, cadence, "ON" if self.use_temporal_ensemble else "OFF", rec_state)
             self.inference_thread.start()
