@@ -41,7 +41,7 @@ SPEED_SCALE = 0.2       # [persisted: tuning_config.json] DEFAULT SEED ONLY. The
                         # entry (e.g. headless). TUNE (0,1+]: fraction of demo speed. LOWER -> more
                         # substeps/row (smoother + slower, chunk lasts longer so the append buffer
                         # starves less); >1 = faster. Alignment stays correct at any value (row-id keyed).
-RECORD_HZ = 30          # policy action-row cadence (training / recording rate), Hz. NOT a free knob:
+RECORD_HZ = 10          # policy action-row cadence (training / recording rate), Hz. NOT a free knob:
                         # fixed by how the policy was trained; changing it desyncs row timing.
 CONTROL_HZ = 120        # TUNE: substep streaming rate to the arm controller, Hz. Primary motion-
                         # RESOLUTION knob: higher -> more substeps/row -> finer motion. Raise toward

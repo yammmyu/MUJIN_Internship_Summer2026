@@ -536,7 +536,7 @@ class InferenceMixin:
         # 速度：占演示速度的比例。越小越慢、每行子步更多（更平滑），且一个 chunk 持续更久。
         ttk.Label(egrid, text="速度 (speed_scale):", anchor=tk.W).grid(row=0, column=0, sticky="w", pady=3)
         self._ex_speed_var = tk.DoubleVar(value=round(self.env.speed_scale, 2))
-        self._tuning_widgets.append(ttk.Scale(egrid, from_=0.05, to=1.0, orient=tk.HORIZONTAL,
+        self._tuning_widgets.append(ttk.Scale(egrid, from_=0.05, to=3.0, orient=tk.HORIZONTAL,
                   variable=self._ex_speed_var, command=lambda _v: self._apply_exec_knobs()))
         self._tuning_widgets[-1].grid(row=0, column=1, sticky="ew", padx=8)
 

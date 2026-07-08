@@ -58,7 +58,7 @@ INFERENCE_HZ = 0  # TUNE (Hz): auto-inference cadence cap. <=0 -> run back-to-ba
 # / set_buffer_len / te_radius / te_sigma / te_m / te_buffer_len) as delegators for the GUI. The four
 # TE_* seeds and USE_TEMPORAL_ENSEMBLE / SMOOTHNESS_WARN_DPOS defaults live in postprocess.py.
 PC4080_HOST = "10.12.11.144"
-PC4080_PORT = 9001
+PC4080_PORT = 9000
 
 
 def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict:
@@ -103,7 +103,7 @@ class InferenceController:
     def __init__(self, env, robot_info=None,
                  host=PC4080_HOST, port=PC4080_PORT,
                  record_hz=RECORD_HZ, inference_hz=INFERENCE_HZ,
-                 obs_source=None, grasp_detector_path=None):
+                 obs_source=None, grasp_detector_path='/home/mujin/workspaces/humanoid/data/grasp_detector/detector.pt'):
         self.humanoid_env = env                 # owned/started/stopped by the caller (GUI)
         self.robot_info = robot_info            # shared with robot_info_server (None = headless)
         # Where observations come from: the live env by default, or an injected source (e.g.

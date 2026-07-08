@@ -16,6 +16,8 @@ log
 *.log
 *.log.INFO*
 live_joints.jsonl
+released_substeps.jsonl
+buffer.jsonl
 
 # --- Editor / backup files ---
 *.bak
@@ -26,7 +28,6 @@ live_joints.jsonl
 *.npz
 recordings/
 recordings_left/
-infer_logs/
 
 # --- Legacy SDK snapshot (kept on disk, not tracked) ---
 G1_SDK_ENV/

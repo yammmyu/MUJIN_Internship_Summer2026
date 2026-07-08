@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 # Raw gripper value at/above which we call the gripper CLOSED (-> 1). The [0,~85] signal is noisy
 # (transient spikes), so only a (near-)fully-closed reading binarizes to 1. Single home for the
 # pipeline; humanoid_env re-exports it for back-compat (scripts import it from there).
-GRIPPER_CLOSE_THRESH = 10.0
+GRIPPER_CLOSE_THRESH = 60.0
 
 # How many policy rows append_actions keeps queued AHEAD of the master clock (the streaming commit-
 # ahead distance). Live-tunable via the pipeline. humanoid_env re-exports it for back-compat.
