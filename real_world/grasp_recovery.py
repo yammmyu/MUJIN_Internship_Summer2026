@@ -610,6 +610,8 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.models import resnet18
 
+from real_world.ik import rot6d_to_quat, quat_to_rot6d, slerp
+
 log = logging.getLogger(__name__)
 
 # 20-col dual_arm_ee_image action row: L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1]
@@ -656,6 +658,11 @@ class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
                  settle_sec=5.0,
                  retreat_offset=(0.0, 0.0, 0.05),   # world-frame dxyz on right EE; +Z = lift
+                 # Right-EE orientation (xyzw, base frame) the wrist RESETS to during the retreat,
+                 # SLERPed from the live orientation over retreat_rows (synced with the lift). Default
+                 # = right_quat[-1] of MDM_data_collection/recordings/recording001 (right j7 ~ -1.88).
+                 # None -> hold the live orientation (old behaviour).
+                 retreat_right_quat=(0.570176, 0.396823, 0.594127, -0.405517),
                  retreat_rows=12,                    # interpolated rows in the scripted retreat
                  retreat_timeout_sec=10.0,           # hard cap on a single retreat
                  open_grip=0.0,                      # retreat feeds append_actions directly (bypasses
@@ -666,6 +673,8 @@ class GraspRecoveryMonitor:
         self.det = _Detector(detector_path, device=device)
         self.settle_sec = settle_sec
         self.retreat_offset = np.asarray(retreat_offset, dtype=float)
+        self.retreat_right_quat = (np.asarray(retreat_right_quat, dtype=float)
+                                   if retreat_right_quat is not None else None)
         self.retreat_rows = int(retreat_rows)
         self.retreat_timeout_sec = retreat_timeout_sec
         self.open_grip = float(open_grip)
@@ -792,13 +801,21 @@ class GraspRecoveryMonitor:
         left = np.asarray(obs["robotl_eef_pos"][-1], dtype=float)     # [pos3, rot6d6] held
         left_grip = float(obs["robot0_grip"][-1][0])
         right = np.asarray(obs["robotr_eef_pos"][-1], dtype=float)    # [pos3, rot6d6]
-        r_pos0, r_rot = right[0:3], right[3:9]
+        r_pos0, r_rot0 = right[0:3], right[3:9]
         r_pos1 = r_pos0 + self.retreat_offset
+        # Orientation: reset the right wrist to a scripted orientation (self.retreat_right_quat) by
+        # SLERPing from the live orientation over the retreat, so the twist is synchronized with the
+        # +Z lift and stays C5-bounded (no snap). None -> hold the live orientation. Staying in
+        # EE-space keeps IK + sim-validation consistent (vs stomping a joint post-IK).
+        r_quat0 = rot6d_to_quat(r_rot0)
+        r_quat1 = self.retreat_right_quat
         # interpolate current -> lifted target over retreat_rows; gripper OPEN from row 0
         traj = []
         for k in range(1, self.retreat_rows + 1):
-            rp = r_pos0 + (k / self.retreat_rows) * (r_pos1 - r_pos0)
-            traj.append([*left, left_grip, *rp, *r_rot, self.open_grip])
+            t = k / self.retreat_rows
+            rp = r_pos0 + t * (r_pos1 - r_pos0)
+            rr = quat_to_rot6d(slerp(r_quat0, r_quat1, t)) if r_quat1 is not None else r_rot0
+            traj.append([*left, left_grip, *rp, *rr, self.open_grip])
         self._retreat_traj = traj
         self._anchor_id = int(cur)
         self._end_id = int(cur) + self.retreat_rows - 1

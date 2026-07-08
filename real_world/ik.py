@@ -94,6 +94,13 @@ def rot6d_to_quat(rot6d):
     return np.asarray(se3_to_pos_quat_xyzw(pin.SE3(m, np.zeros(3)))[1], dtype=np.float64)
 
 
+def quat_to_rot6d(quat_xyzw):
+    """Quaternion [x, y, z, w] -> 6D rotation (first two rotation-matrix columns). Inverse of
+    rot6d_to_quat (rot6d = [R[:,0], R[:,1]])."""
+    R = quat_xyzw_to_se3(np.zeros(3), quat_xyzw).rotation
+    return np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
+
+
 def decode_action_row(row):
     """LEFT half of a policy action row [eef_pos(3), 6D_rot(6), gripper(1)] ->
     (pos(3), quat_xyzw(4), grip). Reads cols 0:10, so it works on both a 10-col left row and a
