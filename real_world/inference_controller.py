@@ -310,13 +310,40 @@ class InferenceController:
         self._infer_count += 1
         if submit:
             span = f"{int(base_id)}..{int(base_id) + rows - 1}" if rows else str(int(base_id))
+            # DIAGNOSTIC: how far is the row auto is about to run from where the arm ACTUALLY is?
+            # The row for the live clock sits at buf index (clk - base_id). If |current EE - that row|
+            # is large, auto is commanding a jump away from the current pose (the "ignores current
+            # state / moves to another location" symptom) rather than continuing from it.
+            gap = self._anchor_gap(obs, buf, base_id, clk)
             log.info("[infer] #%d | start %s end %s | took %.1f ms | carried ids %s | "
-                     "robot@id %d (queued->%d, lead %d)%s%s",
+                     "robot@id %d (queued->%d, lead %d)%s%s%s",
                      self._infer_count, _hms(t_start_wall), _hms(t_end_wall), dur_ms, span,
                      clk, qthru, qthru - clk,
                      f" | srv {srv_ms:.0f} ms" if srv_ms >= 50 else "",
-                     "" if append_ok is None or append_ok else " | append SKIPPED")
+                     "" if append_ok is None or append_ok else " | append SKIPPED",
+                     gap)
         return True
+
+    @staticmethod
+    def _anchor_gap(obs, buf, base_id, clk):
+        """Diagnostic string: EE-position gap (m) between the arm's CURRENT pose and the buffer row
+        that maps to the live master clock (index clk-base_id). A big gap = auto is anchoring away
+        from the current state. Returns '' if it can't be computed (shape/index out of range)."""
+        try:
+            b = np.asarray(buf, dtype=float)
+            i0 = int(clk) - int(base_id)
+            if b.ndim != 2 or not (0 <= i0 < b.shape[0]):
+                return f" | anchor idx {i0} OOR (buf {b.shape})"
+            row = b[i0]
+            lcur = np.asarray(obs["robotl_eef_pos"][-1], dtype=float)[0:3]
+            dl = float(np.linalg.norm(row[0:3] - lcur))
+            msg = f" | L-gap {dl*100:.1f}cm"
+            if b.shape[1] > 19:                            # dual-arm row: right EE too
+                rcur = np.asarray(obs["robotr_eef_pos"][-1], dtype=float)[0:3]
+                msg += f" R-gap {float(np.linalg.norm(row[10:13] - rcur))*100:.1f}cm"
+            return msg
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------------ #
     #  Live-tunable smoothing knobs — delegated to env.pipeline (the       #
