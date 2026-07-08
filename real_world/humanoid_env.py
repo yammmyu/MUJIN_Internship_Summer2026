@@ -856,6 +856,13 @@ class HumanoidEnv:
         # DIAGNOSTIC: per-substep timing split (recorder I/O vs firmware check vs dispatch), averaged
         # and printed ~1/s. If total >> STEP_TIME the release loop — not inference — caps arm speed.
         _t = {"rec": 0.0, "fw": 0.0, "disp": 0.0, "tot": 0.0, "n": 0, "log": time.monotonic()}
+        # The per-substep trace recorders (below) do 2 file writes + an EXTRA DDS joint read every
+        # tick. At idle that costs ~0.3ms, but under the live auto pipeline (3 cameras + inference +
+        # IK/sim all contending for the GIL and the DDS bus) it balloons to ~20ms — over half the
+        # 8.3ms tick budget — starving this 120Hz loop down to ~26Hz (arm ~5x slow). They are a debug
+        # aid ONLY, so keep them OFF unless HUMANOID_SUBSTEP_TRACE is explicitly set.
+        import os
+        trace_substeps = os.environ.get("HUMANOID_SUBSTEP_TRACE", "") not in ("", "0", "false", "False")
         while not self._stop_event.is_set():
             if self._estop.is_set():
                 self._stop_event.wait(STEP_TIME)
@@ -875,25 +882,28 @@ class HumanoidEnv:
             # the ABSOLUTE left-arm joint command (q7, rad) + binary gripper, keyed by master row id
             # (post-IK target actually sent, vs chunks.jsonl's EE-space chunk). Recorder 2: the LIVE
             # measured joints at the same tick, same id, for tracking-error / lag analysis. The whole
-            # block is wrapped so a disk/IO error logs once and motion continues.
-            try:
-                q14_cmd, grip_cmd = sub[0], sub[1]
-                with open(TRACE_DIR / "released_substeps.jsonl", "a") as f:
-                    f.write(json.dumps({
-                        "step_id": row_id,
-                        "q14": np.asarray(q14_cmd, dtype=np.float64).tolist(),   # [left7, right7]
-                        "grip": (None if grip_cmd is None else
-                                 [float(grip_cmd[0]), float(grip_cmd[1])]),      # [gl, gr]
-                    }) + "\n")
+            # block is wrapped so a disk/IO error logs once and motion continues. Gated OFF by default
+            # (see trace_substeps above) — the file I/O + extra DDS read here is what caps arm speed
+            # under the live auto pipeline.
+            if trace_substeps:
                 try:
-                    live_vals, _ = self.robot.arm_joint_states()
-                    live_joints = np.asarray(live_vals, dtype=np.float64).tolist()
-                except Exception:
-                    live_joints = None
-                with open(TRACE_DIR / "live_joints.jsonl", "a") as f:
-                    f.write(json.dumps({"step_id": row_id, "joints": live_joints}) + "\n")
-            except Exception as e:
-                print(f"[HumanoidEnv] substep recorder failed (continuing): {e}")
+                    q14_cmd, grip_cmd = sub[0], sub[1]
+                    with open(TRACE_DIR / "released_substeps.jsonl", "a") as f:
+                        f.write(json.dumps({
+                            "step_id": row_id,
+                            "q14": np.asarray(q14_cmd, dtype=np.float64).tolist(),   # [left7, right7]
+                            "grip": (None if grip_cmd is None else
+                                     [float(grip_cmd[0]), float(grip_cmd[1])]),      # [gl, gr]
+                        }) + "\n")
+                    try:
+                        live_vals, _ = self.robot.arm_joint_states()
+                        live_joints = np.asarray(live_vals, dtype=np.float64).tolist()
+                    except Exception:
+                        live_joints = None
+                    with open(TRACE_DIR / "live_joints.jsonl", "a") as f:
+                        f.write(json.dumps({"step_id": row_id, "joints": live_joints}) + "\n")
+                except Exception as e:
+                    print(f"[HumanoidEnv] substep recorder failed (continuing): {e}")
 
             _t1 = time.monotonic()
             if self._firmware_unsafe():                        # defense-in-depth: firmware fault
@@ -932,21 +942,28 @@ class HumanoidEnv:
         # enqueue/splice time, so the live _robot_q can be drained one substep per tick (and spliced
         # into mid-stream by auto-inference) without an over-cap velocity.
         # robot_states: the observation that anchors the trajectory (8.2.4). Reads only, optional.
-        robot_states = {}
-
-
-        try:
-            robot_states["arm"] = list(self.robot.arm_joint_states()[0])
-        except Exception:
-            pass
-        try:
-            robot_states["waist"] = list(self.robot.waist_joint_states()[0])
-        except Exception:
-            pass
-        try:
-            robot_states["head"] = list(self.robot.head_joint_states()[0])
-        except Exception:
-            pass
+        # The release loop calls this ONCE PER SUBSTEP (120Hz), so re-reading arm+waist+head here
+        # meant 3 DDS round-trips every tick — under the live auto pipeline that DDS/GIL contention
+        # inflated dispatch from ~0.3ms to ~10ms. These states barely change tick-to-tick and are only
+        # an anchor, so cache them and refresh at ~RECORD_HZ (10Hz) instead of CONTROL_HZ (120Hz).
+        now = time.monotonic()
+        if getattr(self, "_rs_cache", None) is None or (now - self._rs_cache_t) >= ROW_DT:
+            rs = {}
+            try:
+                rs["arm"] = list(self.robot.arm_joint_states()[0])
+            except Exception:
+                pass
+            try:
+                rs["waist"] = list(self.robot.waist_joint_states()[0])
+            except Exception:
+                pass
+            try:
+                rs["head"] = list(self.robot.head_joint_states()[0])
+            except Exception:
+                pass
+            self._rs_cache = rs
+            self._rs_cache_t = now
+        robot_states = self._rs_cache
         # Seed the dispatch guard from the live pose on the first command so even the very first
         # waypoint is velocity-bounded from where the arm actually is.
         if self._last_cmd_q14 is None and not ignore_estop:
