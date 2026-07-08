@@ -853,6 +853,9 @@ class HumanoidEnv:
         Substeps are pre-subdivided to <= MAX_JOINT_STEP at enqueue/splice time, so per-tick streaming
         stays velocity-bounded (C5). Each substep is its own single-waypoint trajectory, so an E-stop
         halts the arm within ~STEP_TIME (C3). The env is the CONSUMER; the pipeline is the producer."""
+        # DIAGNOSTIC: per-substep timing split (recorder I/O vs firmware check vs dispatch), averaged
+        # and printed ~1/s. If total >> STEP_TIME the release loop — not inference — caps arm speed.
+        _t = {"rec": 0.0, "fw": 0.0, "disp": 0.0, "tot": 0.0, "n": 0, "log": time.monotonic()}
         while not self._stop_event.is_set():
             if self._estop.is_set():
                 self._stop_event.wait(STEP_TIME)
@@ -861,6 +864,7 @@ class HumanoidEnv:
             if sub is None:
                 self._stop_event.wait(STEP_TIME)
                 continue
+            _t0 = time.monotonic()
             # The master row this substep realized (auto path tags a row id as the 3rd element; the
             # manual release path is a 2-tuple). pop_next_substep already advanced the clock; we read
             # the id here only for the diagnostic recorders below.
@@ -891,13 +895,25 @@ class HumanoidEnv:
             except Exception as e:
                 print(f"[HumanoidEnv] substep recorder failed (continuing): {e}")
 
+            _t1 = time.monotonic()
             if self._firmware_unsafe():                        # defense-in-depth: firmware fault
                 self.lock_robot()
                 continue
+            _t2 = time.monotonic()
             # run_trajectory_control([sub]) sends the one waypoint AND paces STEP_TIME internally,
             # so there is no extra wait here (that would double the period).
             if not self.run_trajectory_control([sub]):
                 self.lock_robot()                              # couldn't dispatch -> estop
+            _t3 = time.monotonic()
+            _t["rec"] += _t1 - _t0; _t["fw"] += _t2 - _t1; _t["disp"] += _t3 - _t2
+            _t["tot"] += _t3 - _t0; _t["n"] += 1
+            if _t3 - _t["log"] >= 1.0 and _t["n"]:
+                n = _t["n"]
+                print(f"[release-timing] {n} substeps/s | per-substep avg: "
+                      f"total {_t['tot']/n*1e3:.1f}ms = recorder {_t['rec']/n*1e3:.1f} + "
+                      f"firmware {_t['fw']/n*1e3:.1f} + dispatch {_t['disp']/n*1e3:.1f} "
+                      f"(STEP_TIME={STEP_TIME*1e3:.1f}ms)")
+                _t = {"rec": 0.0, "fw": 0.0, "disp": 0.0, "tot": 0.0, "n": 0, "log": _t3}
 
     def run_trajectory_control(self, points, ignore_estop=False):
         """Stream a batch of sim-validated DUAL-arm waypoints to trajectory_tracking_control ONE at
