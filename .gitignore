@@ -26,6 +26,7 @@ live_joints.jsonl
 *.npz
 recordings/
 recordings_left/
+infer_logs/
 
 # --- Legacy SDK snapshot (kept on disk, not tracked) ---
 G1_SDK_ENV/
