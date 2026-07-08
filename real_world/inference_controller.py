@@ -482,6 +482,8 @@ class InferenceController:
             return
 
         self.is_auto_inference = True
+        if hasattr(env, "reset_grip_latch"):
+            env.reset_grip_latch()                         # fresh run -> gripper can re-latch from scratch
 
         def _run_auto_inference():
             # Target a fixed inference cadence so the loop is controllable via inference_hz (a

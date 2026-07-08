@@ -229,6 +229,14 @@ class HumanoidEnv:
         self._release_thread = None
         self._last_good_arm14 = None                 # last finite 14-joint read (observation anchor)
 
+        # Gripper CLOSE LATCH (anti-regrab): once a channel has been COMMANDED closed continuously for
+        # _grip_latch_sec, fix it at closed so a policy that keeps toggling can't re-open/re-grab. Per
+        # channel [left, right]; "closed" = the binary dispatch command (== the upstream GRIPPER_CLOSE_
+        # THRESH binarize). Reset by reset_grip_latch (E-stop / reset / auto start). None -> disabled.
+        self._grip_latch_sec = 5.0
+        self._grip_closed_since = [None, None]       # monotonic time each channel's closed streak began
+        self._grip_latched = [False, False]          # channel currently fixed at closed
+
         # Camera subscriptions are owned by a CameraHub (its own lock; one SDK camera object per
         # camera, opened/closed on demand). `cameras=` (constructor) are the PINNED cameras — kept
         # ON for the env's life, e.g. data collection; `allowed_cameras` is the requestable set.
@@ -728,6 +736,7 @@ class HumanoidEnv:
         until a fresh 执行→释放 (the previous trajectory was consumed)."""
         self._estop.clear()
         self._last_cmd_q14 = None       # arm may have moved while latched -> re-seed guard from live
+        self.reset_grip_latch()         # fresh start -> a new grasp can re-latch from scratch
         print("[HumanoidEnv] E-stop reset; release re-enabled (run 执行 then 释放).")
 
     @property
@@ -836,6 +845,37 @@ class HumanoidEnv:
         except Exception as e:
             print(f"[HumanoidEnv] arm_joint_states read failed: {e}; using last good.")
         return self._last_good_arm14.copy() if self._last_good_arm14 is not None else None
+
+    def reset_grip_latch(self):
+        """Clear the gripper close-latch state so a channel can re-open after a fresh start
+        (E-stop / reset / new auto run). Both channels drop their closed streak + latch."""
+        self._grip_closed_since = [None, None]
+        self._grip_latched = [False, False]
+
+    def _latched_grip(self, grip_bin):
+        """Anti-regrab latch applied at dispatch: given the binary [gl, gr] this substep would send,
+        return the effective pair. A channel COMMANDED closed continuously for _grip_latch_sec is
+        latched to closed (1) and stays closed until reset_grip_latch; any open command before the
+        streak completes just resets that channel's timer. _grip_latch_sec None -> pass through."""
+        if self._grip_latch_sec is None:
+            return grip_bin
+        now = time.monotonic()
+        out = [grip_bin[0], grip_bin[1]]
+        for i in (0, 1):
+            if self._grip_latched[i]:
+                out[i] = 1                                    # fixed closed
+                continue
+            if grip_bin[i] >= 1:                              # commanded closed -> grow the streak
+                if self._grip_closed_since[i] is None:
+                    self._grip_closed_since[i] = now
+                elif now - self._grip_closed_since[i] >= self._grip_latch_sec:
+                    self._grip_latched[i] = True
+                    print(f"[HumanoidEnv] gripper channel {i} closed >= {self._grip_latch_sec:.1f}s "
+                          f"-> LATCHED closed (anti-regrab; reset on E-stop/restart).")
+                out[i] = 1
+            else:                                             # commanded open -> streak broken
+                self._grip_closed_since[i] = None
+        return out
 
     # ===================== consumer: sim-preview execution loop =====================
     def _sim_loop(self):
@@ -999,9 +1039,12 @@ class HumanoidEnv:
             else:
                 waypoints = [q14]
             # Grippers (binary) accompany the motion; send once for the whole (possibly ramped) step.
+            # Anti-regrab close-latch applied here so a sustained grasp can't be re-opened by a toggling
+            # policy (see _latched_grip); the hold path (ignore_estop) never touches the grippers.
             if grip is not None:
                 gl, gr = grip
-                self.robot.move_gripper([1 if gl >= 0.5 else 0, 1 if gr >= 0.5 else 0])
+                self.robot.move_gripper(self._latched_grip([1 if gl >= 0.5 else 0,
+                                                            1 if gr >= 0.5 else 0]))
             for wp in waypoints:
                 if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
                     return True
