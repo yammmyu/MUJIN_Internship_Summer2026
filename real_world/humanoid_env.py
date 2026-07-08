@@ -900,16 +900,16 @@ class HumanoidEnv:
                 self.lock_robot()                              # couldn't dispatch -> estop
 
     def run_trajectory_control(self, points, ignore_estop=False):
-        """Stream a batch of sim-validated LEFT-arm waypoints to trajectory_tracking_control ONE at
+        """Stream a batch of sim-validated DUAL-arm waypoints to trajectory_tracking_control ONE at
         a time (ABS_JOINT, SDK doc 8.2.4), pacing at STEP_TIME and bailing on E-stop between points
         so the arm can be halted mid-batch (the SDK has no trajectory abort). robot_states is read
         once up front as the observation anchor (a read, never a command).
 
-        points: [(q7, grip), ...] sim-achieved left-arm joints (rad) + binary {0,1} gripper, or
-        grip=None to leave the gripper untouched (the E-stop hold). BLOCKS for ~len(points) *
-        STEP_TIME while streaming. Each waypoint addresses only the LEFT arm and (when grip is not
-        None) the 'gripper' group — the right arm and right gripper are never addressed, so they
-        hold. Returns True on normal completion or an E-stop/shutdown halt; False on a dispatch error."""
+        points: [(q14, grip), ...] sim-achieved joints (rad) for BOTH arms — q14 = [left7, right7] —
+        plus a binary {0,1} [gl, gr] gripper pair, or grip=None to leave the grippers untouched (the
+        E-stop hold). BLOCKS for ~len(points) * STEP_TIME while streaming. Each waypoint drives both
+        arms (left_arm=q14[:7], right_arm=q14[7:]) and, when grip is not None, both gripper channels.
+        Returns True on normal completion or an E-stop/shutdown halt; False on a dispatch error."""
         if not points:
             return True
         # points are already <= MAX_JOINT_STEP apart (C5): subdivision now happens UPSTREAM at

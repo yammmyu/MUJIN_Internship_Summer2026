@@ -103,7 +103,7 @@ class InferenceController:
     def __init__(self, env, robot_info=None,
                  host=PC4080_HOST, port=PC4080_PORT,
                  record_hz=RECORD_HZ, inference_hz=INFERENCE_HZ,
-                 obs_source=None):
+                 obs_source=None, grasp_detector_path=None):
         self.humanoid_env = env                 # owned/started/stopped by the caller (GUI)
         self.robot_info = robot_info            # shared with robot_info_server (None = headless)
         # Where observations come from: the live env by default, or an injected source (e.g.
@@ -136,6 +136,22 @@ class InferenceController:
         if TRACE_JSONL:
             self._trace_files.update({name: open(TRACE_DIR / f"{name}.jsonl", "a")
                                       for name in ("requests", "chunks")})
+
+        # CCDP grasp-failure recovery (opt-in). Built ONLY when a detector checkpoint is given (arg
+        # or HUMANOID_GRASP_DETECTOR) and exists on disk; otherwise self.recovery stays None and the
+        # three loop call-ins are no-ops. torch/torchvision are imported lazily inside the module so
+        # the controller keeps no hard dependency on them when recovery is off.
+        self.recovery = None
+        det_path = grasp_detector_path or os.environ.get("HUMANOID_GRASP_DETECTOR", "")
+        if det_path and os.path.exists(det_path):
+            try:
+                from real_world.grasp_recovery import GraspRecoveryMonitor
+                from real_world.postprocess import GRIPPER_CLOSE_THRESH
+                self.recovery = GraspRecoveryMonitor(det_path, closed_grip_min=GRIPPER_CLOSE_THRESH)
+            except Exception as e:
+                log.warning("grasp recovery disabled (failed to load %s): %r", det_path, e)
+        elif det_path:
+            log.warning("grasp recovery disabled: detector checkpoint not found at %s", det_path)
 
     def _trace(self, name, obj):
         """Append one JSON line to the named trace file (no-op if that file's handle isn't open:
@@ -197,6 +213,13 @@ class InferenceController:
             log.debug("timestamp has not advanced")
             return False
 
+        # CCDP grasp-failure recovery (opt-in: inert unless self.recovery is set). If a grasp
+        # check is due and the right hand closed on nothing, this clears the queue and enters
+        # the streaming-retreat mode (pumped from the auto loop) — skip predicting this cycle.
+        rec = getattr(self, "recovery", None)
+        if rec is not None and rec.maybe_start(env, obs):
+            return True
+
         req = build_predict_request(obs)
 
         # Log the proprioception sent to the policy server, keyed by the same obs_ts that
@@ -226,6 +249,10 @@ class InferenceController:
         self._last_inference_obs_ts = ts
         # A fresh chunk restarts the manual step-through from the first row.
         self._exec_cursor = 0
+
+        # Track the right-gripper command so recovery can spot an open->close grasp attempt.
+        if rec is not None:
+            rec.note_action(action)
 
         # POST-PROCESSING (stage 1: gripper binarize + temporal-ensemble merge). The pipeline binarizes
         # the grippers in place and, for AUTO/streaming (submit=True), splices this chunk into its
@@ -412,6 +439,11 @@ class InferenceController:
                          self._infer_count)
                 self.inference_thread.join()
                 self.inference_thread = None
+            # Clear any in-flight retreat so a later restart begins fresh instead of resuming a stale
+            # one anchored at an old clock value.
+            rec = getattr(self, "recovery", None)
+            if rec is not None:
+                rec.reset()
             # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
             # the env E-stop to halt immediately instead.)
             return
@@ -439,8 +471,19 @@ class InferenceController:
                 # the brief window before we notice here.)
                 if self.humanoid_env.estopped:
                     log.warning("E-stop latched — disarming auto-inference.")
+                    rec = getattr(self, "recovery", None)
+                    if rec is not None:
+                        rec.reset()                        # drop any in-flight retreat (queue was cleared)
                     self.is_auto_inference = False
                     break
+                # CCDP recovery: while retreating from a missed grasp, stream the scripted
+                # retreat (~APPEND_AHEAD_ROWS/cycle) instead of the policy and skip the server.
+                # Exits back to normal inference once the retreat has drained (see grasp_recovery).
+                rec = getattr(self, "recovery", None)
+                if rec is not None and rec.is_retreating:
+                    rec.pump(self.humanoid_env)
+                    time.sleep(0.02)
+                    continue
                 # submit=True -> validate + splice onto the robot (and emit the per-inference
                 # lifecycle line, see _run_inference). On a skipped inference (stale obs, server
                 # error, validation failure) back off briefly so we don't busy-spin.

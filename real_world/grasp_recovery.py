@@ -1,0 +1,217 @@
+"""Standalone CCDP-style grasp-failure recovery for the dual-arm policy.
+
+Self-contained: loads the wrist-camera grasp detector (data/grasp_detector/detector.pt,
+trained in the diffusion_policy repo) and drives failure recovery, with NO GUI coupling
+and only three small call-ins from InferenceController. Needs only torch + torchvision +
+the .pt checkpoint on the client machine (detection runs LOCALLY, not on the policy server).
+
+WHAT IT DOES
+------------
+Watches the RIGHT gripper command in each policy chunk. On an open->close transition it
+arms a grasp attempt and, after `settle_sec` (default 5 s — deliberately late so the check
+never perturbs the grasp itself), runs the detector on the right wrist frame
+(obs['handr_imgs'][-1]). If the gripper closed on nothing it enters RECOVERY:
+
+    1. clear the robot queue (drop the policy's "I grasped, now lift" rows)
+    2. STREAM a scripted retreat -- an interpolated right-EE lift to (current + offset) with
+       the gripper opened, left arm held -- fed to env.append_actions ~2 rows/cycle from the
+       auto loop, exactly like the policy is streamed (append_actions only commits
+       APPEND_AHEAD_ROWS ahead of the master clock, so a one-shot append would NOT run it).
+    3. hand control back -> the stochastic policy re-plans a fresh approach on its own.
+
+No failure demos, no high-level planner: each grasp attempt is a sub-problem and the
+retreat simply clears the failed grasp so the stochastic policy can try again.
+
+The env solves the retreat: we only emit EE-space target rows; env.append_actions runs
+Pinocchio IK + sim validation + the velocity-matched seam ramp per row.
+
+INTEGRATION (see the three call-ins in InferenceController):
+    __init__: self.recovery = GraspRecoveryMonitor("data/grasp_detector/detector.pt",
+                                                    open_grip=..., closed_grip_min=...)
+    _run_auto_inference (top of loop):
+        if rec and rec.is_retreating:
+            rec.pump(env); time.sleep(0.02); continue     # stream retreat, skip the server
+    _run_inference (after obs, before post_predict):
+        if rec and rec.maybe_start(env, obs): return True  # miss -> entered recovery
+    _run_inference (after `action`):
+        if rec: rec.note_action(action)                    # track the grip command
+"""
+
+import logging
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision import transforms
+from torchvision.models import resnet18
+
+log = logging.getLogger(__name__)
+
+# 20-col dual_arm_ee_image action row: L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1]
+L_EE = slice(0, 9)      # left [pos3, rot6d6]  (held during retreat)
+L_GRIP = 9
+R_POS = slice(10, 13)   # right pos3
+R_ROT = slice(13, 19)   # right rot6d6
+R_GRIP = 19
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+class _Detector:
+    """Inlined GraspDetector: ResNet18 head on the fixed finger-gap ROI crop."""
+
+    def __init__(self, ckpt_path, device=None):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        ck = torch.load(ckpt_path, map_location=self.device)
+        self.roi = tuple(ck["roi"])
+        self.empty_idx = ck["empty_idx"]
+        self.threshold = ck["threshold"]
+        m = resnet18(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, 2)
+        m.load_state_dict(ck["state_dict"])
+        self.model = m.to(self.device).eval()
+        self.tf = transforms.Compose([
+            transforms.Resize((ck["size"], ck["size"])),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+
+    @torch.no_grad()
+    def p_empty(self, frame) -> float:
+        if not isinstance(frame, Image.Image):
+            frame = Image.fromarray(np.asarray(frame)[..., :3].astype(np.uint8))
+        x = self.tf(frame.convert("RGB").crop(self.roi)).unsqueeze(0).to(self.device)
+        return torch.softmax(self.model(x), dim=1)[0, self.empty_idx].item()
+
+
+class GraspRecoveryMonitor:
+    def __init__(self, detector_path, *,
+                 settle_sec=5.0,
+                 retreat_offset=(0.0, 0.0, 0.05),   # world-frame dxyz on right EE; +Z = lift
+                 retreat_rows=12,                    # interpolated rows in the scripted retreat
+                 retreat_timeout_sec=10.0,           # hard cap on a single retreat
+                 open_grip=0.0,                      # retreat feeds append_actions directly (bypasses
+                                                     # binarize) -> downstream wants {0,1}; 0 = open
+                 closed_grip_min=10.0,               # = postprocess.GRIPPER_CLOSE_THRESH: note_action
+                                                     # reads the RAW server grip [0,~85] (pre-binarize)
+                 device=None):
+        self.det = _Detector(detector_path, device=device)
+        self.settle_sec = settle_sec
+        self.retreat_offset = np.asarray(retreat_offset, dtype=float)
+        self.retreat_rows = int(retreat_rows)
+        self.retreat_timeout_sec = retreat_timeout_sec
+        self.open_grip = float(open_grip)
+        self.closed_grip_min = float(closed_grip_min)
+
+        # grasp-attempt tracking
+        self._prev_closed = False
+        self._close_t = None          # monotonic time of the last open->close transition
+        self._checked = False         # detector already run for this closure?
+
+        # retreat-streaming state
+        self._retreating = False
+        self._retreat_traj = None     # list of 20-col rows anchored at _anchor_id
+        self._anchor_id = None        # master id of retreat row 0
+        self._end_id = None           # master id of the last retreat row
+        self._retreat_deadline = None
+        log.info("GraspRecoveryMonitor ready: settle=%.1fs roi=%s thr=%.2f",
+                 settle_sec, self.det.roi, self.det.threshold)
+
+    # -- hook 1: every policy chunk, to track the right-grip command ------------
+    def note_action(self, action_chunk):
+        a = np.asarray(action_chunk, dtype=float)
+        if a.ndim != 2 or a.shape[1] <= R_GRIP:
+            return
+        closed_now = bool(a[-1, R_GRIP] >= self.closed_grip_min)
+        if closed_now and not self._prev_closed:          # open -> close: attempt starts
+            self._close_t = time.monotonic()
+            self._checked = False
+        elif not closed_now and self._prev_closed and not self._checked:
+            self._close_t = None                          # released before the check -> cancel it
+        self._prev_closed = closed_now
+
+    # -- hook 2: every loop BEFORE predict. True => entered recovery (skip predict)
+    def maybe_start(self, env, obs) -> bool:
+        if self._retreating or self._close_t is None or self._checked:
+            return False
+        if time.monotonic() - self._close_t < self.settle_sec:
+            return False
+        self._checked = True
+
+        frame = obs.get("handr_imgs")
+        if isinstance(frame, (list, tuple)):
+            frame = frame[-1] if frame else None
+        if frame is None:
+            log.warning("[grasp-check] no right wrist frame in obs")
+            return False
+
+        p = self.det.p_empty(frame)
+        if p < self.det.threshold:
+            log.info("[grasp-check] P_empty=%.2f -> held", p)
+            return False
+
+        self._begin_retreat(env, obs)
+        log.warning("[recovery] missed grasp (P_empty=%.2f) -> streaming retreat", p)
+        return True
+
+    @property
+    def is_retreating(self) -> bool:
+        return self._retreating
+
+    # -- hook 3: every loop WHILE retreating; streams the retreat, exits when done
+    def pump(self, env):
+        if not self._retreating:
+            return
+        if time.monotonic() > self._retreat_deadline:
+            log.warning("[recovery] retreat timed out -> handing back to policy")
+            return self._finish()
+        # Top the queue up FIRST (a no-op once every row is queued), so the empty queue that
+        # _begin_retreat just left behind can't read as "done" on the opening pump.
+        ok, reason = env.append_actions(self._retreat_traj, self._anchor_id)
+        if not ok:                                         # IK/validation hard-fail: don't spin
+            log.warning("[recovery] retreat append refused (%s) -> handing back to policy", reason)
+            return self._finish()
+        # Retreat done when the clock has REACHED the last retreat row (ids run anchor.._end_id, so
+        # the clock tops out AT _end_id — never past it) AND the robot queue has drained. robot_pending
+        # counts _robot_q (what the retreat streams into); env.queue_empty() is the preview-sim queue,
+        # which the retreat never touches, so it is NOT the drain signal here.
+        cur, _ = env.queue_status()
+        if cur >= self._end_id and env.robot_pending == 0:  # retreat fully executed
+            log.info("[recovery] retreat complete -> policy re-approaches")
+            self._finish()
+
+    # -- internals --------------------------------------------------------------
+    def _begin_retreat(self, env, obs):
+        with env._lock:                                    # clear queue (non-estop half of lock_robot)
+            env._robot_q.clear()
+            env._staged_release.clear()
+            env._queued_through = -1                       # next append re-anchors to the clock
+        cur, _ = env.queue_status()
+        left = np.asarray(obs["robotl_eef_pos"][-1], dtype=float)     # [pos3, rot6d6] held
+        left_grip = float(obs["robot0_grip"][-1][0])
+        right = np.asarray(obs["robotr_eef_pos"][-1], dtype=float)    # [pos3, rot6d6]
+        r_pos0, r_rot = right[0:3], right[3:9]
+        r_pos1 = r_pos0 + self.retreat_offset
+        # interpolate current -> lifted target over retreat_rows; gripper OPEN from row 0
+        traj = []
+        for k in range(1, self.retreat_rows + 1):
+            rp = r_pos0 + (k / self.retreat_rows) * (r_pos1 - r_pos0)
+            traj.append([*left, left_grip, *rp, *r_rot, self.open_grip])
+        self._retreat_traj = traj
+        self._anchor_id = int(cur)
+        self._end_id = int(cur) + self.retreat_rows - 1
+        self._retreat_deadline = time.monotonic() + self.retreat_timeout_sec
+        self._retreating = True
+
+    def _finish(self):
+        self._retreating = False
+        self._retreat_traj = None
+        # gripper is open now; re-arm grip tracking so the next close is a fresh attempt
+        self._prev_closed = False
+        self._close_t = None
+
+    def reset(self):
+        self._finish()
