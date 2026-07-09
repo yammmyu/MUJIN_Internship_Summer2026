@@ -118,6 +118,13 @@ class InferenceController:
         self.is_auto_inference = False
         self._last_inference_obs_ts = 0.0
         self._infer_count = 0            # total inferences this process (per-inference trace id)
+        # ABSOLUTE 14-joint START pose the arm slowly homes to at the top of each auto run, BEFORE any
+        # server call, so every run begins from the same configuration. = arm_joints[0] of
+        # MDM_data_collection/recordings/recording001. Set to None to skip the homing step.
+        self.auto_start_pose = np.asarray(
+            [2.041772, -0.287803, -2.07299, -1.220383, 0.279462, 1.207418, -1.292626,
+             -1.525758, 0.706167, 1.504347, 0.82008, 0.019143, -1.606412, -1.901265],
+            dtype=float)
         # The temporal-ensemble merge state (rolling raw-chunk buffer + smoothed master buffer +
         # live-tunable smoothing config) lives in env.pipeline (a PostProcessor). This controller only
         # delegates the GUI-facing knobs to it (see set_smoothing / te_radius etc. below).
@@ -486,6 +493,17 @@ class InferenceController:
             env.reset_grip_latch()                         # fresh run -> gripper can re-latch from scratch
 
         def _run_auto_inference():
+            # Home to a fixed START pose (absolute joints, slow) BEFORE any server call, so every run
+            # begins from the same configuration. Blocks until the arm arrives; skipped if disabled,
+            # unsupported, or E-stopped.
+            if (self.auto_start_pose is not None and hasattr(env, "move_to_joints")
+                    and not env.estopped):
+                # Drop any residual queued substeps so the release loop is idle and homing has sole
+                # control of the arm (both would otherwise call the SDK concurrently).
+                if getattr(env, "pipeline", None) is not None:
+                    env.pipeline.clear_queue()
+                log.info("[auto] homing to start pose (absolute joints) before inference…")
+                env.move_to_joints(self.auto_start_pose)
             # Target a fixed inference cadence so the loop is controllable via inference_hz (a
             # value <= 0 means "as fast as latency allows"). We measure each cycle and sleep only
             # the REMAINDER of the period; if an inference already overran the period we go again

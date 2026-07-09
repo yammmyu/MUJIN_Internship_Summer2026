@@ -852,6 +852,30 @@ class HumanoidEnv:
         self._grip_closed_since = [None, None]
         self._grip_latched = [False, False]
 
+    def move_to_joints(self, q14_target, joint_step=None):
+        """Slowly move BOTH arms to an ABSOLUTE 14-joint target (rad) by streaming a velocity-bounded
+        linear ramp from the current measured pose, one waypoint per STEP_TIME (drained by
+        run_trajectory_control, which clamps + paces + honours the E-stop). joint_step = per-substep
+        joint delta (rad); smaller = slower (default 0.3*MAX_JOINT_STEP, a gentle home). Grippers are
+        left untouched. BLOCKS until the arm arrives. Intended for the auto-run start pose while the
+        robot queue is idle. Returns True on completion (or an E-stop/shutdown halt), False on a bad
+        read / dispatch error / E-stop refusal."""
+        if self._estop.is_set():
+            print("[HumanoidEnv] move_to_joints refused: E-stop latched.")
+            return False
+        start = self._read_arm14()
+        if start is None:
+            print("[HumanoidEnv] move_to_joints refused: cannot read arm_joint_states.")
+            return False
+        target = np.clip(np.asarray(q14_target, dtype=np.float64), self._jlower14, self._jupper14)
+        step = float(joint_step) if joint_step else MAX_JOINT_STEP * 0.3
+        span = float(np.max(np.abs(target - start)))
+        n = max(1, int(np.ceil(span / max(step, 1e-6))))
+        print(f"[HumanoidEnv] move_to_joints: |Δq|={span:.3f} rad over {n} substeps "
+              f"(~{n * STEP_TIME:.1f}s) to the start pose.")
+        pts = [(start + (target - start) * (i / n), None) for i in range(1, n + 1)]
+        return self.run_trajectory_control(pts)
+
     def _latched_grip(self, grip_bin):
         """Anti-regrab latch applied at dispatch: given the binary [gl, gr] this substep would send,
         return the effective pair. A channel COMMANDED closed continuously for _grip_latch_sec is
