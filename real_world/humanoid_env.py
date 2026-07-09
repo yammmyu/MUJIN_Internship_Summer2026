@@ -239,6 +239,16 @@ class HumanoidEnv:
         self._grip_state = [None, None]              # last COMMITTED binary state per channel
         self._grip_locked_until = [0, 0]             # master row_id each channel is locked THROUGH
 
+        # Gripper OBS source. The firmware gripper_states() read-back can lag the real gripper by many
+        # SECONDS, so robot0_grip would keep reporting OPEN long after we've physically closed —
+        # confusing the policy into re-grabbing what it already holds. The commanded gripper matches
+        # the physical gripper promptly, so feed THAT into the obs instead, mapped to the training raw
+        # scale (closed -> _grip_obs_closed, open -> 0; MDM recordings are bimodal 0 / ~119.8). The
+        # laggy read is still logged to the recorder. _grip_obs_from_command=False -> use the read.
+        self._grip_obs_from_command = True
+        self._grip_obs_closed = 119.8
+        self._last_grip_cmd = None                   # last EFFECTIVE binary [gl, gr] sent to move_gripper
+
         # Camera subscriptions are owned by a CameraHub (its own lock; one SDK camera object per
         # camera, opened/closed on demand). `cameras=` (constructor) are the PINNED cameras — kept
         # ON for the env's life, e.g. data collection; `allowed_cameras` is the requestable set.
@@ -412,9 +422,16 @@ class HumanoidEnv:
 
             with self._lock:
                 cur = self._current_row_id                # master-ID this obs is anchored to
-            self.obs.ingest(now, now_mono, status, grip, arm14, frames, cur)
+            # OBS gripper: prefer the EFFECTIVE commanded state over the laggy read-back (which can
+            # trail the real gripper by seconds and make the policy re-grab). Mapped to the training
+            # raw scale. Falls back to the read until the first command / when disabled.
+            grip_obs = grip
+            if self._grip_obs_from_command and self._last_grip_cmd is not None:
+                grip_obs = [self._grip_obs_closed if b else 0.0 for b in self._last_grip_cmd]
+            self.obs.ingest(now, now_mono, status, grip_obs, arm14, frames, cur)
 
-            # Append a recording row while a session is active (no-op otherwise).
+            # Append a recording row while a session is active (no-op otherwise). The recorder keeps
+            # the RAW read-back (ground truth for offline analysis), not the commanded obs value.
             self.recorder.tick(now, status, grip, frames)
 
             next_tick += self.dt
@@ -1068,8 +1085,9 @@ class HumanoidEnv:
             # policy (see _latched_grip); the hold path (ignore_estop) never touches the grippers.
             if grip is not None:
                 gl, gr = grip
-                self.robot.move_gripper(self._latched_grip([1 if gl >= 0.5 else 0,
-                                                            1 if gr >= 0.5 else 0]))
+                eff = self._latched_grip([1 if gl >= 0.5 else 0, 1 if gr >= 0.5 else 0])
+                self.robot.move_gripper(eff)
+                self._last_grip_cmd = eff                 # EFFECTIVE cmd -> obs (the read-back lags)
             for wp in waypoints:
                 if not ignore_estop and (self._estop.is_set() or self._stop_event.is_set()):
                     return True
