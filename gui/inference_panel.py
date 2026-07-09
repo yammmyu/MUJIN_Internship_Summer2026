@@ -39,7 +39,7 @@ class InferenceMixin:
     #  左夹爪                                                              #
     # ------------------------------------------------------------------ #
     def move_gripper(self, side, position):
-        """控制夹爪（仅左夹爪在界面暴露；右夹爪保持不动）。"""
+        """控制夹爪（左 / 右 各自独立；side='left'|'right'）。未指定的一侧保持当前位置。"""
         try:
             pos = float(np.clip(position, 0.0, 1.0))
             if side == "left":
@@ -399,15 +399,17 @@ class InferenceMixin:
         canvas.bind("<Enter>", _bind_wheel)
         canvas.bind("<Leave>", _unbind_wheel)
 
-        # ===== 左夹爪 =====
-        sec_grip = ttk.LabelFrame(body, text="  🤏  左夹爪  ")
+        # ===== 夹爪（左 / 右 独立控制）=====
+        sec_grip = ttk.LabelFrame(body, text="  🤏  夹爪（左 / 右）  ")
         sec_grip.pack(fill=tk.X, padx=10, pady=(10, 6))
-        row = ttk.Frame(sec_grip)
-        row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="张开", style="Success.TButton",
-                   command=lambda: self.move_gripper("left", 0.0)).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(row, text="闭合", style="Warn.TButton",
-                   command=lambda: self.move_gripper("left", 1.0)).pack(side=tk.LEFT, padx=6)
+        for side, label in (("left", "左"), ("right", "右")):
+            row = ttk.Frame(sec_grip)
+            row.pack(fill=tk.X, padx=8, pady=(8, 4))
+            ttk.Label(row, text=f"{label}夹爪", width=6).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(row, text="张开", style="Success.TButton",
+                       command=lambda s=side: self.move_gripper(s, 0.0)).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(row, text="闭合", style="Warn.TButton",
+                       command=lambda s=side: self.move_gripper(s, 1.0)).pack(side=tk.LEFT, padx=6)
 
         # ===== 仿真预览（自动运行 / 仿真验证都依赖它先启动）=====
         sec_sim = ttk.LabelFrame(body, text="  🟦  仿真预览（自动运行 / 仿真验证前先启动）  ")
