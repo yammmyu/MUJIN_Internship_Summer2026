@@ -37,9 +37,10 @@ def extract_pose(frame):
 class ObsCollector:
     """Producer-side observation buffers + snapshot for one policy (dual_arm_ee_image)."""
 
-    def __init__(self, solver, inference_cameras, agent_camera, hand_left, hand_right,
+    def __init__(self, solver, solver_r, inference_cameras, agent_camera, hand_left, hand_right,
                  stale_timeout):
         self.solver = solver                        # LEFT-arm model, for live-joint EE FK
+        self.solver_r = solver_r                    # RIGHT-arm model, for live-joint EE FK (mirror)
         self.inference_cameras = list(inference_cameras)
         self.agent_camera = agent_camera
         self.hand_left = hand_left
@@ -86,6 +87,17 @@ class ObsCollector:
         pos, quat = self.solver.m.fk(np.asarray(arm7, dtype=np.float64))
         return build_ee_pose_row(pos, quat)
 
+    def _right_ee_fk(self, arm7):
+        """Right EE obs row [pos(3) + rot6d(6)] via pinocchio FK on the LIVE right joints — the mirror
+        of _left_ee_fk. Uses FK, NOT status['frames']['arm_right_link7']: now that the dual-arm policy
+        DRIVES the right arm, the firmware parks its right-EE/FK estimator while that ABS_JOINT
+        trajectory executes, FREEZING the status frame at the pre-motion pose (arm_joint_states stays
+        live). That stale frame made the policy re-plan the right arm from an OLD pose ('snaps back').
+        solver_r carries its own calibrated base_offset (fk_calibration_right.json), so this matches the
+        training right-EE frame the same way the left does."""
+        pos, quat = self.solver_r.m.fk(np.asarray(arm7, dtype=np.float64))
+        return build_ee_pose_row(pos, quat)
+
     @staticmethod
     def _frame_sig(frame):
         """Cheap change signature for a camera frame (H2): a coarse subsample, not the whole
@@ -100,14 +112,12 @@ class ObsCollector:
         reads it already took: `status` (motion status), `grip` ([left,right] raw), `arm14` (both
         arms, or None), this tick's camera `frames` ({name: [prev,cur]}), and the master row id the
         obs is anchored to. Latest-wins; None inputs are simply skipped."""
-        # LEFT EE from FK on the LIVE joints; RIGHT EE from the firmware status frame (the right arm
-        # is never commanded, so its FK frame never parks). Both rows 9-dim [pos(3) + rot6d(6)].
+        # BOTH EE rows from FK on the LIVE joints (9-dim [pos(3) + rot6d(6)]). The right arm is now
+        # commanded by the dual-arm policy, so — like the left — its firmware EE frame parks during the
+        # ABS_JOINT trajectory; FK from the live joints keeps the right EE tracking the real arm instead
+        # of freezing at the pre-motion pose (which made the policy plan the right arm from a stale pose).
         robotl_eef = self._left_ee_fk(arm14[:7]) if arm14 is not None else None
-        if status is not None and 'frames' in status:
-            rp = extract_pose(status['frames']['arm_right_link7'])
-            robotr_eef = build_ee_pose_row(rp[:3], rp[3:7])
-        else:
-            robotr_eef = None
+        robotr_eef = self._right_ee_fk(arm14[7:]) if arm14 is not None else None
         grip_state = build_grip_row(grip[0], grip[1]) if grip is not None else None
 
         # Freshness (H2): did the EE pose or a policy camera frame actually CHANGE? Only then bump

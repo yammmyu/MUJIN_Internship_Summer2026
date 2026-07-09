@@ -254,10 +254,11 @@ class HumanoidEnv:
         self._log_ts = {}                                      # key -> last monotonic print time (throttling)
         # Producer-side observation (#3): rolling dual-arm EE-pose / gripper buffers + freshness +
         # get_obs/inf_ready live in the ObsCollector. The collect thread feeds it one ingest() per
-        # tick; it FKs the left EE from the live joints and reads the right EE from the status frame.
+        # tick; it FKs BOTH EE rows from the live joints (left + right solvers) so neither freezes on
+        # the firmware's parked EE frame while its arm executes an ABS_JOINT trajectory.
         self.obs = ObsCollector(
-            self.solver, INFERENCE_CAMERAS, AGENT_CAMERA, HAND_CAMERA_LEFT, HAND_CAMERA_RIGHT,
-            STALE_TIMEOUT)
+            self.solver, self.solver_r, INFERENCE_CAMERAS, AGENT_CAMERA, HAND_CAMERA_LEFT,
+            HAND_CAMERA_RIGHT, STALE_TIMEOUT)
         # Master row clock (self.pipeline._current_row_id) + streaming cursor (._queued_through) + the
         # robot queue live in the pipeline; _release_loop advances the clock as substeps dispatch and
         # _collect_loop snapshots it (via the self._current_row_id property) into the obs so each
