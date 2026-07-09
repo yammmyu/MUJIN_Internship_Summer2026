@@ -791,6 +791,10 @@ class GraspRecoveryMonitor:
             env._robot_q.clear()
             env._staged_release.clear()
             env._queued_through = -1                       # next append re-anchors to the clock
+        # OPENING the right gripper is the point of the retreat, so drop any anti-regrab close-latch
+        # first — otherwise a grasp that latched closed (held >5s) would override the retreat's open.
+        if hasattr(env, "reset_grip_latch"):
+            env.reset_grip_latch()
         # The retreat streams straight to append_actions, BYPASSING pipeline.merge(), so its master
         # ids never enter the smoothed buffer. Clear that buffer now so the FIRST post-retreat merge
         # re-anchors from the live clock instead of materializing a stale pre-miss run that stops at
