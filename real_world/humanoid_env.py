@@ -229,13 +229,15 @@ class HumanoidEnv:
         self._release_thread = None
         self._last_good_arm14 = None                 # last finite 14-joint read (observation anchor)
 
-        # Gripper CLOSE LATCH (anti-regrab): once a channel has been COMMANDED closed continuously for
-        # _grip_latch_sec, fix it at closed so a policy that keeps toggling can't re-open/re-grab. Per
-        # channel [left, right]; "closed" = the binary dispatch command (== the upstream GRIPPER_CLOSE_
-        # THRESH binarize). Reset by reset_grip_latch (E-stop / reset / auto start). None -> disabled.
-        self._grip_latch_sec = 5.0
-        self._grip_closed_since = [None, None]       # monotonic time each channel's closed streak began
-        self._grip_latched = [False, False]          # channel currently fixed at closed
+        # Gripper CHANGE DEBOUNCE (anti-chatter): when a channel's binary command flips (crosses the
+        # upstream GRIPPER_CLOSE_THRESH), commit that new state and LOCK it for the next _grip_lock_rows
+        # master row_ids — the gripper can't toggle open<->close again until the hold expires, so a
+        # policy that oscillates can't regrab. A deliberate change after the hold is still allowed (and
+        # re-arms the hold). Per channel [left, right]. Reset by reset_grip_latch (E-stop/reset/auto
+        # start/retreat). _grip_lock_rows None -> disabled.
+        self._grip_lock_rows = 20
+        self._grip_state = [None, None]              # last COMMITTED binary state per channel
+        self._grip_locked_until = [0, 0]             # master row_id each channel is locked THROUGH
 
         # Camera subscriptions are owned by a CameraHub (its own lock; one SDK camera object per
         # camera, opened/closed on demand). `cameras=` (constructor) are the PINNED cameras — kept
@@ -848,10 +850,10 @@ class HumanoidEnv:
         return self._last_good_arm14.copy() if self._last_good_arm14 is not None else None
 
     def reset_grip_latch(self):
-        """Clear the gripper close-latch state so a channel can re-open after a fresh start
-        (E-stop / reset / new auto run). Both channels drop their closed streak + latch."""
-        self._grip_closed_since = [None, None]
-        self._grip_latched = [False, False]
+        """Clear the gripper change-debounce state so a channel can flip freely after a fresh start
+        (E-stop / reset / new auto run / retreat). Both channels drop their committed state + hold."""
+        self._grip_state = [None, None]
+        self._grip_locked_until = [0, 0]
 
     def move_to_joints(self, q14_target, joint_step=None):
         """Slowly move BOTH arms to an ABSOLUTE 14-joint target (rad) by streaming a velocity-bounded
@@ -878,28 +880,26 @@ class HumanoidEnv:
         return self.run_trajectory_control(pts)
 
     def _latched_grip(self, grip_bin):
-        """Anti-regrab latch applied at dispatch: given the binary [gl, gr] this substep would send,
-        return the effective pair. A channel COMMANDED closed continuously for _grip_latch_sec is
-        latched to closed (1) and stays closed until reset_grip_latch; any open command before the
-        streak completes just resets that channel's timer. _grip_latch_sec None -> pass through."""
-        if self._grip_latch_sec is None:
+        """Anti-chatter debounce applied at dispatch: given the binary [gl, gr] this substep would
+        send, return the effective pair. When a channel's command flips vs its committed state, the
+        flip is accepted ONLY if the current master row_id is past that channel's hold window; the flip
+        then re-locks the channel for _grip_lock_rows row_ids, during which any toggle is ignored (the
+        committed state is re-sent). First command per channel is adopted without a lock.
+        _grip_lock_rows None -> pass through."""
+        if self._grip_lock_rows is None:
             return grip_bin
-        now = time.monotonic()
+        cur = self._current_row_id
         out = [grip_bin[0], grip_bin[1]]
         for i in (0, 1):
-            if self._grip_latched[i]:
-                out[i] = 1                                    # fixed closed
-                continue
-            if grip_bin[i] >= 1:                              # commanded closed -> grow the streak
-                if self._grip_closed_since[i] is None:
-                    self._grip_closed_since[i] = now
-                elif now - self._grip_closed_since[i] >= self._grip_latch_sec:
-                    self._grip_latched[i] = True
-                    print(f"[HumanoidEnv] gripper channel {i} closed >= {self._grip_latch_sec:.1f}s "
-                          f"-> LATCHED closed (anti-regrab; reset on E-stop/restart).")
-                out[i] = 1
-            else:                                             # commanded open -> streak broken
-                self._grip_closed_since[i] = None
+            b = 1 if grip_bin[i] >= 1 else 0
+            if self._grip_state[i] is None:                   # first command -> adopt, no lock
+                self._grip_state[i] = b
+            elif b != self._grip_state[i] and cur >= self._grip_locked_until[i]:
+                self._grip_state[i] = b                       # allowed flip past the hold -> commit + re-lock
+                self._grip_locked_until[i] = cur + self._grip_lock_rows
+                print(f"[HumanoidEnv] gripper channel {i} -> {'closed' if b else 'open'}; "
+                      f"locked {self._grip_lock_rows} row_ids (through {self._grip_locked_until[i]}).")
+            out[i] = self._grip_state[i]                      # within the hold, force the committed state
         return out
 
     # ===================== consumer: sim-preview execution loop =====================
