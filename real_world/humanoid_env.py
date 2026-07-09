@@ -872,6 +872,23 @@ class HumanoidEnv:
         self._grip_state = [None, None]
         self._grip_locked_until = [0, 0]
 
+    def command_gripper(self, gl=None, gr=None):
+        """Directly command a gripper OUTSIDE the streamed release path (e.g. recovery opening the
+        hand). gl/gr are open(0)/close(1); None leaves that channel at its last commanded state.
+        Bypasses the anti-chatter debounce (this is an explicit command), updates the obs source
+        (_last_grip_cmd) so the policy sees the new state promptly, and syncs the debounce committed
+        state so it won't immediately fight the command."""
+        cur = list(self._last_grip_cmd) if self._last_grip_cmd is not None else [0, 0]
+        if gl is not None:
+            cur[0] = 1 if float(gl) >= 0.5 else 0
+        if gr is not None:
+            cur[1] = 1 if float(gr) >= 0.5 else 0
+        if self._real:
+            self.robot.move_gripper(cur)
+        self._last_grip_cmd = cur
+        self._grip_state = [cur[0], cur[1]]
+        self._grip_locked_until = [self._current_row_id, self._current_row_id]
+
     def move_to_joints(self, q14_target, joint_step=None):
         """Slowly move BOTH arms to an ABSOLUTE 14-joint target (rad) by streaming a velocity-bounded
         linear ramp from the current measured pose, one waypoint per STEP_TIME (drained by

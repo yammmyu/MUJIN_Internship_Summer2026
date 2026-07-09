@@ -154,7 +154,8 @@ class InferenceController:
             try:
                 from real_world.grasp_recovery import GraspRecoveryMonitor
                 from real_world.postprocess import GRIPPER_CLOSE_THRESH
-                self.recovery = GraspRecoveryMonitor(det_path, closed_grip_min=GRIPPER_CLOSE_THRESH)
+                self.recovery = GraspRecoveryMonitor(det_path, closed_grip_min=GRIPPER_CLOSE_THRESH,
+                                                     retreat_home_q14=self.auto_start_pose)
             except Exception as e:
                 log.warning("grasp recovery disabled (failed to load %s): %r", det_path, e)
         elif det_path:
@@ -523,14 +524,9 @@ class InferenceController:
                         rec.reset()                        # drop any in-flight retreat (queue was cleared)
                     self.is_auto_inference = False
                     break
-                # CCDP recovery: while retreating from a missed grasp, stream the scripted
-                # retreat (~APPEND_AHEAD_ROWS/cycle) instead of the policy and skip the server.
-                # Exits back to normal inference once the retreat has drained (see grasp_recovery).
-                rec = getattr(self, "recovery", None)
-                if rec is not None and rec.is_retreating:
-                    rec.pump(self.humanoid_env)
-                    time.sleep(0.02)
-                    continue
+                # CCDP recovery is now SYNCHRONOUS: a detected miss opens the gripper + moves the arm
+                # home inside maybe_start() (called from _run_inference below), then normal inference
+                # resumes from home — no streamed-retreat pump step here anymore.
                 # submit=True -> validate + splice onto the robot (and emit the per-inference
                 # lifecycle line, see _run_inference). On a skipped inference (stale obs, server
                 # error, validation failure) back off briefly so we don't busy-spin.
