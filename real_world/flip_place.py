@@ -42,42 +42,52 @@ R_GRIP_IDX = 1          # right channel in a [gl, gr] gripper command
 
 class FlipPlaceMacro:
     def __init__(self, path=DEFAULT_PATH, *,
-                 rj7_trigger=1.0,      # fire when right wrist-roll >= this (flip swings -1.9 -> +1.4)
-                 settle_s=0.3,         # rj7 must stay >= trigger this long (never fire mid-flip)
+                 rj7_change=2.5,       # fire when right wrist-roll has ROTATED this far since the grab
+                                       # (|Δrj7|); the flip swings ~3.0-3.5 rad, so ~2.5 is near-complete
+                 settle_s=0.3,         # |Δrj7| must stay >= threshold this long (never fire mid-flip)
                  vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
                  release_settle_s=0.4, # pause after opening the gripper before withdrawing
                  open_grip=0.0):       # 0 = open (release)
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints
         if self.path.ndim != 2 or self.path.shape[1] != 14:
             raise ValueError(f"flip_release_path must be (M,14); got {self.path.shape}")
-        self.rj7_trigger = float(rj7_trigger)
+        self.rj7_change = float(rj7_change)
         self.settle_s = float(settle_s)
         self.vel_frac = float(vel_frac)
         self.release_settle_s = float(release_settle_s)
         self.open_grip = float(open_grip)
         self._fired = False           # already ran for the current closed episode?
-        self._above_since = None      # monotonic time rj7 first went >= trigger (settle timer)
-        log.info("FlipPlaceMacro ready: %d waypoints, rj7_trigger=%.2f settle=%.1fs vel=%.0f%% max",
-                 len(self.path), self.rj7_trigger, self.settle_s, self.vel_frac * 100)
+        self._above_since = None      # monotonic time |Δrj7| first went >= threshold (settle timer)
+        self._prev_closed = False     # right gripper closed last check (open->close edge = the grab)
+        self._rj7_at_grab = None      # wrist-roll captured at the grab; the flip is measured FROM here
+        log.info("FlipPlaceMacro ready: %d waypoints, rj7_change>=%.2f settle=%.1fs vel=%.0f%% max",
+                 len(self.path), self.rj7_change, self.settle_s, self.vel_frac * 100)
 
     def maybe_trigger(self, env) -> bool:
         """Loop hook: True => the macro ran this cycle (caller should skip predicting). Fires ONCE per
-        closed grasp, when the right gripper is commanded closed AND the wrist-roll has held past the
-        flip threshold for settle_s. Resets when the gripper opens."""
+        closed grasp, when the right gripper is commanded closed AND the wrist-roll has ROTATED by
+        rj7_change (|Δrj7|) from its value AT THE GRAB, held for settle_s. Measuring the CHANGE (not an
+        absolute angle) makes the trigger independent of the grasp orientation. Resets on release."""
         grip = getattr(env, "_last_grip_cmd", None)
         grip_closed = grip is not None and grip[R_GRIP_IDX] >= 1
         if not grip_closed:                          # released -> disarm; ready for the next grasp
+            self._prev_closed = False
             self._fired = False
             self._above_since = None
-            return False
-        if self._fired:
+            self._rj7_at_grab = None
             return False
         arm14 = env._read_arm14()
         if arm14 is None:
             return False
         rj7 = float(arm14[RJ7_INDEX])
-        if rj7 < self.rj7_trigger:
-            self._above_since = None                 # dropped below -> restart the settle timer
+        if not self._prev_closed:                    # open->close edge = the grab: capture the baseline
+            self._prev_closed = True
+            self._rj7_at_grab = rj7
+        if self._fired or self._rj7_at_grab is None:
+            return False
+        change = abs(rj7 - self._rj7_at_grab)        # how far the wrist has rotated since the grab
+        if change < self.rj7_change:
+            self._above_since = None                 # fell back -> restart the settle timer
             return False
         now = time.monotonic()
         if self._above_since is None:
@@ -86,8 +96,8 @@ class FlipPlaceMacro:
         if now - self._above_since < self.settle_s:
             return False
         self._fired = True
-        log.warning("[flip-place] flip complete (rj7=%.2f >= %.2f) -> stop auto, run release macro",
-                    rj7, self.rj7_trigger)
+        log.warning("[flip-place] flip complete (|Δrj7|=%.2f >= %.2f since grab) -> stop auto, run macro",
+                    change, self.rj7_change)
         self._run(env, np.asarray(arm14, dtype=np.float64))
         return True
 
@@ -125,3 +135,5 @@ class FlipPlaceMacro:
         """Disarm (e.g. on auto stop / E-stop) so a restart doesn't immediately re-fire."""
         self._fired = False
         self._above_since = None
+        self._prev_closed = False
+        self._rj7_at_grab = None
