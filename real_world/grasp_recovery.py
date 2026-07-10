@@ -43,7 +43,15 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.models import resnet18
 
+from real_world.timing import CONTROL_HZ, MAX_JOINT_VEL
+
 log = logging.getLogger(__name__)
+
+# Retreat cruise speed as a fraction of the MAX_JOINT_VEL safety ceiling. The per-substep joint
+# delta handed to move_to_joints is (frac * MAX_JOINT_VEL / CONTROL_HZ), so the resulting cruise is
+# exactly frac * MAX_JOINT_VEL rad/s -- independent of move_to_joints' own default derate.
+RETREAT_JOINT_VEL_FRAC = 0.5
+RETREAT_JOINT_STEP = RETREAT_JOINT_VEL_FRAC * MAX_JOINT_VEL / CONTROL_HZ
 
 # 20-col dual_arm_ee_image action row: L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1]
 L_EE = slice(0, 9)      # left [pos3, rot6d6]  (held during retreat)
@@ -87,7 +95,7 @@ class _Detector:
 
 class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
-                 settle_sec=5.0,
+                 settle_sec=3.0,
                  # ABSOLUTE 14-joint HOME pose the recovery moves BOTH arms to (open gripper + go home),
                  # instead of a scripted EE-space lift. Passed in by the controller (= its auto start
                  # pose, arm_joints[0] of MDM_data_collection/recordings/recording001). None -> skip the
@@ -210,9 +218,11 @@ class GraspRecoveryMonitor:
         # policy sees "open" promptly.
         if hasattr(env, "command_gripper"):
             env.command_gripper(gr=self.open_grip)
-        # Move to the fixed home joint pose (absolute joints, slow, velocity-bounded, E-stop-aware).
+        # Move to the fixed home joint pose (absolute joints, velocity-bounded, E-stop-aware). Pin the
+        # per-substep delta so the retreat always cruises at RETREAT_JOINT_VEL_FRAC of MAX_JOINT_VEL,
+        # instead of move_to_joints' gentler default derate.
         if self.retreat_home_q14 is not None and hasattr(env, "move_to_joints"):
-            env.move_to_joints(self.retreat_home_q14)
+            env.move_to_joints(self.retreat_home_q14, joint_step=RETREAT_JOINT_STEP)
         else:
             log.warning("[recovery] no home pose / move_to_joints unavailable -> opened gripper only")
         self._finish()                                     # synchronous recovery done; policy resumes
