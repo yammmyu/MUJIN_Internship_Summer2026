@@ -913,6 +913,37 @@ class HumanoidEnv:
         pts = [(start + (target - start) * (i / n), None) for i in range(1, n + 1)]
         return self.run_trajectory_control(pts)
 
+    def play_joint_path(self, waypoints, vel_frac=0.5, grip=None):
+        """Stream a MULTI-waypoint ABSOLUTE-joint path (14-vec per waypoint) to the arms, velocity-
+        bounded and paced. Each consecutive pair is linearly subdivided so no substep exceeds
+        vel_frac*MAX_JOINT_STEP (i.e. vel_frac of MAX_JOINT_VEL) — vel_frac=0.5 -> half max joint
+        velocity. The path is prepended with the LIVE pose so the first move has a ZERO seam (smooth
+        connect from wherever the arm is). grip=None leaves the grippers untouched; else a binary
+        [gl, gr]. BLOCKS until done; clamps + paces + honours the E-stop via run_trajectory_control.
+        Returns True on completion (or an E-stop/shutdown halt), False on a bad read / dispatch error /
+        E-stop refusal."""
+        if self._estop.is_set():
+            print("[HumanoidEnv] play_joint_path refused: E-stop latched.")
+            return False
+        if not len(waypoints):
+            return True
+        live = self._read_arm14()
+        if live is None:
+            print("[HumanoidEnv] play_joint_path refused: cannot read arm_joint_states.")
+            return False
+        step = max(1e-4, float(vel_frac)) * MAX_JOINT_STEP
+        prev = np.clip(np.asarray(live, dtype=np.float64), self._jlower14, self._jupper14)
+        pts = []
+        for wp in waypoints:
+            q = np.clip(np.asarray(wp, dtype=np.float64), self._jlower14, self._jupper14)
+            span = float(np.max(np.abs(q - prev)))
+            n = max(1, int(np.ceil(span / step)))
+            pts.extend((prev + (q - prev) * (i / n), grip) for i in range(1, n + 1))
+            prev = q
+        print(f"[HumanoidEnv] play_joint_path: {len(waypoints)} waypoints -> {len(pts)} substeps "
+              f"(~{len(pts) * STEP_TIME:.1f}s at {float(vel_frac)*100:.0f}% max joint vel).")
+        return self.run_trajectory_control(pts)
+
     def _latched_grip(self, grip_bin):
         """Anti-chatter debounce applied at dispatch: given the binary [gl, gr] this substep would
         send, return the effective pair. When a channel's command flips vs its committed state, the

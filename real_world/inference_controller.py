@@ -161,6 +161,19 @@ class InferenceController:
         elif det_path:
             log.warning("grasp recovery disabled: detector checkpoint not found at %s", det_path)
 
+        # Flip-place release macro (opt-in): after the policy's grab+lift+flip, move out to a fixed
+        # release pose, open the gripper, and come back — see real_world/flip_place.py. Inert unless the
+        # baked recording path exists.
+        self.flip_place = None
+        try:
+            from real_world.flip_place import FlipPlaceMacro, DEFAULT_PATH
+            if os.path.exists(DEFAULT_PATH):
+                self.flip_place = FlipPlaceMacro()
+            else:
+                log.warning("flip-place disabled: release path not found at %s", DEFAULT_PATH)
+        except Exception as e:
+            log.warning("flip-place disabled (failed to init): %r", e)
+
     def _trace(self, name, obj):
         """Append one JSON line to the named trace file (no-op if that file's handle isn't open:
         buffer is always open; requests/chunks only under TRACE_JSONL)."""
@@ -479,6 +492,9 @@ class InferenceController:
             rec = getattr(self, "recovery", None)
             if rec is not None:
                 rec.reset()
+            fp = getattr(self, "flip_place", None)
+            if fp is not None:
+                fp.reset()
             # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
             # the env E-stop to halt immediately instead.)
             return
@@ -522,8 +538,17 @@ class InferenceController:
                     rec = getattr(self, "recovery", None)
                     if rec is not None:
                         rec.reset()                        # drop any in-flight retreat (queue was cleared)
+                    fp = getattr(self, "flip_place", None)
+                    if fp is not None:
+                        fp.reset()                         # disarm the flip macro too
                     self.is_auto_inference = False
                     break
+                # Flip-place release macro: once the policy's grab+lift+flip completes, this stops
+                # predicting, moves out to the fixed release pose, opens the gripper, and comes back —
+                # all inline (clears every queue before/after so auto resumes without snapping).
+                fp = getattr(self, "flip_place", None)
+                if fp is not None and fp.maybe_trigger(self.humanoid_env):
+                    continue
                 # CCDP recovery is now SYNCHRONOUS: a detected miss opens the gripper + moves the arm
                 # home inside maybe_start() (called from _run_inference below), then normal inference
                 # resumes from home — no streamed-retreat pump step here anymore.
