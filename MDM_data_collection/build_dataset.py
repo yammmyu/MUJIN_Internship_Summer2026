@@ -281,7 +281,19 @@ def build(src_dir: pathlib.Path, out_path: pathlib.Path) -> None:
     )
     meta_arr[:] = ep_ends
 
+    # ── Row cadence (self-describing) ─────────────────────────────────────────
+    # Stamp the build fps into the dataset so it carries its own deploy contract: a policy trained
+    # on this zarr MUST run with real_world/timing.py RECORD_HZ == this value, or every action row
+    # executes at the wrong speed. Reading meta/record_hz back lets training / eval assert parity
+    # instead of trusting a filename convention (see the --fps note and the build-time check below).
+    hz_arr = store['meta'].empty(
+        name='record_hz', shape=(1,), chunks=(1,),
+        dtype=np.float64, zarr_format=2, compressor=COMPRESSOR,
+    )
+    hz_arr[:] = np.array([TARGET_HZ], dtype=np.float64)
+
     print(f"\nDataset written to {out_path}")
+    print(f"  Row cadence  : {TARGET_HZ:g} Hz  (deploy with timing.py RECORD_HZ={TARGET_HZ:g})")
     print(f"  Total frames : {total}")
     print(f"  Episodes     : {len(episode_ends)}")
     print(f"  action shape : {arrays['action'].shape}")
@@ -301,11 +313,28 @@ if __name__ == '__main__':
     parser.add_argument('--sigma', type=float, default=None,
                         help='Gaussian sigma (OUTPUT frames) for action smoothing; 0 = disabled. '
                              'Default preserves the 30 Hz time-window (scales with --fps).')
+    parser.add_argument('--allow-hz-mismatch', action='store_true',
+                        help='build even if --fps differs from real_world/timing.py RECORD_HZ (the '
+                             'deploy cadence). Off by default so the train/deploy row rates stay in sync.')
     args = parser.parse_args()
 
     SOURCE_HZ = args.source_hz
     TARGET_HZ = args.fps
     STRIDE = max(1, round(SOURCE_HZ / TARGET_HZ))
+
+    # Enforce the train<->deploy cadence invariant that used to live only in a comment: a dataset
+    # built at TARGET_HZ is correct ONLY if the robot deploys with real_world/timing.py RECORD_HZ ==
+    # TARGET_HZ (else each row plays at the wrong speed). Refuse a mismatched build unless explicitly
+    # overridden — e.g. you are about to edit timing.py to match. SDK-free import (timing.py has no
+    # a2d_sdk dependency), so this runs on any machine that can build a dataset.
+    from real_world.timing import RECORD_HZ as DEPLOY_RECORD_HZ
+    if TARGET_HZ != DEPLOY_RECORD_HZ and not args.allow_hz_mismatch:
+        parser.error(
+            f"--fps {TARGET_HZ:g} != real_world/timing.py RECORD_HZ {DEPLOY_RECORD_HZ:g}. A model "
+            f"trained at {TARGET_HZ:g} Hz executes each row at the wrong speed unless deployed with "
+            f"RECORD_HZ={TARGET_HZ:g}. Set timing.py RECORD_HZ to match, or pass --allow-hz-mismatch "
+            f"to override (the built fps is stamped into meta/record_hz either way)."
+        )
     # Default sigma preserves the physical smoothing time-window of the 1.7-frame @30 Hz default,
     # so lowering the rate doesn't over-smooth (1.7 * fps/30). Explicit --sigma overrides.
     SMOOTH_SIGMA = (1.7 * (TARGET_HZ / 30.0)) if args.sigma is None else args.sigma
