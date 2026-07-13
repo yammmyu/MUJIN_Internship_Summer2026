@@ -1,3 +1,14 @@
 *__pycache__
 *.idea
 *.pyc
+
+# Packaged ROS2 "forwarder" runtime bundle: the SDK ships a self-contained app tree
+# (its own Python 3.10 interpreter + stdlib, ROS2 dist-packages, ament share resources,
+# and prebuilt binaries). This is vendor build output, not authored code — it is kept on
+# disk (obtained with the SDK) but must not be versioned. The authored/config bits under
+# forwarder/app (conf/, config/, demo/, python/ bindings) stay tracked.
+forwarder/app/bin/
+forwarder/app/lib/
+forwarder/app/local/
+forwarder/app/opt/
+forwarder/app/share/
