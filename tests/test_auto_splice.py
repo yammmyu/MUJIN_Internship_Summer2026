@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_safety_invariants as T                                              # noqa: E402
 import real_world.postprocess as planner_mod                                    # noqa: E402 (workspace envelopes live here now)
-from real_world.humanoid_env import HumanoidEnv, MAX_JOINT_STEP, SUBSTEPS_PER_ROW  # noqa: E402
+from real_world.humanoid_env import HumanoidEnv  # noqa: E402
+from real_world.timing import MAX_JOINT_STEP, SUBSTEPS_PER_ROW  # noqa: E402
 from real_world.sim_backend import SimEnv                                       # noqa: E402
 
 

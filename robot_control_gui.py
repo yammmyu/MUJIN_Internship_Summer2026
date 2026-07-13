@@ -29,7 +29,7 @@ from servers.robot_info_server import create_robot_info_http_server, RobotInfo
 from gui import StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataCollectionMixin
 from pico_vr.pico_vr_server.server import DummyServer
 from real_world import HumanoidEnv, InferenceController
-from real_world.humanoid_env import RECORD_HZ
+from real_world.timing import RECORD_HZ
 from real_world.sim_backend import SimEnv
 
 

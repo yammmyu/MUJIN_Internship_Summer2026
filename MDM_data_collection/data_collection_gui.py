@@ -18,7 +18,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from real_world.humanoid_env import HumanoidEnv, RECORD_CAMERAS as CAMERA_NAMES
+from real_world.humanoid_env import HumanoidEnv
+from real_world.recording import RECORD_CAMERAS as CAMERA_NAMES
 
 _CAMERA_TITLES = {
     "hand_left":  "左手相机",

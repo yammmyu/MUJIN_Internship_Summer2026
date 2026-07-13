@@ -27,8 +27,8 @@ import numpy as np
 
 from real_world.ik import build_solver, rot6d_to_quat as _ik_rot6d_to_quat
 # Episode recording is owned by a dedicated Recorder (its own lock + disk I/O); the env just
-# drives it from the collect loop and lifecycle. RECORD_CAMERAS is re-exported here for
-# back-compat (data_collection_gui imports it from this module).
+# drives it from the collect loop and lifecycle. (RECORD_CAMERAS is imported for the env's own
+# use; external callers now import it from real_world.recording, its owner.)
 from real_world.recording import Recorder, RECORD_CAMERAS
 # Dynamic camera subscriptions live in a dedicated CameraHub (its own lock; one SDK camera
 # object per camera, opened/closed on demand). KNOWN_CAMERAS / CAMERA_IDLE_TIMEOUT are the
@@ -40,15 +40,16 @@ from real_world.camera import CameraHub, KNOWN_CAMERAS, CAMERA_IDLE_TIMEOUT
 from real_world.sim_preview import SimPreview
 # Post-inference action pipeline (#8): raw policy chunk -> robot-ready substeps (gripper binarize +
 # temporal-ensemble merge; later stages absorb IK, sim validation, and the queue splice). The env
-# owns one PostProcessor (self.pipeline). GRIPPER_CLOSE_THRESH is re-exported here for back-compat
-# (scripts import it from this module).
+# owns one PostProcessor (self.pipeline). (GRIPPER_CLOSE_THRESH / APPEND_AHEAD_ROWS are imported for
+# the env's own use; external callers now import them from real_world.postprocess, their owner.)
 from real_world.postprocess import PostProcessor, GRIPPER_CLOSE_THRESH, APPEND_AHEAD_ROWS
 # Producer-side observation buffers + freshness + get_obs/inf_ready (#3). extract_pose is the
 # shared status-frame parser (obs right-EE + recorder both use it).
 from real_world.observer import ObsCollector, extract_pose
 # Timing/rate constants live in ONE place (real_world/timing.py) so RECORD_HZ, the substep rate
 # (CONTROL_HZ/STEP_TIME) and the velocity cap (MAX_JOINT_VEL/MAX_JOINT_STEP) can't drift apart.
-# Re-exported below for back-compat — scripts and tests import these names from humanoid_env.
+# (Imported for the env's own use; scripts and tests now import these names from real_world.timing,
+# their owner, rather than through this module.)
 from real_world.timing import (
     RECORD_HZ, ROW_DT, CONTROL_HZ, STEP_TIME, SUBSTEPS_PER_ROW, MAX_JOINT_VEL, MAX_JOINT_STEP,
     RAMP_JOINT_STEP, SPEED_SCALE, TRACE_DIR,

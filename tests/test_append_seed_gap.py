@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_safety_invariants as T
 import test_auto_splice as A
-from real_world.humanoid_env import MAX_JOINT_STEP, SUBSTEPS_PER_ROW
+from real_world.timing import MAX_JOINT_STEP, SUBSTEPS_PER_ROW
 
 
 def _counts_by_id(q):

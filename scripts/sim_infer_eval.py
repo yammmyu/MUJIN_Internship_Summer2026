@@ -38,7 +38,10 @@ from real_world.ik import quat_xyzw_to_se3, DEFAULT_URDF, DEFAULT_CALIBRATION  #
 from real_world.sim_backend import SimEnv, load_trajectory  # noqa: E402
 from real_world.recorded_obs import RecordedObsSource  # noqa: E402
 # These import a2d_sdk (only present on the robot machine), so keep them after the SDK-free ones.
-from real_world.humanoid_env import HumanoidEnv, RECORD_HZ, GRIPPER_CLOSE_THRESH, MAX_JOINT_STEP  # noqa: E402
+from real_world.humanoid_env import HumanoidEnv  # noqa: E402
+# Constants imported from their TRUE owners (timing / postprocess), not via the env's namespace.
+from real_world.timing import RECORD_HZ, MAX_JOINT_STEP  # noqa: E402
+from real_world.postprocess import GRIPPER_CLOSE_THRESH  # noqa: E402
 from real_world.inference_controller import (  # noqa: E402
     InferenceController, PC4080_HOST, PC4080_PORT, INFERENCE_HZ,
 )

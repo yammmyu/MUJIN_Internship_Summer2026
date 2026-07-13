@@ -100,7 +100,8 @@ class _FakeCtl:
 def run(verbose=True):
     """Run all invariant checks. Returns True on success, raises AssertionError on a violation."""
     import real_world.postprocess as planner_mod
-    from real_world.humanoid_env import HumanoidEnv, MAX_JOINT_STEP
+    from real_world.humanoid_env import HumanoidEnv
+    from real_world.timing import MAX_JOINT_STEP
     from real_world.sim_backend import SimEnv
 
     # Isolate the RELEASE-pipeline invariants from the workspace-envelope check (H4 is config,
