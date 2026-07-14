@@ -20,26 +20,51 @@ import tkinter as tk
 from tkinter import ttk
 import argparse
 
-import rclpy
-
-from a2d_sdk.robot import RobotDds as Robot, RobotController, Slam
-from examples.control_wheel_example import WheelController
-from servers.robot_info_server import create_robot_info_http_server, RobotInfo
-
-from gui import StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataCollectionMixin
-from pico_vr.pico_vr_server.server import DummyServer
-from real_world import HumanoidEnv, InferenceController
+# The GUI is always available; the hardware stack (ROS, the a2d SDK, the PyBullet
+# sim, the ZeroMQ VR server, the policy env) only exists on the robot machine. Guard
+# those imports so the console can also launch in --demo mode on any laptop, where
+# the whole stack is replaced by gui.demo_backend. Names left as None here are only
+# ever dereferenced on the real (non-demo) path.
+from gui import (StyleMixin, CameraMixin, InferenceMixin, VRMixin,
+                 DataCollectionMixin, EvalMixin)
 from real_world.timing import RECORD_HZ
-from real_world.sim_backend import SimEnv
+
+try:
+    import rclpy
+    from a2d_sdk.robot import RobotDds as Robot, RobotController, Slam
+    from examples.control_wheel_example import WheelController
+    from servers.robot_info_server import create_robot_info_http_server, RobotInfo
+    from pico_vr.pico_vr_server.server import DummyServer
+    from real_world import HumanoidEnv, InferenceController
+    from real_world.sim_backend import SimEnv
+    _HW_IMPORT_ERROR = None
+except Exception as _e:                       # missing SDK / ROS / zmq / pybullet
+    rclpy = None
+    Robot = RobotController = Slam = WheelController = None
+    create_robot_info_http_server = RobotInfo = DummyServer = None
+    HumanoidEnv = InferenceController = SimEnv = None
+    _HW_IMPORT_ERROR = _e
 
 
-class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataCollectionMixin):
-    def __init__(self, root, camera_mode="all"):
+class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin,
+                      DataCollectionMixin, EvalMixin):
+    def __init__(self, root, camera_mode="all", demo=False):
         self.root = root
-        self.root.title("智元G1机器人控制界面")
+        self.demo = demo
+        self.root.title("Mujin Humanoid Control Console" + ("  —  DEMO" if demo else ""))
         self.root.geometry("1600x950")
         self.root.minsize(1180, 720)
         self._setup_styles()
+
+        if demo:
+            self._init_demo_backend(camera_mode)
+        else:
+            self._init_real_backend(camera_mode)
+
+    # ------------------------------------------------------------------ #
+    #  Backend construction (real hardware vs. hardware-free demo)         #
+    # ------------------------------------------------------------------ #
+    def _init_real_backend(self, camera_mode):
 
         # 机器人（相机由 HumanoidEnv 持有，见下方 self.env）
         self.robot = Robot()
@@ -50,10 +75,10 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         # 不切换底盘导航模式，避免遥操过程中底盘被自动导航带动。
         try:
             self.slam = Slam()
-            print("SLAM 模块初始化成功（已解冻关节状态）")
+            print("SLAM initialized (joint states unfrozen)")
         except Exception as e:
             self.slam = None
-            print(f"⚠️ SLAM 初始化失败，VR 遥操所需关节状态可能不可用: {e}")
+            print(f"⚠️ SLAM init failed; joint states needed for VR teleop may be unavailable: {e}")
 
         # data 模式下保持 3 路相机常开，普通模式不订阅任何相机（无视频流带宽）
         camera_names = ["hand_left", "hand_right", "head"] if camera_mode == "data" else []
@@ -91,92 +116,145 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         # 策略推理控制器（复用注入的 env）
         self.inference = InferenceController(self.env, self.robot_info, grasp_detector_path="data/grasp_detector/detector.pt")
 
-        # 恢复上次保存的调参（平滑/执行参数），在搭建界面前应用，使控件初值与运行时一致。
+        # ---- VR data channel ----
+        # Uplink (:5556): headset -> _handle_vr_joints (the only place VR poses reach the robot).
+        # Downlink (:5555): start_vr_stream_thread composites the camera view and pushes it back.
+        # use_default_image=False: wait for real camera frames rather than a placeholder.
+        self.dummy_server = DummyServer(
+            on_joints=self._handle_vr_joints,
+            use_default_image=False,
+        )
+        self._finish_init(start_vr_stream=True)
+
+    def _init_demo_backend(self, camera_mode):
+        """Hardware-free backend: every collaborator is a synthetic stand-in from
+        gui.demo_backend, so the exact same UI runs on any laptop for recorded demos."""
+        from gui.demo_backend import (
+            DemoRobot, DemoRobotController, DemoSlam, DemoWheelController,
+            DemoDummyServer, DemoEnv, DemoInference, DemoEvalWriter)
+        from gui.eval_panel import EVAL_DIR
+
+        self.camera_mode = camera_mode
+        self.robot = DemoRobot()
+        self.robot_controller = DemoRobotController()
+        self.slam = DemoSlam()
+        self.wheel_controller = DemoWheelController()
+        self.robot_info = None
+        self.camera_images = {}
+        self.camera_tile_size = (320, 240)
+
+        self.env = DemoEnv(output_dir="recordings")
+        self._sim_thread = None
+        self._sim_stop = threading.Event()
+
+        # A synthetic eval session that fills the dashboard live during an auto run.
+        self._demo_eval = DemoEvalWriter(EVAL_DIR / "demo_session.jsonl")
+        self.inference = DemoInference(self.env, eval_writer=self._demo_eval)
+        self.dummy_server = DemoDummyServer()
+
+        # In demo mode "Start sim preview" just flags the sim ready (no PyBullet needed),
+        # so auto-run proceeds without hardware or a display.
+        def _demo_launch_sim():
+            self.env.sim = object()
+            self.status_text.set("Sim preview ready (demo)")
+        self.launch_sim = _demo_launch_sim
+        self._stop_sim = lambda: None
+
+        self._finish_init(start_vr_stream=False)
+
+    def _finish_init(self, start_vr_stream):
+        """Shared tail for both backends: restore tuning, init shared state, build the
+        UI, and start the (already-constructed) collaborators."""
+        # Restore persisted tuning before the panel is built so widgets show live values.
         self._load_and_apply_tuning()
 
-        # 左夹爪状态（move_gripper 读写；右夹爪界面不暴露，保持不动）
+        # Left-gripper state (right gripper is not exposed in the UI; it stays put).
         self.left_gripper_pos = 0.0
         self.right_gripper_pos = 0.0
 
-        # ---- VR 遥操共享状态（_handle_vr_joints / 执行线程读写）----
-        # is_vr_control 是总开关：False 时回调照常解析手柄姿态但不下发任何机器人动作。
+        # ---- VR teleop shared state (read/written by _handle_vr_joints / exec thread) ----
         self.is_vr_control = False
         self.vr_execution_thread = None
         self.vr_actions = []
         self.previous_vr_positions = []
         self.last_joint_update_timestamp = 0.0
         self.vr_buttons_pressed = set()
-        # 最新摇杆轴快照（[L_x, L_y, R_x, R_y]），由 _handle_vr_joints 每拍刷新；
-        # 50Hz 执行线程据此做摇杆腕部滚转（速率控制）。
         self.vr_axes = []
 
-        # 状态栏
+        # Status bar.
         self.status_text = tk.StringVar()
-        self.status_text.set("就绪")
+        self.status_text.set("Ready" + ("  ·  demo mode" if self.demo else ""))
         self.status_label = None
 
         self.setup_ui()
-        self.env.start()           # 启动相机采集 + 执行线程（GUI 持有 env 生命周期）
+        self.env.start()           # camera capture + exec threads (GUI owns env lifecycle)
         self.inference.start()
         self.start_camera_thread()
 
-        # ---- VR 遥操数据通道 ----
-        # 上行(:5556)：头显客户端把 HMD+手柄 21 维姿态回传 → on_joints=_handle_vr_joints。
-        #              这是把头显动作接到机器人的唯一连接点。
-        # 下行(:5555)：start_vr_stream_thread 把相机画面合成后 set_image 推给头显。
-        # use_default_image=False：不发内置占位图，等真实相机帧。
-        self.dummy_server = DummyServer(
-            on_joints=self._handle_vr_joints,
-            use_default_image=False,
-        )
         self.dummy_server.start()
-        self.start_vr_stream_thread()
+        if start_vr_stream:
+            self.start_vr_stream_thread()
 
     def setup_ui(self):
-        """顶部标题栏 + 左右分栏（左相机 / 右推理控制）+ 底部状态栏。"""
-        # ===== 顶部标题栏 =====
-        header = ttk.Frame(self.root)
-        header.pack(fill=tk.X, padx=16, pady=(12, 4))
-        ttk.Label(header, text="智元 G1 机器人控制面板",
-                  style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header, text="Mujin · Humanoid Control Console",
-                  style="Subtitle.TLabel").pack(side=tk.LEFT, padx=12, pady=(8, 0))
+        """Branded top bar + tabbed workspace (Console / VR teleop / Evaluation) + status bar."""
+        # ===== Top app bar =====
+        header = ttk.Frame(self.root, style="Header.TFrame")
+        header.pack(fill=tk.X)
+        hinner = ttk.Frame(header, style="Header.TFrame")
+        hinner.pack(fill=tk.X, padx=20, pady=12)
+        # Brand mark + product name.
+        ttk.Label(hinner, text="MUJIN", style="Brand.TLabel").pack(side=tk.LEFT)
+        ttk.Label(hinner, text="Humanoid Control Console",
+                  style="Title.TLabel").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(hinner, text="G1 dual-arm  ·  policy inference & teleop",
+                  style="Subtitle.TLabel").pack(side=tk.LEFT, padx=14, pady=(6, 0))
+        if self.demo:
+            ttk.Label(hinner, text="DEMO MODE  ·  no hardware",
+                      style="DemoPill.TLabel").pack(side=tk.RIGHT)
+        else:
+            ttk.Label(hinner, text="LIVE  ·  hardware connected",
+                      style="Pill.TLabel").pack(side=tk.RIGHT)
+        ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X)
 
-        # ===== 底部状态栏（先建，固定贴底） =====
+        # ===== Status bar (built first, pinned to the bottom) =====
         status_bar = ttk.Frame(self.root)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 10))
         self.status_label = ttk.Label(
             status_bar, textvariable=self.status_text,
             style="Status.TLabel", anchor=tk.W)
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(status_bar, text="清除", style="Muted.TButton",
-                   command=lambda: self.status_text.set("就绪")
+        ttk.Button(status_bar, text="Clear", style="Muted.TButton",
+                   command=lambda: self.status_text.set("Ready")
                    ).pack(side=tk.RIGHT, padx=(8, 0))
 
-        # ===== 主区：顶层 Notebook（控制台 / VR 遥操 两个标签页）=====
+        # ===== Workspace: top-level notebook =====
         tabs = ttk.Notebook(self.root)
-        tabs.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        tabs.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        # ---- 标签页 1：控制台（相机视图 + 推理控制左右分栏）----
+        # ---- Tab 1: Console (camera views + inference control) ----
         body = ttk.Frame(tabs)
-        tabs.add(body, text="  🧠  控制台  ")
+        tabs.add(body, text="   Console   ")
 
         left_frame = ttk.Frame(body)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
-        # 右侧推理控制为固定宽面板（其内部 canvas 已按需预留宽度），左侧相机视图占据剩余空间并随
-        # 窗口伸缩。此前右侧也是 expand=True，两栏按 50/50 平分宽度，而推理面板的 canvas 内容比默认
-        # 窗口的一半还宽，于是右半被裁切。
-        right_frame = ttk.LabelFrame(body, text="  🧠  推理控制  ")
+        # The inference control column is fixed-width (its inner canvas reserves the width it
+        # needs); the camera view takes the remaining space and stretches with the window.
+        right_frame = ttk.LabelFrame(body, text="  Inference control  ")
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
 
-        self.setup_camera_panel(left_frame)         # 左：相机视图
-        self.setup_inference_panel(right_frame)     # 右：左夹爪 + 推理控制 + 子步监视
+        self.setup_camera_panel(left_frame)         # left: camera views
+        self.setup_inference_panel(right_frame)     # right: grippers + inference + substep monitor
 
-        # ---- 标签页 2：VR 遥操（开关 + 灵敏度参数）----
+        # ---- Tab 2: VR teleop (toggle + sensitivity + data collection) ----
         vr_tab = ttk.Frame(tabs)
-        tabs.add(vr_tab, text="  🎮  VR 遥操  ")
+        tabs.add(vr_tab, text="   VR teleop   ")
         self.setup_vr_panel(vr_tab)
+
+        # ---- Tab 3: Evaluation dashboard (live success-rate KPIs) ----
+        eval_tab = ttk.Frame(tabs)
+        tabs.add(eval_tab, text="   Evaluation   ")
+        self.setup_eval_panel(eval_tab)
 
     def setup_vr_panel(self, parent):
         """VR 遥操控制：左侧启动/停止开关 + 灵敏度参数标签页，右侧数据采集面板。
@@ -195,7 +273,7 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         top = ttk.Frame(left)
         top.pack(fill=tk.X, padx=8, pady=8)
         self.vr_toggle_btn = ttk.Button(
-            top, text="启动 VR 遥操", style="Primary.TButton",
+            top, text="Start VR teleop", style="Primary.TButton",
             command=self._toggle_vr,
         )
         self.vr_toggle_btn.pack(side=tk.LEFT)
@@ -205,8 +283,8 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self.setup_vr_params_panel(nb)
 
-        # 右：数据采集（录制控制 + 末端位姿实时），固定宽面板。
-        right = ttk.LabelFrame(parent, text="  📦  数据采集  ")
+        # Right: data collection (record controls + live EE pose), fixed width.
+        right = ttk.LabelFrame(parent, text="  Data collection  ")
         right.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
         self.setup_data_collection_panel(right)
 
@@ -214,22 +292,22 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
         """翻转 VR 遥操总开关并同步按钮/状态栏文案。"""
         self.is_vr_control = not self.is_vr_control
         if self.is_vr_control:
-            self.vr_toggle_btn.config(text="停止 VR 遥操")
-            self.status_text.set("VR 遥操：开（按住 L_Y / R_B 移动手臂）")
+            self.vr_toggle_btn.config(text="Stop VR teleop")
+            self.status_text.set("VR teleop: ON  (hold L_Y / R_B to move the arms)")
         else:
-            self.vr_toggle_btn.config(text="启动 VR 遥操")
-            self.status_text.set("VR 遥操：关")
+            self.vr_toggle_btn.config(text="Start VR teleop")
+            self.status_text.set("VR teleop: OFF")
 
     # ===================== sim preview (in-process PyBullet) =====================
     def launch_sim(self):
         """Start the PyBullet preview on its own thread (idempotent)."""
         if self._sim_thread is not None and self._sim_thread.is_alive():
-            self.status_text.set("仿真预览已在运行")
+            self.status_text.set("Sim preview already running")
             return
         self._sim_stop.clear()
         self._sim_thread = threading.Thread(target=self._sim_loop, daemon=True)
         self._sim_thread.start()
-        self.status_text.set("仿真预览已启动")
+        self.status_text.set("Sim preview started")
 
     def _sim_loop(self):
         """Owns the PyBullet connection: build it here, seed to the robot's current pose,
@@ -263,36 +341,41 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin, DataColl
             self._sim_thread.join(timeout=3.0)
 
     def on_closing(self):
-        """窗口关闭时依次释放各资源，最后强制退出进程。
+        """Release each resource in order on window close, then force-exit the process.
 
-        每个资源单独 try/except，避免前一个清理失败阻断后续；
-        最后用 os._exit() 兜底，绕过被 DDS/rclpy 原生线程卡住的解释器退出。
+        Each resource is torn down under its own try/except so one failure can't block the
+        rest; os._exit() is the backstop for an interpreter wedged on a native DDS/rclpy thread.
         """
-        if getattr(self, "_is_closing", False):     # 信号 + 窗口关闭可能同时触发
+        if getattr(self, "_is_closing", False):     # signal + window-close may both fire
             return
         self._is_closing = True
 
-        # VR 总开关先置 False，让执行线程自然退出，再关闭网络服务。
+        # Flip the VR master switch off first so the exec thread exits, then close the services.
         self.is_vr_control = False
 
-        for label, fn in [
-            ("推理控制器", self.inference.stop),
-            ("VR 服务", self.dummy_server.stop),
-            ("仿真预览", self._stop_sim),     # 先停仿真步进线程，再关 env
-            ("HumanoidEnv", self.env.stop),   # 先停采集/执行线程，再关其持有的相机
-            ("机器人", self.robot.shutdown),
-            ("ROS 节点", self.wheel_controller.destroy_node),
-            ("rclpy", rclpy.shutdown),
-        ]:
+        steps = [
+            ("inference controller", self.inference.stop),
+            ("VR service", self.dummy_server.stop),
+            ("sim preview", self._stop_sim),     # stop the sim-stepping thread before the env
+            ("environment", self.env.stop),      # stop capture/exec threads before its cameras
+            ("robot", self.robot.shutdown),
+            ("ROS node", self.wheel_controller.destroy_node),
+        ]
+        if getattr(self, "_demo_eval", None) is not None:
+            steps.insert(0, ("demo eval", self._demo_eval.stop))
+        if rclpy is not None and not self.demo:
+            steps.append(("rclpy", rclpy.shutdown))
+
+        for label, fn in steps:
             try:
                 fn()
             except Exception as e:
-                print(f"关闭{label}出错: {e}")
+                print(f"error closing {label}: {e}")
 
         try:
             self.root.destroy()
         except Exception as e:
-            print(f"销毁窗口出错: {e}")
+            print(f"error destroying window: {e}")
         finally:
             os._exit(0)
 
@@ -339,23 +422,36 @@ def main():
         handlers=_log_handlers,
     )
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", action="store_true")
+    parser = argparse.ArgumentParser(description="Mujin Humanoid Control Console")
+    parser.add_argument("--data", action="store_true",
+                        help="data-collection camera mode (3 cameras always on)")
+    parser.add_argument("--demo", action="store_true",
+                        help="hardware-free demo mode: synthetic robot/cameras/eval, "
+                             "no SDK/ROS/robot required (for recorded demos & UI work)")
     args = parser.parse_args()
 
     camera_mode = "data" if args.data else "all"
 
-    _safety_preflight()    # block launch if the safety invariants regressed
+    if not args.demo and _HW_IMPORT_ERROR is not None:
+        print(f"\n*** Hardware stack unavailable ({type(_HW_IMPORT_ERROR).__name__}: "
+              f"{_HW_IMPORT_ERROR}).\n*** This machine can only run the console in demo mode. "
+              f"Launch with:  python robot_control_gui.py --demo\n")
+        sys.exit(1)
+
+    if not args.demo:
+        _safety_preflight()    # block launch if the safety invariants regressed
+    else:
+        print("[startup] DEMO MODE — no hardware; synthetic robot/cameras/eval.\n")
 
     root = tk.Tk()
-    app = RobotControlGUI(root, camera_mode)
+    app = RobotControlGUI(root, camera_mode, demo=args.demo)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
 
-    # Ctrl+C：注册 SIGINT 处理器，转交主线程的 on_closing
+    # Ctrl+C: route SIGINT to the main thread's on_closing.
     signal.signal(signal.SIGINT, lambda *_: app.on_closing())
 
-    # 心跳：周期性把控制权交还给 Python 解释器，
-    # 否则 Tk 的 C 事件循环在空闲时不会处理挂起的 SIGINT。
+    # Heartbeat: periodically hand control back to the Python interpreter, else Tk's C
+    # event loop won't service a pending SIGINT while idle.
     def _tick():
         root.after(200, _tick)
     root.after(200, _tick)

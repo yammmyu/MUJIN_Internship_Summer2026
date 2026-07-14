@@ -32,7 +32,7 @@ class DataCollectionMixin:
         self._dc_finalizing   = False
         self._dc_is_stopped   = False
         self._dc_current_name = tk.StringVar(value="—")
-        self._dc_status_var   = tk.StringVar(value="空闲")
+        self._dc_status_var   = tk.StringVar(value="Idle")
 
         # ---- 末端位姿显示变量 ----
         self._dc_left_pos_var   = tk.StringVar(value="—")
@@ -44,35 +44,35 @@ class DataCollectionMixin:
         # 用原生 tk.Label（而非 ttk）直接设 bg，确保各主题下背景色都生效。
         # 颜色/文案由 _dc_update_indicator() 按 self._dc_is_recording 驱动。
         self._dc_indicator = tk.Label(
-            parent, text="■  未录制  NOT RECORDING",
-            font=("", 20, "bold"), bg="#c0392b", fg="white",
-            height=2, anchor="center", relief="raised", bd=2,
+            parent, text="■   NOT RECORDING",
+            font=self.theme.ui(18, "bold"), bg=self.theme.DANGER, fg="white",
+            height=2, anchor="center", relief="flat", bd=0,
         )
         self._dc_indicator.pack(fill=tk.X, padx=8, pady=(8, 4))
 
-        # ── 录制状态 ──
-        sec_info = ttk.LabelFrame(parent, text="  ⏺  录制状态  ")
+        # ── Recording status ──
+        sec_info = ttk.LabelFrame(parent, text="  Recording status  ")
         sec_info.pack(fill=tk.X, padx=8, pady=(8, 6))
         info_grid = ttk.Frame(sec_info)
         info_grid.pack(fill=tk.X, padx=8, pady=8)
         info_grid.columnconfigure(1, weight=1)
-        ttk.Label(info_grid, text="当前录制:").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(info_grid, text="Episode").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Label(info_grid, textvariable=self._dc_current_name,
                   style="Value.TLabel").grid(row=0, column=1, sticky="w", padx=8)
-        ttk.Label(info_grid, text="状态:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(info_grid, text="State").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Label(info_grid, textvariable=self._dc_status_var,
                   style="Value.TLabel").grid(row=1, column=1, sticky="w", padx=8)
 
-        # ── 控制 ──
-        sec_ctrl = ttk.LabelFrame(parent, text="  🎛  数据采集  ")
+        # ── Controls ──
+        sec_ctrl = ttk.LabelFrame(parent, text="  Data collection  ")
         sec_ctrl.pack(fill=tk.X, padx=8, pady=6)
         main_row = ttk.Frame(sec_ctrl)
         main_row.pack(fill=tk.X, padx=8, pady=8)
-        self._dc_btn_start = ttk.Button(main_row, text="⏺  开始录制",
+        self._dc_btn_start = ttk.Button(main_row, text="⏺  Start recording",
                                         style="Danger.TButton",
                                         command=self.recording_start)
         self._dc_btn_start.pack(side=tk.LEFT, padx=(0, 6))
-        self._dc_btn_stop = ttk.Button(main_row, text="⏹  停止录制",
+        self._dc_btn_stop = ttk.Button(main_row, text="⏹  Stop recording",
                                        style="Muted.TButton",
                                        command=self.recording_stop,
                                        state=tk.DISABLED)
@@ -80,50 +80,50 @@ class DataCollectionMixin:
 
         self._dc_post_stop_frame = ttk.Frame(sec_ctrl)
         ttk.Label(self._dc_post_stop_frame,
-                  text="录制已停止，请选择:").pack(side=tk.LEFT, padx=(8, 12))
-        self._dc_btn_save = ttk.Button(self._dc_post_stop_frame, text="💾  保存",
+                  text="Recording stopped — choose:").pack(side=tk.LEFT, padx=(8, 12))
+        self._dc_btn_save = ttk.Button(self._dc_post_stop_frame, text="Save",
                                        style="Success.TButton",
                                        command=self.recording_save)
         self._dc_btn_save.pack(side=tk.LEFT, padx=(0, 6))
-        self._dc_btn_delete = ttk.Button(self._dc_post_stop_frame, text="🗑  删除",
+        self._dc_btn_delete = ttk.Button(self._dc_post_stop_frame, text="Delete",
                                          style="Warn.TButton",
                                          command=self.recording_delete)
         self._dc_btn_delete.pack(side=tk.LEFT, padx=6)
 
-        # ── 快捷键说明（键盘 + VR 手柄）──
-        sec_keys = ttk.LabelFrame(parent, text="  ⌨  快捷键（键盘焦点不在输入框时生效）  ")
+        # ── Shortcuts (keyboard + VR controller) ──
+        sec_keys = ttk.LabelFrame(parent, text="  Shortcuts   ·   active when no text field is focused  ")
         sec_keys.pack(fill=tk.X, padx=8, pady=6)
         keys_body = ttk.Frame(sec_keys)
         keys_body.pack(fill=tk.X, padx=8, pady=8)
         keys_body.columnconfigure(1, weight=1)
         for i, (key, act) in enumerate([
-            ("[R]", "开始录制"), ("[S]", "停止录制"),
-            ("[Enter]", "保存"), ("[D]", "删除"),
-            ("[VR R_A]", "录制 / 停止 / 保存并开始下一段"),
+            ("[R]", "Start recording"), ("[S]", "Stop recording"),
+            ("[Enter]", "Save"), ("[D]", "Delete"),
+            ("[VR R_A]", "Record / stop / save & start next"),
         ]):
             ttk.Label(keys_body, text=key, style="Value.TLabel").grid(
                 row=i, column=0, sticky="w", pady=2)
             ttk.Label(keys_body, text=act).grid(
                 row=i, column=1, sticky="w", padx=8, pady=2)
 
-        # ── 末端位姿实时 ──
-        sec_pos = ttk.LabelFrame(parent, text="  📡  末端位置实时  ")
+        # ── Live end-effector pose ──
+        sec_pos = ttk.LabelFrame(parent, text="  End-effector pose (live)  ")
         sec_pos.pack(fill=tk.X, padx=8, pady=6)
         pos_grid = ttk.Frame(sec_pos)
         pos_grid.pack(fill=tk.X, padx=8, pady=8)
         pos_grid.columnconfigure(1, weight=1)
-        ttk.Label(pos_grid, text="左手 pos (x,y,z):").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, text="Left pos (x,y,z)").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Label(pos_grid, textvariable=self._dc_left_pos_var,
                   style="Value.TLabel").grid(row=0, column=1, sticky="w", padx=8)
-        ttk.Label(pos_grid, text="左手 quat (x,y,z,w):").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, text="Left quat (x,y,z,w)").grid(row=1, column=0, sticky="w", pady=2)
         ttk.Label(pos_grid, textvariable=self._dc_left_quat_var,
                   style="Value.TLabel").grid(row=1, column=1, sticky="w", padx=8)
         ttk.Separator(pos_grid, orient="horizontal").grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Label(pos_grid, text="右手 pos (x,y,z):").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, text="Right pos (x,y,z)").grid(row=3, column=0, sticky="w", pady=2)
         ttk.Label(pos_grid, textvariable=self._dc_right_pos_var,
                   style="Value.TLabel").grid(row=3, column=1, sticky="w", padx=8)
-        ttk.Label(pos_grid, text="右手 quat (x,y,z,w):").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(pos_grid, text="Right quat (x,y,z,w)").grid(row=4, column=0, sticky="w", pady=2)
         ttk.Label(pos_grid, textvariable=self._dc_right_quat_var,
                   style="Value.TLabel").grid(row=4, column=1, sticky="w", padx=8)
 
@@ -138,9 +138,9 @@ class DataCollectionMixin:
         if ind is None:
             return
         if self._dc_is_recording:
-            ind.config(text="●  录制中  RECORDING", bg="#27ae60", fg="white")
+            ind.config(text="●   RECORDING", bg=self.theme.SUCCESS, fg="white")
         else:
-            ind.config(text="■  未录制  NOT RECORDING", bg="#c0392b", fg="white")
+            ind.config(text="■   NOT RECORDING", bg=self.theme.DANGER, fg="white")
 
     # ── 键盘快捷键（焦点守卫，避免在 VR 参数输入框里误触发）──────────────────
 
@@ -184,23 +184,23 @@ class DataCollectionMixin:
         name = self._dc_next_name()
         self._dc_current_name.set(name)
         self._dc_is_recording = True
-        self._dc_update_indicator()                    # → 绿色「录制中」
-        self._dc_status_var.set("🔴  录制中…")
+        self._dc_update_indicator()                    # → green "RECORDING"
+        self._dc_status_var.set("● Recording…")
         self._dc_btn_start.config(state=tk.DISABLED)
         self._dc_btn_stop.config(state=tk.NORMAL)
         self._dc_post_stop_frame.pack_forget()
         self.env.start_recording(episode_name=name)
-        self._dc_show_status(f"开始录制: {name}")
+        self._dc_show_status(f"Started recording: {name}")
 
     def recording_stop(self):
         if not self._dc_is_recording:
             return
         self._dc_is_recording = False
         self._dc_update_indicator()                    # → 红色「未录制」
-        self._dc_finalizing   = True   # 收尾中：禁止开始新录制，直到写盘完成
-        self._dc_status_var.set("⏸  正在停止…")
+        self._dc_finalizing   = True   # finalizing: block a new recording until the write completes
+        self._dc_status_var.set("⏸ Stopping…")
         self._dc_btn_stop.config(state=tk.DISABLED)
-        self._dc_show_status(f"正在停止录制: {self._dc_current_name.get()}…")
+        self._dc_show_status(f"Stopping recording: {self._dc_current_name.get()}…")
         # stop_recording 会 finalize（写盘）—— 放后台线程，避免阻塞 UI。
         threading.Thread(target=self._dc_flush_and_prompt, daemon=True).start()
 
@@ -215,9 +215,9 @@ class DataCollectionMixin:
         # 写盘完成 → 进入「待保存/删除」态。
         self._dc_finalizing = False
         self._dc_is_stopped = True
-        self._dc_status_var.set("⏸  已停止 — 请保存或删除")
+        self._dc_status_var.set("⏸ Stopped — save or delete")
         self._dc_post_stop_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
-        self._dc_show_status(f"录制已停止: {self._dc_current_name.get()}，请保存或删除")
+        self._dc_show_status(f"Recording stopped: {self._dc_current_name.get()} — save or delete")
 
     def recording_save(self):
         if not self._dc_is_stopped:
@@ -225,9 +225,9 @@ class DataCollectionMixin:
         name = self._dc_current_name.get()
         self._dc_is_stopped = False
         self._dc_post_stop_frame.pack_forget()
-        self._dc_status_var.set(f"✅  已保存: {name}")
+        self._dc_status_var.set(f"✓ Saved: {name}")
         self._dc_btn_start.config(state=tk.NORMAL)
-        self._dc_show_status(f"已保存录制: {name}")
+        self._dc_show_status(f"Saved recording: {name}")
 
     def recording_delete(self):
         if not self._dc_is_stopped:
@@ -239,9 +239,9 @@ class DataCollectionMixin:
         self._dc_is_stopped = False
         self._dc_post_stop_frame.pack_forget()
         self._dc_current_name.set("—")
-        self._dc_status_var.set("🗑  已删除")
+        self._dc_status_var.set("Deleted")
         self._dc_btn_start.config(state=tk.NORMAL)
-        self._dc_show_status(f"已删除录制: {name}")
+        self._dc_show_status(f"Deleted recording: {name}")
 
     def _dc_show_status(self, msg: str):
         ts = time.strftime("%H:%M:%S")

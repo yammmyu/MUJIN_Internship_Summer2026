@@ -15,36 +15,36 @@ class CameraMixin:
 
     def setup_camera_panel(self, parent):
         """设置相机图像面板：RGBD 控制条 + 相机勾选条 + 动态网格显示区。"""
-        camera_frame = ttk.LabelFrame(parent, text="  📷  相机视图  ")
+        camera_frame = ttk.LabelFrame(parent, text="  Camera views  ")
         camera_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 可显示的相机及其中文名（须为 env 构造 Camera() 时声明的相机；
-        # data 模式下只有 3 路，深度/鱼眼不可用，故按 env.cameras 过滤）
+        # Displayable cameras (must be declared when env builds Camera(); in data mode only 3
+        # streams exist — depth/fisheye unavailable — so filter by env.cameras).
         self.available_cameras = [
             name for name in
             ["head", "head_depth", "hand_left", "hand_right", "head_center_fisheye"]
             if name in self.env.cameras]
         self.camera_titles = {
-            "head": "头部相机",
-            "head_depth": "深度相机",
-            "hand_left": "左手相机",
-            "hand_right": "右手相机",
-            "head_center_fisheye": "头部鱼眼相机",
+            "head": "Head",
+            "head_depth": "Depth",
+            "hand_left": "Left wrist",
+            "hand_right": "Right wrist",
+            "head_center_fisheye": "Head fisheye",
         }
 
         # ---- 相机勾选条：选择要显示的相机 ----
         # 默认全部不勾选：启动时不请求任何相机，env 不订阅，无视频流带宽。
         # 勾选某相机后，显示线程才会向 env 请求该相机（env 随即订阅/开流）。
         select_bar = ttk.Frame(camera_frame)
-        select_bar.pack(fill=tk.X, padx=10, pady=(0, 6))
-        ttk.Label(select_bar, text="显示相机:").pack(side=tk.LEFT, padx=(0, 4))
+        select_bar.pack(fill=tk.X, padx=10, pady=(2, 6))
+        ttk.Label(select_bar, text="Show", style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         self.camera_display_vars = {
             name: tk.BooleanVar(value=False)
             for name in self.available_cameras
         }
         for name in self.available_cameras:
             ttk.Checkbutton(
-                select_bar, text=self.camera_titles[name],
+                select_bar, text=self.camera_titles[name], style="Card.TCheckbutton",
                 variable=self.camera_display_vars[name],
                 command=self._rebuild_camera_display).pack(side=tk.LEFT, padx=4)
 
@@ -52,11 +52,12 @@ class CameraMixin:
         # （含显示勾选、推理触发、常开相机），与上面的勾选框相互独立。
         active_bar = ttk.Frame(camera_frame)
         active_bar.pack(fill=tk.X, padx=10, pady=(0, 6))
-        ttk.Label(active_bar, text="已激活相机:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(active_bar, text="Live", style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         self.camera_active_labels = {}
         for name in self.available_cameras:
             lbl = tk.Label(active_bar, text=f"● {self.camera_titles[name]}",
-                           fg="#9aa0a6", font=("", 9))   # 灰色=关闭
+                           fg=self.theme.DOT_OFF, bg=self.theme.APP_BG,
+                           font=self.theme.ui(9))   # grey = off
             lbl.pack(side=tk.LEFT, padx=4)
             self.camera_active_labels[name] = lbl
         self._refresh_active_camera_indicator()
@@ -146,15 +147,15 @@ class CameraMixin:
 
             header = ttk.Frame(card)
             header.pack(fill=tk.X, pady=(0, 4))
-            ttk.Label(header, text=f"📷  {self.camera_titles.get(name, name)}",
-                      style="Section.TLabel").pack(side=tk.LEFT, anchor=tk.W)
-            ttk.Button(header, text="💾 保存图片",
-                       style="Primary.TButton",
+            ttk.Label(header, text=self.camera_titles.get(name, name),
+                      style="CardTitle.TLabel").pack(side=tk.LEFT, anchor=tk.W)
+            ttk.Button(header, text="Save frame",
+                       style="Ghost.TButton",
                        command=lambda n=name: self.save_camera_frame(n)
                        ).pack(side=tk.RIGHT)
 
             label = ttk.Label(card, borderwidth=1, relief="solid",
-                              background="#222", anchor=tk.CENTER)
+                              background="#12161F", anchor=tk.CENTER)
             label.pack(fill=tk.BOTH, expand=True)
             self.camera_labels[name] = label
 
@@ -172,7 +173,7 @@ class CameraMixin:
             active = set(self.env.active_cameras())
             for name, lbl in self.camera_active_labels.items():
                 on = name in active
-                lbl.config(fg="#16a34a" if on else "#9aa0a6")   # 绿 / 灰
+                lbl.config(fg=self.theme.DOT_ON if on else self.theme.DOT_OFF)  # green / grey
         except Exception:
             pass
         # 复用 Tk 主循环定时器，无需额外线程
@@ -212,7 +213,7 @@ class CameraMixin:
             if isinstance(image, (list, tuple)):
                 image = image[-1] if image else None
             if image is None or not isinstance(image, np.ndarray) or image.size == 0:
-                self.status_text.set(f"保存失败：{camera_name} 相机暂无图像")
+                self.status_text.set(f"Save failed: no image yet from {camera_name}")
                 return
 
             # 转换为可保存的 RGB PIL 图像（与显示逻辑保持一致）
@@ -247,11 +248,11 @@ class CameraMixin:
             filename = f"{camera_name}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
             filepath = os.path.join(save_dir, filename)
             pil_image.convert("RGB").save(filepath, "JPEG", quality=95)
-            self.status_text.set(f"已保存图片: {filepath}")
-            print(f"已保存图片: {filepath}")
+            self.status_text.set(f"Saved image: {filepath}")
+            print(f"Saved image: {filepath}")
         except Exception as e:
-            self.status_text.set(f"保存图片失败: {e}")
-            print(f"保存图片失败: {e}")
+            self.status_text.set(f"Save image failed: {e}")
+            print(f"Save image failed: {e}")
 
     def update_camera_display(self, camera_name, image):
         """更新相机图像显示"""

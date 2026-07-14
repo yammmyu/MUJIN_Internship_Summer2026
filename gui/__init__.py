@@ -10,6 +10,7 @@ from gui.camera_panel import CameraMixin
 from gui.inference_panel import InferenceMixin
 from gui.vr_control import VRMixin
 from gui.data_collection import DataCollectionMixin
+from gui.eval_panel import EvalMixin
 
 __all__ = [
     "StyleMixin",
@@ -17,4 +18,5 @@ __all__ = [
     "InferenceMixin",
     "VRMixin",
     "DataCollectionMixin",
+    "EvalMixin",
 ]

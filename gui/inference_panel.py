@@ -17,10 +17,10 @@ TUNING_CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "tuning_co
 
 def _grip_label(grip):
     """Binary {0,1} gripper command -> readable label for the substep monitor. Accepts a scalar
-    (single gripper) or a [gl, gr] pair (dual-arm): the pair renders as 'L闭/R开'."""
+    (single gripper) or a [gl, gr] pair (dual-arm). ● = closed, ○ = open."""
     if isinstance(grip, (list, tuple, np.ndarray)):
-        return f"L{'闭' if float(grip[0]) >= 0.5 else '开'}/R{'闭' if float(grip[1]) >= 0.5 else '开'}"
-    return "闭(1)" if float(grip) >= 0.5 else "开(0)"
+        return f"L{'●' if float(grip[0]) >= 0.5 else '○'} R{'●' if float(grip[1]) >= 0.5 else '○'}"
+    return "● closed" if float(grip) >= 0.5 else "○ open"
 
 
 class InferenceMixin:
@@ -47,9 +47,10 @@ class InferenceMixin:
             else:
                 self.right_gripper_pos = pos
             self.robot.move_gripper([self.left_gripper_pos, self.right_gripper_pos])
-            self.status_text.set(f"{'左' if side == 'left' else '右'}夹爪 -> {'闭合' if pos >= 0.5 else '张开'}")
+            self.status_text.set(f"{'Left' if side == 'left' else 'Right'} gripper → "
+                                 f"{'closed' if pos >= 0.5 else 'open'}")
         except Exception as e:
-            self.status_text.set(f"夹爪控制失败: {e}")
+            self.status_text.set(f"Gripper command failed: {e}")
 
     # ------------------------------------------------------------------ #
     #  手动单步推理                                                        #
@@ -61,15 +62,15 @@ class InferenceMixin:
             try:
                 ok = self.inference.inference_once()
                 remaining = self.inference.steps_remaining()
-                msg = (f"✅ 推理完成，共 {remaining} 步" if ok else "❌ 推理失败")
+                msg = (f"✓ Inference complete — {remaining} steps" if ok else "✗ Inference failed")
             except Exception as e:
-                msg = f"❌ 推理异常：{e}"
+                msg = f"✗ Inference error: {e}"
             def done():
                 self.status_text.set(msg)
                 self._refresh_validation_buttons()
                 self._set_manual_busy(False)       # idle again -> tuning unlocked (ALWAYS runs)
             self.root.after(0, done)
-        self.status_text.set("推理中…")
+        self.status_text.set("Running inference…")
         self._set_manual_busy(True)                # lock tuning while inferencing
         threading.Thread(target=worker, daemon=True).start()
 
@@ -83,15 +84,15 @@ class InferenceMixin:
         def worker():
             ok, reason = self.inference.execute_inference_result(once=once)
             remaining = self.inference.steps_remaining()
-            msg = (f"✅ 仿真验证通过（剩余 {remaining} 步），可释放到真机" if ok
-                   else f"❌ 仿真验证失败：{reason}")
+            msg = (f"✓ Sim-validated ({remaining} steps left) — ready to release" if ok
+                   else f"✗ Sim validation failed: {reason}")
             def done():
                 self.status_text.set(msg)
                 self._refresh_validation_buttons()
                 self._refresh_release_buttons()    # a successful validate stages new substeps
                 self._set_manual_busy(False)       # idle again -> tuning unlocked
             self.root.after(0, done)
-        self.status_text.set("仿真验证中…")
+        self.status_text.set("Validating in sim…")
         self._set_manual_busy(True)                # lock tuning while validating
         threading.Thread(target=worker, daemon=True).start()
 
@@ -116,7 +117,7 @@ class InferenceMixin:
         first if needed, then wait (non-blocking) until env.sim is ready before starting the loop."""
         if getattr(self.env, "sim", None) is None:
             self.launch_sim()
-        self.status_text.set("⏳ 启动仿真中，准备自动运行…")
+        self.status_text.set("Starting sim, preparing auto-run…")
         self._auto_pending = True            # lock tuning from the moment auto-run is requested
         self._refresh_tuning_state()
         self._await_sim_then_auto()
@@ -126,19 +127,19 @@ class InferenceMixin:
         if getattr(self.env, "sim", None) is not None:
             self.inference.auto_inference()
             self._auto_pending = False       # is_auto_inference now carries the lock
-            self.status_text.set("⚠ 自动运行中（推理→仿真验证→真机，急停可随时停止）")
+            self.status_text.set("● Auto-run active  (infer → sim-validate → robot; E-stop to halt)")
             self._refresh_tuning_state()     # is_auto_inference now True -> stays locked
         elif tries < 50:                     # ~5s budget for the sim thread to build
             self.root.after(100, lambda: self._await_sim_then_auto(tries + 1))
         else:
             self._auto_pending = False
-            self.status_text.set("⚠ 仿真启动超时，无法开始自动运行")
+            self.status_text.set("⚠ Sim start timed out — cannot begin auto-run")
             self._refresh_tuning_state()     # auto never started -> unlock
 
     def _stop_auto_inference(self):
         """Stop feeding new chunks; the release loop drains whatever is queued (use 急停 to halt)."""
         self.inference.auto_inference(stop=True)
-        self.status_text.set("■ 已停止自动运行（队列将自然排空；急停可立即停止）")
+        self.status_text.set("■ Auto-run stopped (queue drains naturally; E-stop halts immediately)")
         self._refresh_tuning_state()         # idle again -> unlock tuning
 
     # ------------------------------------------------------------------ #
@@ -154,9 +155,9 @@ class InferenceMixin:
             n = self.env.release_n_substeps(count)
         staged = self.env.staged_substeps
         if n > 0:
-            self.status_text.set(f"🚀 已下发 {n} 条指令到真机（剩余待释放 {staged} 子步）")
+            self.status_text.set(f"▶ Sent {n} commands to the robot ({staged} substeps still staged)")
         else:
-            self.status_text.set("⚠ 没有待释放的子步（先在仿真中验证）")
+            self.status_text.set("⚠ No staged substeps to release (validate in sim first)")
         self._refresh_release_buttons()            # staged buffer shrank (maybe now empty)
 
     def _refresh_release_buttons(self):
@@ -197,9 +198,9 @@ class InferenceMixin:
             return
         radius, sigma, m = self.inference.set_smoothing(radius=radius, sigma=sigma, m=m)
         buflen = self.inference.set_buffer_len(buflen)
-        self._sm_readout_var.set(f"当前：radius={radius}  σ={sigma:.2f}  m={m:.3f}  buffer={buflen}")
+        self._sm_readout_var.set(f"current:  radius={radius}   σ={sigma:.2f}   m={m:.3f}   buffer={buflen}")
         if announce:
-            self.status_text.set(f"平滑参数已更新：radius={radius}  σ={sigma:.2f}  m={m:.3f}  buffer={buflen}")
+            self.status_text.set(f"Smoothing updated:  radius={radius}  σ={sigma:.2f}  m={m:.3f}  buffer={buflen}")
             self._save_tuning()
 
     def _apply_exec_knobs(self, *_, announce=True):
@@ -215,10 +216,10 @@ class InferenceMixin:
         speed, sub = self.env.set_speed_scale(speed)
         self.env.append_ahead_rows = max(1, ahead)
         self._ex_readout_var.set(
-            f"当前：speed={speed:.2f} (子步/行={sub})  append_ahead={self.env.append_ahead_rows}")
+            f"current:  speed={speed:.2f}  (substeps/row={sub})   append_ahead={self.env.append_ahead_rows}")
         if announce:
             self.status_text.set(
-                f"执行参数已更新：speed={speed:.2f}  子步/行={sub}  append_ahead={self.env.append_ahead_rows}")
+                f"Execution updated:  speed={speed:.2f}  substeps/row={sub}  append_ahead={self.env.append_ahead_rows}")
             self._save_tuning()
 
     # ------------------------------------------------------------------ #
@@ -240,8 +241,8 @@ class InferenceMixin:
             except tk.TclError:
                 pass
         if getattr(self, "_tuning_hint_var", None) is not None:
-            self._tuning_hint_var.set("⛔ 运行中：停止推理/自动运行后才能调参" if locked
-                                      else "✅ 空闲：可调参（修改即保存）")
+            self._tuning_hint_var.set("⛔ Running — stop inference/auto-run to edit tuning" if locked
+                                      else "✓ Idle — tuning editable (saved on change)")
 
     def _set_manual_busy(self, busy):
         self._manual_busy = busy
@@ -302,10 +303,10 @@ class InferenceMixin:
             a7 = np.asarray(live14, dtype=np.float64)[sl]
             vals = [f"{a7[k]:+.3f}" for k in range(7)]
             gtxt = _grip_label(live_grips[arm]) if live_grips is not None else "—"
-            tree.item("live", values=("实时", *vals, gtxt))
+            tree.item("live", values=("LIVE", *vals, gtxt))
             prev = a7
         else:
-            tree.item("live", values=("实时", *["—"] * 8))
+            tree.item("live", values=("LIVE", *["—"] * 8))
             prev = None
         for i in range(self._monitor_rows):
             iid = f"subrow{i}"
@@ -344,14 +345,14 @@ class InferenceMixin:
             # is staged. Either way these are absolute (q14, [gl,gr]) targets; each table slices its side.
             try:
                 subs = self.env.staged_preview(self._monitor_rows)
-                source = "待释放（手动验证）"
+                source = "staged (manual validation)"
                 if not subs:
                     subs = self.env.robot_q_preview(self._monitor_rows)
-                    source = "真机队列（自动 / 已释放）"
+                    source = "robot queue (auto / released)"
             except Exception:
                 subs = []
                 source = "—"
-            self._monitor_src_var.set(f"队列来源：{source}")
+            self._monitor_src_var.set(f"queue source:  {source}")
             self._update_one_arm_monitor(self._monitor_tree_l, slice(0, 7), live14, live_grips, 0, subs)
             self._update_one_arm_monitor(self._monitor_tree_r, slice(7, 14), live14, live_grips, 1, subs)
         except tk.TclError:
@@ -370,8 +371,8 @@ class InferenceMixin:
         # width= 预留足够横向空间，使整面板（含较宽的子步监视表）在默认窗口尺寸下即可完整显示；
         # 下面的 <Configure> 绑定再把内层 frame 钉到 canvas 视口宽度，窗口变窄时内容自适应回流
         # （纵向溢出交给竖直滚动条），而不是被裁切到右边缘之外、只能靠放大整窗才能看到。
-        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f5f6f8", width=850)
-        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas = tk.Canvas(parent, highlightthickness=0, bg=self.theme.APP_BG, width=760)
+        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview, style="Vertical.TScrollbar")
         body = ttk.Frame(canvas)
         body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         body_window = canvas.create_window((0, 0), window=body, anchor="nw")
@@ -399,90 +400,92 @@ class InferenceMixin:
         canvas.bind("<Enter>", _bind_wheel)
         canvas.bind("<Leave>", _unbind_wheel)
 
-        # ===== 夹爪（左 / 右 独立控制）=====
-        sec_grip = ttk.LabelFrame(body, text="  🤏  夹爪（左 / 右）  ")
+        # ===== Grippers (left / right, independent) =====
+        sec_grip = ttk.LabelFrame(body, text="  Grippers  ")
         sec_grip.pack(fill=tk.X, padx=10, pady=(10, 6))
-        for side, label in (("left", "左"), ("right", "右")):
+        for side, label in (("left", "Left"), ("right", "Right")):
             row = ttk.Frame(sec_grip)
             row.pack(fill=tk.X, padx=8, pady=(8, 4))
-            ttk.Label(row, text=f"{label}夹爪", width=6).pack(side=tk.LEFT, padx=(0, 6))
-            ttk.Button(row, text="张开", style="Success.TButton",
+            ttk.Label(row, text=label, width=6, style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(row, text="Open", style="Success.TButton",
                        command=lambda s=side: self.move_gripper(s, 0.0)).pack(side=tk.LEFT, padx=(0, 6))
-            ttk.Button(row, text="闭合", style="Warn.TButton",
+            ttk.Button(row, text="Close", style="Warn.TButton",
                        command=lambda s=side: self.move_gripper(s, 1.0)).pack(side=tk.LEFT, padx=6)
 
-        # ===== 仿真预览（自动运行 / 仿真验证都依赖它先启动）=====
-        sec_sim = ttk.LabelFrame(body, text="  🟦  仿真预览（自动运行 / 仿真验证前先启动）  ")
+        # ===== Sim preview (required before auto-run / sim-validate) =====
+        sec_sim = ttk.LabelFrame(body, text="  Sim preview  ")
         sec_sim.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(sec_sim, text="Start the PyBullet preview before auto-run or sim validation.",
+                  style="Caption.TLabel").pack(anchor="w", padx=8, pady=(2, 0))
         row = ttk.Frame(sec_sim)
         row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="启动仿真预览", style="Primary.TButton",
+        ttk.Button(row, text="Start sim preview", style="Primary.TButton",
                    command=lambda: self.launch_sim()).pack(side=tk.LEFT, padx=(0, 6))
 
-        # ===== 自动运行（推理 -> 仿真验证 -> 真机）=====
-        sec_auto = ttk.LabelFrame(body, text="  ▶  自动运行  ")
+        # ===== Auto-run (infer -> sim-validate -> robot) =====
+        sec_auto = ttk.LabelFrame(body, text="  Auto-run   ·   infer → sim-validate → robot  ")
         sec_auto.pack(fill=tk.X, padx=10, pady=6)
         row = ttk.Frame(sec_auto)
         row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="⚠ 开始自动运行", style="Danger.TButton",
+        ttk.Button(row, text="▶  Start auto-run", style="Danger.TButton",
                    command=lambda: self._start_auto_inference()).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(row, text="■ 停止自动运行", style="Muted.TButton",
+        ttk.Button(row, text="■  Stop auto-run", style="Muted.TButton",
                    command=lambda: self._stop_auto_inference()).pack(side=tk.LEFT, padx=6)
 
-        # ===== 急停（最显眼，始终可用）=====
-        sec_estop = ttk.LabelFrame(body, text="  ⛔  急停  ")
+        # ===== Emergency stop (most prominent, always available) =====
+        sec_estop = ttk.LabelFrame(body, text="  Emergency stop  ")
         sec_estop.pack(fill=tk.X, padx=10, pady=6)
         row = ttk.Frame(sec_estop)
         row.pack(fill=tk.X, padx=8, pady=8)
         # E-STOP: latched; drops pending + actively holds. Physical E-stop remains primary.
         # It also clears the staged buffer, so grey out the release buttons.
-        ttk.Button(row, text="⛔ 急停（立即停止并保持）", style="Danger.TButton",
+        ttk.Button(row, text="⛔  E-STOP — halt & hold", style="EStop.TButton",
                    command=lambda: (self.env.lock_robot(), self._refresh_release_buttons())
-                   ).pack(side=tk.LEFT, padx=(0, 6))
+                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         # Clear the latched E-stop (only after the operator confirms the arm is safe).
-        ttk.Button(row, text="重置急停", style="Muted.TButton",
+        ttk.Button(row, text="Reset", style="Muted.TButton",
                    command=lambda: self.env.reset_estop()).pack(side=tk.LEFT, padx=6)
 
-        # ===== 手动单步（推理一次 -> 仿真验证 -> 释放）=====
-        sec_manual = ttk.LabelFrame(body, text="  🧠  手动单步  ")
+        # ===== Manual step-through (infer once -> validate -> release) =====
+        sec_manual = ttk.LabelFrame(body, text="  Manual step-through  ")
         sec_manual.pack(fill=tk.X, padx=10, pady=6)
 
         manual_row = ttk.Frame(sec_manual)
         manual_row.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ttk.Label(manual_row, text="① 推理:", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(manual_row, text="推理一次", style="Primary.TButton",
+        ttk.Label(manual_row, text="① Infer", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(manual_row, text="Infer once", style="Primary.TButton",
                    command=lambda: self._run_inference_once()).pack(side=tk.LEFT, padx=4)
-        # "仿真验证" = validate-in-sim (step + self-collision + readback); stages the sim-validated
+        # Validate-in-sim (step + self-collision + readback); stages the sim-validated
         # trajectory but does NOT touch the robot. Run off the Tk thread so the GUI doesn't freeze.
-        self._btn_validate_step = ttk.Button(manual_row, text="② 仿真验证(单步)", style="Primary.TButton",
+        self._btn_validate_step = ttk.Button(manual_row, text="② Validate (step)", style="Ghost.TButton",
                    command=lambda: self._run_validation(once=True))
         self._btn_validate_step.pack(side=tk.LEFT, padx=4)
-        self._btn_validate_rest = ttk.Button(manual_row, text="② 仿真验证(整条)", style="Primary.TButton",
+        self._btn_validate_rest = ttk.Button(manual_row, text="② Validate (all)", style="Ghost.TButton",
                    command=lambda: self._run_validation(once=False))
         self._btn_validate_rest.pack(side=tk.LEFT, padx=4)
-        self._refresh_validation_buttons()       # no prediction yet -> disabled until 推理一次
+        self._refresh_validation_buttons()       # no prediction yet -> disabled until first inference
 
         release_row = ttk.Frame(sec_manual)
         release_row.pack(fill=tk.X, padx=8, pady=(4, 8))
-        ttk.Label(release_row, text="③ 释放真机:", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_release_step = ttk.Button(release_row, text="🚀 释放(单步)", style="Danger.TButton",
+        ttk.Label(release_row, text="③ Release", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_release_step = ttk.Button(release_row, text="▶ Release (1)", style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=False, count=1))
         self._btn_release_step.pack(side=tk.LEFT, padx=4)
-        self._btn_release_ten = ttk.Button(release_row, text="🚀 释放(10步)", style="Danger.TButton",
+        self._btn_release_ten = ttk.Button(release_row, text="▶ Release (10)", style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=False, count=10))
         self._btn_release_ten.pack(side=tk.LEFT, padx=4)
-        self._btn_release_rest = ttk.Button(release_row, text="🚀 释放(剩余)", style="Danger.TButton",
+        self._btn_release_rest = ttk.Button(release_row, text="▶ Release (rest)", style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=True))
         self._btn_release_rest.pack(side=tk.LEFT, padx=4)
-        self._refresh_release_buttons()          # nothing staged yet -> disabled until 仿真验证
+        self._refresh_release_buttons()          # nothing staged yet -> disabled until validation
 
         # 调参锁状态：仅在空闲（无手动/自动推理）时可调；下列控件按状态启用/禁用。
         self._manual_busy = False
         self._auto_pending = False
         self._tuning_widgets = []
 
-        # ===== 平滑参数（仅空闲可调，修改即保存）=====
-        sec_smooth = ttk.LabelFrame(body, text="  🎛  平滑参数（仅空闲可调，修改即保存）  ")
+        # ===== Smoothing (editable when idle; saved on change) =====
+        sec_smooth = ttk.LabelFrame(body, text="  Smoothing   ·   editable when idle  ")
         sec_smooth.pack(fill=tk.X, padx=10, pady=6)
         grid = ttk.Frame(sec_smooth)
         grid.pack(fill=tk.X, padx=8, pady=8)
@@ -497,27 +500,27 @@ class InferenceMixin:
         self._sm_sigma_var = tk.DoubleVar(value=round(self.inference.te_sigma, 2))
         self._sm_m_var = tk.DoubleVar(value=round(self.inference.te_m, 3))
 
-        # TE 半径：id 轴高斯半宽 = 冻结上下文行数。越大越平滑，但更滞后。
-        ttk.Label(grid, text="TE 半径 (radius):", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
+        # TE radius: id-axis Gaussian half-width = frozen context rows. Larger = smoother, more lag.
+        ttk.Label(grid, text="TE radius", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
         self._tuning_widgets.append(ttk.Spinbox(grid, from_=0, to=8, increment=1, width=6,
                     textvariable=self._sm_radius_var, command=self._apply_smoothing))
         self._bind_spinbox_apply(self._tuning_widgets[-1], self._apply_smoothing)  # 键入回车/失焦也应用
         self._tuning_widgets[-1].grid(row=1, column=2, sticky="e", padx=4)
 
-        # TE σ：窗口内高斯形状。越大窗口内平滑越强（建议 <= radius）。
-        ttk.Label(grid, text="TE σ (sigma):", anchor=tk.W).grid(row=2, column=0, sticky="w", pady=3)
+        # TE σ: Gaussian shape within the window. Larger = stronger in-window smoothing (keep <= radius).
+        ttk.Label(grid, text="TE sigma (σ)", anchor=tk.W).grid(row=2, column=0, sticky="w", pady=3)
         self._tuning_widgets.append(ttk.Scale(grid, from_=0.3, to=4.0, orient=tk.HORIZONTAL,
                   variable=self._sm_sigma_var, command=lambda _v: self._apply_smoothing()))
         self._tuning_widgets[-1].grid(row=2, column=1, sticky="ew", padx=8)
 
-        # TE 衰减 m：跨 chunk 同 id 均值的时近衰减。越大越信任最新 chunk（更灵敏更糙）。
-        ttk.Label(grid, text="TE 衰减 (m):", anchor=tk.W).grid(row=3, column=0, sticky="w", pady=3)
+        # TE decay m: recency decay across chunks at the same id. Larger = trust newest chunk more.
+        ttk.Label(grid, text="TE decay (m)", anchor=tk.W).grid(row=3, column=0, sticky="w", pady=3)
         self._tuning_widgets.append(ttk.Scale(grid, from_=0.0, to=0.5, orient=tk.HORIZONTAL,
                   variable=self._sm_m_var, command=lambda _v: self._apply_smoothing()))
         self._tuning_widgets[-1].grid(row=3, column=1, sticky="ew", padx=8)
 
-        # TE 缓冲长度：参与跨 chunk 平均的最近 chunk 数（重叠深度）。越大平均越深（更平滑）。
-        ttk.Label(grid, text="TE 缓冲长度 (buffer):", anchor=tk.W).grid(row=4, column=0, sticky="w", pady=3)
+        # TE buffer length: # of recent chunks averaged (overlap depth). Larger = deeper, smoother.
+        ttk.Label(grid, text="TE buffer", anchor=tk.W).grid(row=4, column=0, sticky="w", pady=3)
         self._sm_buflen_var = tk.IntVar(value=self.inference.te_buffer_len)
         self._tuning_widgets.append(ttk.Spinbox(grid, from_=1, to=16, increment=1, width=6,
                     textvariable=self._sm_buflen_var, command=self._apply_smoothing))
@@ -528,22 +531,22 @@ class InferenceMixin:
         ttk.Label(grid, textvariable=self._sm_readout_var,
                   style="Value.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        # ===== 执行参数（速度 / 队列提前，作用于后续推理）=====
-        sec_exec = ttk.LabelFrame(body, text="  ⚙  执行参数（仅空闲可调，修改即保存）  ")
+        # ===== Execution (speed / queue-ahead; applies to later inferences) =====
+        sec_exec = ttk.LabelFrame(body, text="  Execution   ·   editable when idle  ")
         sec_exec.pack(fill=tk.X, padx=10, pady=6)
         egrid = ttk.Frame(sec_exec)
         egrid.pack(fill=tk.X, padx=8, pady=8)
         egrid.columnconfigure(1, weight=1)
 
-        # 速度：占演示速度的比例。越小越慢、每行子步更多（更平滑），且一个 chunk 持续更久。
-        ttk.Label(egrid, text="速度 (speed_scale):", anchor=tk.W).grid(row=0, column=0, sticky="w", pady=3)
+        # Speed: fraction of demo speed. Lower = slower, more substeps/row (smoother), longer chunk.
+        ttk.Label(egrid, text="Speed", anchor=tk.W).grid(row=0, column=0, sticky="w", pady=3)
         self._ex_speed_var = tk.DoubleVar(value=round(self.env.speed_scale, 2))
         self._tuning_widgets.append(ttk.Scale(egrid, from_=0.05, to=3.0, orient=tk.HORIZONTAL,
                   variable=self._ex_speed_var, command=lambda _v: self._apply_exec_knobs()))
         self._tuning_widgets[-1].grid(row=0, column=1, sticky="ew", padx=8)
 
-        # 队列提前：领先主时钟的行数 = 提交距离。越小越晚冻结（提交前平均更充分，更平滑），但缓冲余量更少。
-        ttk.Label(egrid, text="队列提前 (append_ahead):", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
+        # Queue-ahead: rows queued ahead of the master clock = commit distance. Lower = later freeze.
+        ttk.Label(egrid, text="Queue ahead", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
         self._ex_ahead_var = tk.IntVar(value=self.env.append_ahead_rows)
         self._tuning_widgets.append(ttk.Spinbox(egrid, from_=1, to=20, increment=1, width=6,
                     textvariable=self._ex_ahead_var, command=self._apply_exec_knobs))
@@ -558,8 +561,8 @@ class InferenceMixin:
         self._apply_exec_knobs(announce=False)
         self._refresh_tuning_state()             # set initial enabled/disabled + hint
 
-        # ===== 子步监视：实时双臂 14 关节 + 待释放子步滚动表（左/右各一张，含每关节增量） =====
-        sec_monitor = ttk.LabelFrame(body, text="  📈  子步监视（双臂 14 关节 · rad）  ")
+        # ===== Substep monitor: live dual-arm 14 joints + upcoming substeps (per-arm, with deltas) =====
+        sec_monitor = ttk.LabelFrame(body, text="  Substep monitor   ·   dual-arm 14 joints (rad)  ")
         sec_monitor.pack(fill=tk.X, padx=10, pady=6)
 
         # 实时关节作为表内置顶高亮行（#＝实时），其下为接下来要下发到真机的子步；左右两张表按同一
@@ -569,9 +572,10 @@ class InferenceMixin:
         cap_row = ttk.Frame(sec_monitor)
         cap_row.pack(fill=tk.X, padx=8, pady=(6, 4))
         ttk.Label(cap_row,
-                  text="置顶行＝实时关节；其下 #0 = 下一个下发的子步，Δ＝相对上一行增量（左右两表同步）",
-                  style="Subtitle.TLabel", anchor=tk.W).pack(side=tk.LEFT)
-        self._monitor_src_var = tk.StringVar(value="队列来源：—")
+                  text="Top row = LIVE joints;  #0 = next substep to send,  Δ = change vs previous row.  "
+                       "Grip: ● closed / ○ open.",
+                  style="Caption.TLabel", anchor=tk.W).pack(side=tk.LEFT)
+        self._monitor_src_var = tk.StringVar(value="queue source:  —")
         ttk.Label(cap_row, textvariable=self._monitor_src_var,
                   style="Value.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
 
@@ -584,25 +588,26 @@ class InferenceMixin:
             cols = ("idx", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "grip")
             t = ttk.Treeview(grp, columns=cols, show="headings", height=11, style="Monitor.Treeview")
             t.heading("idx", text="#")
-            t.column("idx", width=44, anchor="center", stretch=False)
+            t.column("idx", width=42, anchor="center", stretch=False)
             for k, c in enumerate(cols[1:8], start=1):
                 t.heading(c, text=f"J{k}")
-                t.column(c, width=96, minwidth=72, anchor="center", stretch=True)
-            t.heading("grip", text="夹爪")
-            t.column("grip", width=62, anchor="center", stretch=False)
-            t.tag_configure("live", background="#e3f2fd", foreground="#0d47a1",
-                            font=("Consolas", 9, "bold"))
-            t.tag_configure("odd", background="#ffffff")
-            t.tag_configure("even", background="#f3f5f9")
+                t.column(c, width=90, minwidth=64, anchor="center", stretch=True)
+            t.heading("grip", text="grip")
+            t.column("grip", width=64, anchor="center", stretch=False)
+            th = self.theme
+            t.tag_configure("live", background=th.BRAND_SOFT, foreground=th.BRAND_INK,
+                            font=th.mono(9, "bold"))
+            t.tag_configure("odd", background=th.SURFACE)
+            t.tag_configure("even", background=th.SURFACE_ALT)
             t.pack(fill=tk.X, padx=6, pady=(0, 6))
-            t.insert("", "end", iid="live", tags=("live",), values=("实时", *["—"] * 8))
+            t.insert("", "end", iid="live", tags=("live",), values=("LIVE", *["—"] * 8))
             for i in range(self._monitor_rows):
                 t.insert("", "end", iid=f"subrow{i}",
                          tags=("even" if i % 2 else "odd",), values=(i, *[""] * 8))
             return t
 
-        self._monitor_tree_l = _build_arm_table("左臂 (L)")
-        self._monitor_tree_r = _build_arm_table("右臂 (R)")
+        self._monitor_tree_l = _build_arm_table("Left arm (L)")
+        self._monitor_tree_r = _build_arm_table("Right arm (R)")
 
         # Start the periodic refresh (idempotent — only schedules once).
         if getattr(self, "_monitor_after_id", None) is None:

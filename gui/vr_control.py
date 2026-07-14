@@ -238,37 +238,37 @@ VR_PARAMS_DEFAULTS = VRParameters()
 # pose_mult / qut_mult 下限 > 0：get_action_delta 里有 assert 必须为正。
 # ---------------------------------------------------------------------- #
 VR_PARAM_SPECS = [
-    # 平移 / 旋转整体增益
-    ("pose_mult",       "平移增益",       0.10, 3.00, 0.05, False, "灵敏度增益"),
-    ("qut_mult",        "旋转增益",       0.10, 3.00, 0.05, False, "灵敏度增益"),
-    ("pitch_gain",      "俯仰额外增益",    0.50, 5.00, 0.10, False, "灵敏度增益"),
-    # 单拍增量上限(= 速度上限)
-    ("pos_max_delta",   "单拍位移上限(m)",  0.002, 0.100, 0.001, False, "速度上限(单拍)"),
-    ("quat_max_delta",  "单拍旋转上限(rad)", 0.002, 0.200, 0.001, False, "速度上限(单拍)"),
-    # 合并后再钳位(最终速度上限)
-    ("merge_pos_clamp", "合并位移上限(m)",  0.002, 0.100, 0.001, False, "速度上限(合并)"),
-    ("merge_rot_clamp", "合并旋转上限(rad)", 0.002, 0.200, 0.001, False, "速度上限(合并)"),
-    # 软死区(抖动抑制)
-    ("pos_deadzone",    "位移死区(m)",     0.0000, 0.0200, 0.0005, False, "死区"),
-    ("quat_deadzone",   "旋转死区(rad)",    0.0000, 0.0500, 0.0005, False, "死区"),
-    # One-Euro 滤波(跟手性 ↔ 抖动抑制)
-    ("pos_mincutoff",   "位置静止截止(Hz)", 0.10, 10.00, 0.10, False, "One-Euro 滤波"),
-    ("pos_beta",        "位置速度增益β",    0.00, 50.00, 0.50, False, "One-Euro 滤波"),
-    ("quat_mincutoff",  "姿态静止截止(Hz)", 0.10, 10.00, 0.10, False, "One-Euro 滤波"),
-    ("quat_beta",       "姿态速度增益β",    0.00, 60.00, 0.50, False, "One-Euro 滤波"),
-    # 头部行程限位(保护舵机)
-    ("head_yaw_limit",  "头部偏航限位(rad)", 0.00, 1.57, 0.01, False, "头部限位"),
-    ("head_pitch_limit", "头部俯仰限位(rad)", 0.00, 1.00, 0.01, False, "头部限位"),
-    # 摇杆腕部滚转(速率控制)
-    ("wrist_roll_rate",     "滚转速率(rad/拍)", 0.000, 0.200, 0.002, False, "腕部滚转(摇杆)"),
-    ("wrist_roll_deadzone", "摇杆死区",        0.000, 0.500, 0.010, False, "腕部滚转(摇杆)"),
-    ("wrist_roll_expo",     "expo 曲线",       0.000, 1.000, 0.050, False, "腕部滚转(摇杆)"),
-    ("wrist_roll_limit_lo", "滚转下限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
-    ("wrist_roll_limit_hi", "滚转上限(rad)",   -3.140, 3.140, 0.010, False, "腕部滚转(摇杆)"),
-    # 摇杆前后 → EE X 平移（固定步长）
-    ("ee_x_rate",       "X 步长(m/拍)",    0.000, 0.020, 0.0005, False, "末端 X 平移(摇杆前后)"),
-    # 动作队列
-    ("queue_max",       "动作队列上限",     1, 100, 1, True, "队列"),
+    # Overall translation / rotation gain
+    ("pose_mult",       "Translation gain",  0.10, 3.00, 0.05, False, "Sensitivity gain"),
+    ("qut_mult",        "Rotation gain",     0.10, 3.00, 0.05, False, "Sensitivity gain"),
+    ("pitch_gain",      "Extra pitch gain",  0.50, 5.00, 0.10, False, "Sensitivity gain"),
+    # Per-tick delta cap (= speed cap)
+    ("pos_max_delta",   "Pos step cap (m)",   0.002, 0.100, 0.001, False, "Speed cap (per tick)"),
+    ("quat_max_delta",  "Rot step cap (rad)", 0.002, 0.200, 0.001, False, "Speed cap (per tick)"),
+    # Post-merge clamp (final speed cap)
+    ("merge_pos_clamp", "Merged pos cap (m)",  0.002, 0.100, 0.001, False, "Speed cap (merged)"),
+    ("merge_rot_clamp", "Merged rot cap (rad)", 0.002, 0.200, 0.001, False, "Speed cap (merged)"),
+    # Soft deadzone (jitter suppression)
+    ("pos_deadzone",    "Pos deadzone (m)",    0.0000, 0.0200, 0.0005, False, "Deadzone"),
+    ("quat_deadzone",   "Rot deadzone (rad)",  0.0000, 0.0500, 0.0005, False, "Deadzone"),
+    # One-Euro filter (responsiveness <-> jitter suppression)
+    ("pos_mincutoff",   "Pos min cutoff (Hz)", 0.10, 10.00, 0.10, False, "One-Euro filter"),
+    ("pos_beta",        "Pos speed gain β",    0.00, 50.00, 0.50, False, "One-Euro filter"),
+    ("quat_mincutoff",  "Rot min cutoff (Hz)", 0.10, 10.00, 0.10, False, "One-Euro filter"),
+    ("quat_beta",       "Rot speed gain β",    0.00, 60.00, 0.50, False, "One-Euro filter"),
+    # Head travel limits (protect the servos)
+    ("head_yaw_limit",  "Head yaw limit (rad)",  0.00, 1.57, 0.01, False, "Head limits"),
+    ("head_pitch_limit", "Head pitch limit (rad)", 0.00, 1.00, 0.01, False, "Head limits"),
+    # Joystick wrist roll (rate control)
+    ("wrist_roll_rate",     "Roll rate (rad/tick)", 0.000, 0.200, 0.002, False, "Wrist roll (joystick)"),
+    ("wrist_roll_deadzone", "Joystick deadzone",    0.000, 0.500, 0.010, False, "Wrist roll (joystick)"),
+    ("wrist_roll_expo",     "Expo curve",           0.000, 1.000, 0.050, False, "Wrist roll (joystick)"),
+    ("wrist_roll_limit_lo", "Roll min (rad)",       -3.140, 3.140, 0.010, False, "Wrist roll (joystick)"),
+    ("wrist_roll_limit_hi", "Roll max (rad)",       -3.140, 3.140, 0.010, False, "Wrist roll (joystick)"),
+    # Joystick fwd/back -> EE X translation (fixed step)
+    ("ee_x_rate",       "X step (m/tick)",    0.000, 0.020, 0.0005, False, "EE X translation (joystick)"),
+    # Action queue
+    ("queue_max",       "Action queue cap",   1, 100, 1, True, "Queue"),
 ]
 
 # 改这些会更新 One-Euro 滤波器；需同步推到已创建的滤波器实例上才能立即生效。
@@ -296,7 +296,7 @@ VRC_PRESET_DT = 0.01
 # ---------------------------------------------------------------------- #
 VR_ARM_PRESETS = [
     {
-        "label": "↩ 左手初始位",
+        "label": "↩ Left home",
         "side": "left",
         "joints": [0.9738845229148865, 0.5554335117340088, -0.6520541310310364,
                    -1.832319736480713, 0.8602326512336731, 0.7369483709335327,
@@ -304,7 +304,7 @@ VR_ARM_PRESETS = [
         "gripper": "open",
     },
     {
-        "label": "↩ 左手预备位",
+        "label": "↩ Left ready",
         "side": "left",
         "joints": [0.7920729517936707, -0.7327778339385986, -0.7821090221405029,
                    -0.7740122079849243, 0.12358089536428452, 1.321889877319336,
@@ -312,7 +312,7 @@ VR_ARM_PRESETS = [
         "gripper": "open",
     },
     {
-        "label": "↩ 右手初始位",
+        "label": "↩ Right home",
         "side": "right",
         "joints": [-0.8415611982345581, -0.6472030878067017, 0.4974645972251892,
                    1.8316916227340698, -0.825088381767273, -0.700041651725769,
@@ -320,7 +320,7 @@ VR_ARM_PRESETS = [
         "gripper": "open",
     },
     {
-        "label": "↩ 右手预备位",
+        "label": "↩ Right ready",
         "side": "right",
         "joints": [-0.9775315523147583, 0.5038163661956787, 0.9730992317199707,
                    0.6804278492927551, -0.08786074817180634, -1.4976462125778198,
@@ -344,14 +344,14 @@ VRC_WAIST_HEIGHT_MAX = 100.0               # 腰部升降上限 (cm)
 #   label / yaw_deg(偏航°) / pitch_deg(俯仰°,+ 为下俯)
 # 头部按绝对目标角下发: robot.move_head([yaw_rad, pitch_rad])。
 VR_HEAD_PRESETS = [
-    {"label": "↩ 头部初始位", "yaw_deg": 0.0, "pitch_deg": 30.0},
+    {"label": "↩ Head home", "yaw_deg": 0.0, "pitch_deg": 30.0},
 ]
 
 # 腰部「一键回到」预设。**每条 = 一个按钮**,后续直接追加字典即可。
 #   label / pitch_deg(俯仰°,+ 为前倾) / height_cm(升降高度 cm)
 # 腰部按绝对目标下发: robot.move_waist([pitch_rad, height_cm])。
 VR_WAIST_PRESETS = [
-    {"label": "↩ 腰部初始位", "pitch_deg": 40.0, "height_cm": 2.0},
+    {"label": "↩ Waist home", "pitch_deg": 40.0, "height_cm": 2.0},
 ]
 
 
@@ -898,17 +898,17 @@ class VRMixin:
         self._vrp_ensure_state()
 
         tab = ttk.Frame(parent)
-        parent.add(tab, text="🎚  VR 灵敏度")
+        parent.add(tab, text="Sensitivity")
 
-        # 顶部说明 + 重置按钮
+        # Description + reset
         top = ttk.Frame(tab)
         top.pack(fill=tk.X, padx=12, pady=(12, 4))
-        ttk.Label(top, text="拖动滑块或输入数值即时生效(已限制安全范围)",
-                  style="Subtitle.TLabel").pack(side=tk.LEFT)
-        ttk.Button(top, text="↺  重置默认", style="Muted.TButton",
+        ttk.Label(top, text="Drag a slider or type a value — applied live (clamped to a safe range).",
+                  style="Caption.TLabel").pack(side=tk.LEFT)
+        ttk.Button(top, text="↺  Reset defaults", style="Muted.TButton",
                    command=self._vrp_reset).pack(side=tk.RIGHT)
 
-        # 可滚动容器(参数较多)
+        # Scrollable container (many parameters)
         canvas = tk.Canvas(tab, highlightthickness=0,
                            bg=(ttk.Style().lookup("TFrame", "background") or "#f5f6f8"))
         sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
@@ -1061,7 +1061,7 @@ class VRMixin:
             self._vrp_set_ui(attr, getattr(VR_PARAMS, attr))
         if getattr(self, "status_text", None) is not None:
             try:
-                self.status_text.set("VR 灵敏度参数已重置为默认")
+                self.status_text.set("VR sensitivity reset to defaults")
             except Exception:
                 pass
 

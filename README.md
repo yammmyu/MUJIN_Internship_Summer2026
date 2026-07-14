@@ -31,9 +31,22 @@ Run from the repository root so top-level packages (`real_world`, `gui`,
 # GUI dependencies
 pip install -r requirements_gui.txt   # add requirements_sim.txt for the sim backend
 
-# Launch the control GUI
+# Launch the control GUI (requires the robot + a2d SDK + ROS)
 python robot_control_gui.py
+
+# Hardware-free DEMO mode — synthetic robot, live camera feeds, and a filling
+# evaluation dashboard. Runs on any laptop with Tk; no SDK/ROS/robot needed.
+# Use it for recorded demos, screenshots, and UI work.
+python robot_control_gui.py --demo
 ```
+
+The console is organized as three tabs — **Console** (camera views + policy
+inference: sim preview, validate, release, substep monitor), **VR teleop**
+(Pico teleoperation + data collection), and **Evaluation** (a live success-rate
+KPI dashboard fed by `infer_logs/eval/*.jsonl`, the same logs
+[scripts/eval_trials.py](scripts/eval_trials.py) writes). The UI theme and all
+ttk styles live in [gui/styles.py](gui/styles.py); the demo stand-ins live in
+[gui/demo_backend.py](gui/demo_backend.py).
 
 ## Notes
 
