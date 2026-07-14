@@ -323,10 +323,20 @@ def main():
     # so their INFO/WARNING messages actually reach the console. Without this only a bare
     # last-resort WARNING handler exists and INFO/DEBUG are dropped. Level is overridable via
     # HUMANOID_LOG_LEVEL (e.g. DEBUG to surface the per-inference hot-path traces).
+    # Console AND a persistent file (infer_logs/gui.log) so offline tools can read the run — e.g.
+    # scripts/eval_trials.py tails it to auto-count "[recovery] missed grasp" retreats per trial.
+    _log_handlers = [logging.StreamHandler()]
+    try:
+        from real_world.timing import TRACE_DIR
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        _log_handlers.append(logging.FileHandler(TRACE_DIR / "gui.log"))
+    except Exception as _e:      # never let logging setup block launch
+        print(f"[startup] could not open gui.log file handler: {_e}")
     logging.basicConfig(
         level=os.environ.get("HUMANOID_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=_log_handlers,
     )
 
     parser = argparse.ArgumentParser()
