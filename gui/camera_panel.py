@@ -43,16 +43,22 @@ class CameraMixin:
             for name in self.available_cameras
         }
         for name in self.available_cameras:
-            ttk.Checkbutton(
+            self.tip(ttk.Checkbutton(
                 select_bar, text=self.camera_titles[name], style="Card.TCheckbutton",
                 variable=self.camera_display_vars[name],
-                command=self._rebuild_camera_display).pack(side=tk.LEFT, padx=4)
+                command=self._rebuild_camera_display),
+                f"Show the {self.camera_titles[name].lower()} camera. The stream is only "
+                "subscribed while shown, so unchecking it frees bandwidth."
+                ).pack(side=tk.LEFT, padx=4)
 
         # ---- 实时「已激活相机」指示条：显示 env 当前正在订阅/抓取的所有相机 ----
         # （含显示勾选、推理触发、常开相机），与上面的勾选框相互独立。
         active_bar = ttk.Frame(camera_frame)
         active_bar.pack(fill=tk.X, padx=10, pady=(0, 6))
-        ttk.Label(active_bar, text="Live", style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        self.tip(ttk.Label(active_bar, text="Live", style="CardTitle.TLabel"),
+                 "Which cameras the robot is actually streaming right now (green = live). "
+                 "This can differ from what's shown — inference and recording also keep cameras on."
+                 ).pack(side=tk.LEFT, padx=(0, 8))
         self.camera_active_labels = {}
         for name in self.available_cameras:
             lbl = tk.Label(active_bar, text=f"● {self.camera_titles[name]}",
@@ -149,10 +155,11 @@ class CameraMixin:
             header.pack(fill=tk.X, pady=(0, 4))
             ttk.Label(header, text=self.camera_titles.get(name, name),
                       style="CardTitle.TLabel").pack(side=tk.LEFT, anchor=tk.W)
-            ttk.Button(header, text="Save frame",
-                       style="Ghost.TButton",
-                       command=lambda n=name: self.save_camera_frame(n)
-                       ).pack(side=tk.RIGHT)
+            self.tip(ttk.Button(header, text="Save frame",
+                     style="Ghost.TButton",
+                     command=lambda n=name: self.save_camera_frame(n)),
+                     "Save the current frame from this camera as a JPG in humanoid/saved_images/."
+                     ).pack(side=tk.RIGHT)
 
             label = ttk.Label(card, borderwidth=1, relief="solid",
                               background="#12161F", anchor=tk.CENTER)

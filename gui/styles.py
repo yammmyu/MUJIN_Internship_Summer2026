@@ -86,8 +86,85 @@ class Theme:
         return (self.mono_family, size, weight)
 
 
+class _Tooltip:
+    """A small, themed hover tooltip — the app's one plain-language help affordance.
+
+    Every expert knob in this console (TE radius, queue-ahead, speed scale …) carries
+    a one-line explanation that only appears on hover, so the dense operator layout
+    stays uncluttered while newcomers can still learn what each control does. Shows
+    after a short delay, hides on leave / click / scroll. Cross-platform, uses design
+    tokens, and never lets a teardown race throw into the Tk loop.
+    """
+
+    def __init__(self, widget, text, theme, delay=450, wraplength=280):
+        self.widget = widget
+        self.text = text
+        self.theme = theme
+        self.delay = delay
+        self.wraplength = wraplength
+        self._after = None
+        self._tip = None
+        # add="+" so we never clobber a widget's existing <Enter>/<Leave> handlers.
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<MouseWheel>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        try:
+            self._after = self.widget.after(self.delay, self._show)
+        except tk.TclError:
+            self._after = None
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 14
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except tk.TclError:
+            return
+        t = self.theme
+        self._tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)          # borderless bubble
+        try:
+            tw.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.configure(bg=t.BORDER_STRONG)       # 1px hairline via padding below
+        tk.Label(tw, text=self.text, justify="left",
+                 background="#1D2939", foreground="#E6EDF7",
+                 font=t.ui(9), wraplength=self.wraplength,
+                 padx=11, pady=8, bd=0).pack(padx=1, pady=1)
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
 class StyleMixin:
     """Applies the Mujin light theme to ttk and exposes ``self.theme`` tokens."""
+
+    def tip(self, widget, text):
+        """Attach a plain-language hover tooltip to any widget and return the widget,
+        so it can wrap a creation call inline: ``self.tip(ttk.Button(...), "…")``."""
+        _Tooltip(widget, text, self.theme)
+        return widget
 
     def _setup_styles(self):
         self.theme = Theme(self.root)

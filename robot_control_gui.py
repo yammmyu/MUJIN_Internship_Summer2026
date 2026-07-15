@@ -276,6 +276,9 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin,
             top, text="Start VR teleop", style="Primary.TButton",
             command=self._toggle_vr,
         )
+        self.tip(self.vr_toggle_btn,
+                 "Arm/disarm VR teleoperation. When ON, hold L_Y or R_B on the controllers to "
+                 "drive the arms. The headset must be connected first (uplink :5556).")
         self.vr_toggle_btn.pack(side=tk.LEFT)
 
         # 灵敏度参数面板需要一个 Notebook 容器（setup_vr_params_panel 调 parent.add）。

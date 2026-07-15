@@ -367,6 +367,28 @@ class InferenceMixin:
     # ------------------------------------------------------------------ #
     def setup_inference_panel(self, parent):
         """推理控制面板：左夹爪 / 仿真预览 / 自动运行 / 手动单步 / 真机释放 / 子步监视。"""
+        # ===== Pinned E-STOP bar (never scrolls out of reach) =====
+        # The single most safety-critical control lives OUTSIDE the scroll canvas, pinned to the
+        # top of the column, so it is always one click away no matter how far the operator has
+        # scrolled through tuning / the substep monitor. E-STOP is latched: it drops pending
+        # commands and actively holds; Reset re-arms once the arm is confirmed safe.
+        estop_bar = ttk.Frame(parent, style="Toolbar.TFrame")
+        estop_bar.pack(side=tk.TOP, fill=tk.X, padx=0, pady=(0, 6))
+        inner = ttk.Frame(estop_bar, style="Toolbar.TFrame")
+        inner.pack(fill=tk.X, padx=8, pady=8)
+        self.tip(
+            ttk.Button(inner, text="⛔  E-STOP", style="EStop.TButton",
+                       command=lambda: (self.env.lock_robot(), self._refresh_release_buttons())),
+            "Immediately halt and hold both arms. Latched — drops all queued motion. "
+            "Press Reset only once you've confirmed the arm is in a safe position."
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.tip(
+            ttk.Button(inner, text="Reset", style="Muted.TButton",
+                       command=lambda: self.env.reset_estop()),
+            "Clear the latched E-stop and re-arm the robot. Do this only when the arm is safe."
+        ).pack(side=tk.LEFT)
+        ttk.Separator(parent, orient="horizontal").pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+
         # 用 Canvas+滚动条 包裹，内容多时可滚动。
         # width= 预留足够横向空间，使整面板（含较宽的子步监视表）在默认窗口尺寸下即可完整显示；
         # 下面的 <Configure> 绑定再把内层 frame 钉到 canvas 视口宽度，窗口变窄时内容自适应回流
@@ -400,6 +422,17 @@ class InferenceMixin:
         canvas.bind("<Enter>", _bind_wheel)
         canvas.bind("<Leave>", _unbind_wheel)
 
+        # ===== Guided-workflow hint (orients a first-time operator to the happy path) =====
+        guide = ttk.Frame(body)
+        guide.pack(fill=tk.X, padx=10, pady=(10, 2))
+        ttk.Label(guide, text="How to run the policy", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            guide, style="Caption.TLabel", justify="left",
+            text=("Typical run:  ①  Start sim preview   →   ②  Start auto-run   "
+                  "(infer → sim-validate → robot).\nPrefer to go step by step? Use "
+                  "Manual step-through below. Hit ⛔ E-STOP (top) to halt at any time."),
+        ).pack(anchor="w", pady=(2, 0))
+
         # ===== Grippers (left / right, independent) =====
         sec_grip = ttk.LabelFrame(body, text="  Grippers  ")
         sec_grip.pack(fill=tk.X, padx=10, pady=(10, 6))
@@ -407,10 +440,12 @@ class InferenceMixin:
             row = ttk.Frame(sec_grip)
             row.pack(fill=tk.X, padx=8, pady=(8, 4))
             ttk.Label(row, text=label, width=6, style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-            ttk.Button(row, text="Open", style="Success.TButton",
-                       command=lambda s=side: self.move_gripper(s, 0.0)).pack(side=tk.LEFT, padx=(0, 6))
-            ttk.Button(row, text="Close", style="Warn.TButton",
-                       command=lambda s=side: self.move_gripper(s, 1.0)).pack(side=tk.LEFT, padx=6)
+            self.tip(ttk.Button(row, text="Open", style="Success.TButton",
+                     command=lambda s=side: self.move_gripper(s, 0.0)),
+                     f"Fully open the {label.lower()} gripper.").pack(side=tk.LEFT, padx=(0, 6))
+            self.tip(ttk.Button(row, text="Close", style="Warn.TButton",
+                     command=lambda s=side: self.move_gripper(s, 1.0)),
+                     f"Fully close the {label.lower()} gripper.").pack(side=tk.LEFT, padx=6)
 
         # ===== Sim preview (required before auto-run / sim-validate) =====
         sec_sim = ttk.LabelFrame(body, text="  Sim preview  ")
@@ -419,32 +454,46 @@ class InferenceMixin:
                   style="Caption.TLabel").pack(anchor="w", padx=8, pady=(2, 0))
         row = ttk.Frame(sec_sim)
         row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="Start sim preview", style="Primary.TButton",
-                   command=lambda: self.launch_sim()).pack(side=tk.LEFT, padx=(0, 6))
+        self.tip(ttk.Button(row, text="Start sim preview", style="Primary.TButton",
+                 command=lambda: self.launch_sim()),
+                 "Open the PyBullet preview window and match it to the robot's current pose. "
+                 "Required before auto-run or sim validation — the trajectory is checked here first."
+                 ).pack(side=tk.LEFT, padx=(0, 6))
 
         # ===== Auto-run (infer -> sim-validate -> robot) =====
         sec_auto = ttk.LabelFrame(body, text="  Auto-run   ·   infer → sim-validate → robot  ")
         sec_auto.pack(fill=tk.X, padx=10, pady=6)
         row = ttk.Frame(sec_auto)
         row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="▶  Start auto-run", style="Danger.TButton",
-                   command=lambda: self._start_auto_inference()).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(row, text="■  Stop auto-run", style="Muted.TButton",
-                   command=lambda: self._stop_auto_inference()).pack(side=tk.LEFT, padx=6)
+        self.tip(ttk.Button(row, text="▶  Start auto-run", style="Danger.TButton",
+                 command=lambda: self._start_auto_inference()),
+                 "Continuously run the policy: infer → validate in sim → send to the robot, on a loop. "
+                 "Starts the sim preview automatically if it isn't up yet. Halt with E-STOP (top)."
+                 ).pack(side=tk.LEFT, padx=(0, 6))
+        self.tip(ttk.Button(row, text="■  Stop auto-run", style="Muted.TButton",
+                 command=lambda: self._stop_auto_inference()),
+                 "Stop feeding new predictions. Motion already queued drains naturally — "
+                 "use E-STOP instead if you need to halt immediately."
+                 ).pack(side=tk.LEFT, padx=6)
 
-        # ===== Emergency stop (most prominent, always available) =====
-        sec_estop = ttk.LabelFrame(body, text="  Emergency stop  ")
-        sec_estop.pack(fill=tk.X, padx=10, pady=6)
-        row = ttk.Frame(sec_estop)
-        row.pack(fill=tk.X, padx=8, pady=8)
-        # E-STOP: latched; drops pending + actively holds. Physical E-stop remains primary.
-        # It also clears the staged buffer, so grey out the release buttons.
-        ttk.Button(row, text="⛔  E-STOP — halt & hold", style="EStop.TButton",
-                   command=lambda: (self.env.lock_robot(), self._refresh_release_buttons())
-                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        # Clear the latched E-stop (only after the operator confirms the arm is safe).
-        ttk.Button(row, text="Reset", style="Muted.TButton",
-                   command=lambda: self.env.reset_estop()).pack(side=tk.LEFT, padx=6)
+        # Post-flip release macro toggle: after the policy's grab+lift+flip, run the scripted release
+        # (move out, open gripper, come back). Live-toggleable even mid-run (it just gates the loop
+        # hook). Disabled + greyed when the baked release path isn't loaded (macro is None).
+        fp_row = ttk.Frame(sec_auto)
+        fp_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._flip_place_var = tk.BooleanVar(value=self.inference.flip_place_enabled)
+        self._flip_place_cb = ttk.Checkbutton(
+            fp_row, text="Run post-flip release macro", variable=self._flip_place_var,
+            command=lambda: setattr(self.inference, "flip_place_enabled", self._flip_place_var.get()))
+        self._flip_place_cb.pack(side=tk.LEFT)
+        if getattr(self.inference, "flip_place", None) is None:
+            self._flip_place_cb.state(["disabled"])
+            ttk.Label(fp_row, text="(macro not loaded)", style="Caption.TLabel").pack(side=tk.LEFT, padx=6)
+        self.tip(self._flip_place_cb,
+                 "After the policy grabs, lifts and flips, automatically run the scripted release "
+                 "(move out, open gripper, return). Safe to toggle mid-run.")
+
+        # (Emergency stop lives in the pinned bar at the top of this column — always reachable.)
 
         # ===== Manual step-through (infer once -> validate -> release) =====
         sec_manual = ttk.LabelFrame(body, text="  Manual step-through  ")
@@ -453,15 +502,23 @@ class InferenceMixin:
         manual_row = ttk.Frame(sec_manual)
         manual_row.pack(fill=tk.X, padx=8, pady=(8, 4))
         ttk.Label(manual_row, text="① Infer", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(manual_row, text="Infer once", style="Primary.TButton",
-                   command=lambda: self._run_inference_once()).pack(side=tk.LEFT, padx=4)
+        self.tip(ttk.Button(manual_row, text="Infer once", style="Primary.TButton",
+                 command=lambda: self._run_inference_once()),
+                 "Run the policy a single time to produce a fresh action chunk. "
+                 "Nothing moves yet — validate it next.").pack(side=tk.LEFT, padx=4)
         # Validate-in-sim (step + self-collision + readback); stages the sim-validated
         # trajectory but does NOT touch the robot. Run off the Tk thread so the GUI doesn't freeze.
         self._btn_validate_step = ttk.Button(manual_row, text="② Validate (step)", style="Ghost.TButton",
                    command=lambda: self._run_validation(once=True))
+        self.tip(self._btn_validate_step,
+                 "Play the NEXT action through the sim (collision + reachability check) and stage it "
+                 "for release. The real robot does not move.")
         self._btn_validate_step.pack(side=tk.LEFT, padx=4)
         self._btn_validate_rest = ttk.Button(manual_row, text="② Validate (all)", style="Ghost.TButton",
                    command=lambda: self._run_validation(once=False))
+        self.tip(self._btn_validate_rest,
+                 "Validate ALL remaining actions of this chunk through the sim and stage them. "
+                 "The real robot does not move.")
         self._btn_validate_rest.pack(side=tk.LEFT, padx=4)
         self._refresh_validation_buttons()       # no prediction yet -> disabled until first inference
 
@@ -470,12 +527,15 @@ class InferenceMixin:
         ttk.Label(release_row, text="③ Release", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self._btn_release_step = ttk.Button(release_row, text="▶ Release (1)", style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=False, count=1))
+        self.tip(self._btn_release_step, "Send the next single sim-validated substep to the real robot.")
         self._btn_release_step.pack(side=tk.LEFT, padx=4)
         self._btn_release_ten = ttk.Button(release_row, text="▶ Release (10)", style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=False, count=10))
+        self.tip(self._btn_release_ten, "Send the next 10 sim-validated substeps to the real robot.")
         self._btn_release_ten.pack(side=tk.LEFT, padx=4)
         self._btn_release_rest = ttk.Button(release_row, text="▶ Release (rest)", style="Danger.TButton",
                    command=lambda: self._run_release_substeps(remaining=True))
+        self.tip(self._btn_release_rest, "Stream ALL remaining staged substeps to the real robot.")
         self._btn_release_rest.pack(side=tk.LEFT, padx=4)
         self._refresh_release_buttons()          # nothing staged yet -> disabled until validation
 
@@ -501,26 +561,38 @@ class InferenceMixin:
         self._sm_m_var = tk.DoubleVar(value=round(self.inference.te_m, 3))
 
         # TE radius: id-axis Gaussian half-width = frozen context rows. Larger = smoother, more lag.
-        ttk.Label(grid, text="TE radius", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
+        lbl = ttk.Label(grid, text="Smoothness (TE radius)", anchor=tk.W)
+        lbl.grid(row=1, column=0, sticky="w", pady=3)
+        self.tip(lbl, "How many neighbouring prediction rows are blended together. "
+                      "Higher = smoother motion, but a touch more lag.")
         self._tuning_widgets.append(ttk.Spinbox(grid, from_=0, to=8, increment=1, width=6,
                     textvariable=self._sm_radius_var, command=self._apply_smoothing))
         self._bind_spinbox_apply(self._tuning_widgets[-1], self._apply_smoothing)  # 键入回车/失焦也应用
         self._tuning_widgets[-1].grid(row=1, column=2, sticky="e", padx=4)
 
         # TE σ: Gaussian shape within the window. Larger = stronger in-window smoothing (keep <= radius).
-        ttk.Label(grid, text="TE sigma (σ)", anchor=tk.W).grid(row=2, column=0, sticky="w", pady=3)
+        lbl = ttk.Label(grid, text="Blend strength (σ)", anchor=tk.W)
+        lbl.grid(row=2, column=0, sticky="w", pady=3)
+        self.tip(lbl, "How strongly rows inside the smoothing window are blended. "
+                      "Higher = stronger smoothing. Keep it at or below the smoothness radius.")
         self._tuning_widgets.append(ttk.Scale(grid, from_=0.3, to=4.0, orient=tk.HORIZONTAL,
                   variable=self._sm_sigma_var, command=lambda _v: self._apply_smoothing()))
         self._tuning_widgets[-1].grid(row=2, column=1, sticky="ew", padx=8)
 
         # TE decay m: recency decay across chunks at the same id. Larger = trust newest chunk more.
-        ttk.Label(grid, text="TE decay (m)", anchor=tk.W).grid(row=3, column=0, sticky="w", pady=3)
+        lbl = ttk.Label(grid, text="Recency (decay m)", anchor=tk.W)
+        lbl.grid(row=3, column=0, sticky="w", pady=3)
+        self.tip(lbl, "How much the newest prediction outweighs older ones for the same step. "
+                      "Higher = react faster to the latest prediction (less averaging).")
         self._tuning_widgets.append(ttk.Scale(grid, from_=0.0, to=0.5, orient=tk.HORIZONTAL,
                   variable=self._sm_m_var, command=lambda _v: self._apply_smoothing()))
         self._tuning_widgets[-1].grid(row=3, column=1, sticky="ew", padx=8)
 
         # TE buffer length: # of recent chunks averaged (overlap depth). Larger = deeper, smoother.
-        ttk.Label(grid, text="TE buffer", anchor=tk.W).grid(row=4, column=0, sticky="w", pady=3)
+        lbl = ttk.Label(grid, text="Overlap depth (buffer)", anchor=tk.W)
+        lbl.grid(row=4, column=0, sticky="w", pady=3)
+        self.tip(lbl, "How many recent prediction chunks are averaged together. "
+                      "Higher = deeper overlap and smoother motion, at a little more lag.")
         self._sm_buflen_var = tk.IntVar(value=self.inference.te_buffer_len)
         self._tuning_widgets.append(ttk.Spinbox(grid, from_=1, to=16, increment=1, width=6,
                     textvariable=self._sm_buflen_var, command=self._apply_smoothing))
@@ -539,14 +611,20 @@ class InferenceMixin:
         egrid.columnconfigure(1, weight=1)
 
         # Speed: fraction of demo speed. Lower = slower, more substeps/row (smoother), longer chunk.
-        ttk.Label(egrid, text="Speed", anchor=tk.W).grid(row=0, column=0, sticky="w", pady=3)
+        lbl = ttk.Label(egrid, text="Speed (× demo)", anchor=tk.W)
+        lbl.grid(row=0, column=0, sticky="w", pady=3)
+        self.tip(lbl, "Playback speed as a fraction of the recorded demo. "
+                      "Lower = slower and smoother (more substeps per row); 1.0 = demo speed.")
         self._ex_speed_var = tk.DoubleVar(value=round(self.env.speed_scale, 2))
         self._tuning_widgets.append(ttk.Scale(egrid, from_=0.05, to=3.0, orient=tk.HORIZONTAL,
                   variable=self._ex_speed_var, command=lambda _v: self._apply_exec_knobs()))
         self._tuning_widgets[-1].grid(row=0, column=1, sticky="ew", padx=8)
 
         # Queue-ahead: rows queued ahead of the master clock = commit distance. Lower = later freeze.
-        ttk.Label(egrid, text="Queue ahead", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=3)
+        lbl = ttk.Label(egrid, text="Look-ahead (rows)", anchor=tk.W)
+        lbl.grid(row=1, column=0, sticky="w", pady=3)
+        self.tip(lbl, "How many rows are committed ahead of real time. "
+                      "Lower = commits later, so the robot reacts sooner to a stop; higher = smoother buffering.")
         self._ex_ahead_var = tk.IntVar(value=self.env.append_ahead_rows)
         self._tuning_widgets.append(ttk.Spinbox(egrid, from_=1, to=20, increment=1, width=6,
                     textvariable=self._ex_ahead_var, command=self._apply_exec_knobs))

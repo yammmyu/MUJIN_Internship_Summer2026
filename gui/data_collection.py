@@ -71,11 +71,16 @@ class DataCollectionMixin:
         self._dc_btn_start = ttk.Button(main_row, text="⏺  Start recording",
                                         style="Danger.TButton",
                                         command=self.recording_start)
+        self.tip(self._dc_btn_start,
+                 "Begin recording a new episode (joints, end-effector poses and the live cameras). "
+                 "Shortcut: R  ·  VR: R_A.")
         self._dc_btn_start.pack(side=tk.LEFT, padx=(0, 6))
         self._dc_btn_stop = ttk.Button(main_row, text="⏹  Stop recording",
                                        style="Muted.TButton",
                                        command=self.recording_stop,
                                        state=tk.DISABLED)
+        self.tip(self._dc_btn_stop,
+                 "Stop recording. You'll then choose Save (keep) or Delete (discard). Shortcut: S.")
         self._dc_btn_stop.pack(side=tk.LEFT, padx=6)
 
         self._dc_post_stop_frame = ttk.Frame(sec_ctrl)
@@ -84,10 +89,12 @@ class DataCollectionMixin:
         self._dc_btn_save = ttk.Button(self._dc_post_stop_frame, text="Save",
                                        style="Success.TButton",
                                        command=self.recording_save)
+        self.tip(self._dc_btn_save, "Keep this episode and write it to disk. Shortcut: Enter.")
         self._dc_btn_save.pack(side=tk.LEFT, padx=(0, 6))
         self._dc_btn_delete = ttk.Button(self._dc_post_stop_frame, text="Delete",
                                          style="Warn.TButton",
                                          command=self.recording_delete)
+        self.tip(self._dc_btn_delete, "Discard this episode without saving. Shortcut: D.")
         self._dc_btn_delete.pack(side=tk.LEFT, padx=6)
 
         # ── Shortcuts (keyboard + VR controller) ──

@@ -100,6 +100,9 @@ class EvalMixin:
         self._ev_session = ttk.Combobox(bar, textvariable=self._ev_session_var,
                                         width=26, state="readonly")
         self._ev_session.pack(side=tk.RIGHT)
+        self.tip(self._ev_session,
+                 "Pick which evaluation session to display. Defaults to the most recent; "
+                 "the board refreshes automatically about once a second.")
         self._ev_session.bind("<<ComboboxSelected>>", lambda _e: self._refresh_eval(force=True))
         ttk.Label(bar, text="Session", style="Caption.TLabel").pack(side=tk.RIGHT, padx=(0, 6))
         self._ev_fresh_var = tk.StringVar(value="—")
