@@ -241,7 +241,7 @@ class PinocchioDLSIKSolver(IKSolver):
                  tol: float = 1e-4,
                  step_scale: float = 1.0,
                  max_step: float = 0.2,
-                 reach_pos_tol: float = 0.02,
+                 reach_pos_tol: float = 0.04,
                  single_step: bool = False,
                  clamp_to_limits: bool = True):
         self.m = model
