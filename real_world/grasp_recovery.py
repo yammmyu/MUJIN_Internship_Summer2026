@@ -89,7 +89,7 @@ class _Detector:
 
 class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
-                 settle_sec=3.0,
+                 settle_sec=4.0,
                  # ABSOLUTE 14-joint HOME pose the recovery moves BOTH arms to (open gripper + go home),
                  # instead of a scripted EE-space lift. Passed in by the controller (= its auto start
                  # pose, arm_joints[0] of MDM_data_collection/recordings/recording001). None -> skip the

@@ -413,12 +413,20 @@ class PostProcessor:
         """Solve IK for an ENTIRE chunk up front, OUTSIDE the sim validation job: per-row workspace
         check (H4) + orientation smoothing (H3) + dual-arm IK, chaining each row's warm-start from the
         previous raw IK solution starting at seed_q (fresh quat-smoothing state per call). Returns
-        (configs, ok, reason) where configs = [(q14, [gl,gr]), ...] are the raw IK joints the sim then
-        validates kinematically. Runs pure-numerical Pinocchio IK on the caller's thread while the sim
-        job only does the substep + self-collision check on solved configs.
-        skip_unreachable=True (calibrate path): drop unreachable/out-of-envelope rows and keep going
-        (mirrors the old learn=True behaviour) instead of aborting."""
-        configs = []
+        (configs, kept_ids, ok, reason) where configs = [(q14, [gl,gr]), ...] are the raw IK joints the
+        sim then validates, and kept_ids[j] = the ORIGINAL chunk-row index of configs[j].
+
+        When a row is UNREACHABLE (either arm's IK unsolvable, or a target outside the workspace box):
+          * skip_unreachable=True (auto/streaming + calibrate): DROP that row and keep going. kept_ids
+            records the survivors' original indices, so the auto path still tags each kept row with its
+            true master id (start_id + kept_ids[...]) — the skipped id becomes a genuine gap in the
+            queue, which pop_next_substep tolerates (it advances the clock to the popped tag). This is
+            the streaming behaviour: an unreachable waypoint is simply left uncommanded, and the arm
+            bridges to the next reachable one.
+          * skip_unreachable=False (manual validate): abort the whole chunk with a reason (nothing
+            partial staged), so a manual step-through never silently omits a row."""
+        configs, kept_ids = [], []
+        reason = None
         seed = np.asarray(seed_q, dtype=np.float64).copy()   # 14-vec [left7, right7]
         seedL, seedR = seed[:7].copy(), seed[7:14].copy()
         qprevL = qprevR = None    # per-arm quat-smoothing state (don't disturb the preview's)
@@ -426,28 +434,29 @@ class PostProcessor:
             Lpos, Lquat, Lgrip, Rpos, Rquat, Rgrip = decode_action_row_dual(action)
             Lpos = np.asarray(Lpos, dtype=np.float64); Rpos = np.asarray(Rpos, dtype=np.float64)
             if not pos_in_workspace(Lpos, "left") or not pos_in_workspace(Rpos, "right"):
+                reason = f"action {k}: target EE pos outside workspace envelope"
                 if skip_unreachable:
                     continue
-                return [], False, f"action {k}: target EE pos outside workspace envelope"
+                return [], [], False, reason
             qprevL = smooth_quat_step(qprevL, Lquat, QUAT_ALPHA)                  # H3 (per arm)
             qprevR = smooth_quat_step(qprevR, Rquat, QUAT_ALPHA)
             # live/chained seed first, nominal-training-posture fallback on a contorted/unreachable
             # solve (per arm) — keeps a warm arm's natural branch, un-contorts a parked one.
             qL, okL = self._ik_robust(self.solver, Lpos, qprevL, seedL, self.nominal_q14[:7])
-            if not okL:
-                if skip_unreachable:
-                    continue
-                return [], False, (f"action {k}: LEFT IK unreachable "
-                                   f"(pos err {self.solver.last_pos_err*1000:.0f} mm)")
             qR, okR = self._ik_robust(self.solver_r, Rpos, qprevR, seedR, self.nominal_q14[7:])
-            if not okR:
+            if not (okL and okR):
+                bad = "LEFT" if not okL else "RIGHT"
+                err = (self.solver if not okL else self.solver_r).last_pos_err * 1000
+                reason = f"action {k}: {bad} IK unreachable (pos err {err:.0f} mm)"
                 if skip_unreachable:
-                    continue
-                return [], False, (f"action {k}: RIGHT IK unreachable "
-                                   f"(pos err {self.solver_r.last_pos_err*1000:.0f} mm)")
+                    continue                               # drop this row; the arm bridges past it
+                return [], [], False, reason               # manual: abort the whole chunk
             configs.append((np.concatenate([qL, qR]), [Lgrip, Rgrip]))
+            kept_ids.append(k)
             seedL, seedR = qL, qR
-        return configs, True, None
+        if configs:
+            return configs, kept_ids, True, None
+        return [], [], False, reason or "empty action chunk"
 
     def validate_chunk(self, sim, configs, seed_q, substeps_per_row, fast=False, seed_gap=False):
         """Run PRE-SOLVED joint configs through `sim` from seed_q (substep + self-collision + joint
@@ -608,7 +617,8 @@ class PostProcessor:
         if seed is None:                                    # queue empty -> continue from live pose
             arm14 = self.read_arm14()
             seed = arm14 if arm14 is not None else self._last_q14   # 14-vec dual seed
-        configs, ok, reason = self.solve_chunk_ik(action_chunk[lo:hi + 1], seed)
+        configs, kept_ids, ok, reason = self.solve_chunk_ik(action_chunk[lo:hi + 1], seed,
+                                                            skip_unreachable=True)
         if not ok:
             return False, reason
         K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
@@ -618,11 +628,12 @@ class PostProcessor:
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
         # Tag each substep with its absolute master id from the sim's EXACT per-substep row index
-        # (rows[s] = the config row it realizes): config row j -> master id start_id + j. Using the
-        # returned index (not an s//K guess) keeps alignment exact even if a velocity-capped row emits
-        # more than K substeps.
+        # (rows[s] = the CONFIG index it realizes) mapped through kept_ids to the ORIGINAL chunk row:
+        # config j -> master id start_id + kept_ids[j]. This keeps ids correct when solve_chunk_ik
+        # skipped an unreachable row (that id is simply absent — a gap the release loop tolerates), and
+        # stays exact even if a velocity-capped row emits more than K substeps.
         tagged = [(np.asarray(q14, dtype=np.float64), grip,     # q14 = both arms; grip = [gl, gr]
-                   start_id + int(rows[s]))
+                   start_id + int(kept_ids[rows[s]]))
                   for s, (q14, grip) in enumerate(traj)]
         with self._lock:
             cur = self._current_row_id
@@ -677,7 +688,7 @@ class PostProcessor:
         # from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
         arm14 = self.read_arm14()                         # read outside the lock (DDS I/O)
         seed = arm14 if arm14 is not None else self._last_q14      # 14-vec dual seed
-        configs, ok, reason = self.solve_chunk_ik(action_chunk, seed)
+        configs, kept_ids, ok, reason = self.solve_chunk_ik(action_chunk, seed, skip_unreachable=True)
         if not ok:
             return False, reason
         K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
@@ -685,11 +696,12 @@ class PostProcessor:
         if not ok or not traj:
             return False, reason or "empty validated trajectory"
         # Tag each validated substep with its ABSOLUTE master row id from the sim's EXACT per-substep
-        # row index (rows[s] = the config row it realizes): config row j -> master id obs_step_id + j.
-        # No seed_gap here (queue-REPLACE ramps from the live pose), so row 0 is a lone point (rows[0]=0)
-        # and the release ramp bridges live->row0 below.
+        # row index (rows[s] = the CONFIG index it realizes) mapped through kept_ids to the original
+        # chunk row: config j -> master id obs_step_id + kept_ids[j] (a skipped-unreachable row is an
+        # absent id). No seed_gap here (queue-REPLACE ramps from the live pose), so the release ramp
+        # bridges live->first row below.
         tagged = [(np.asarray(q14, dtype=np.float64), grip,
-                   int(obs_step_id) + int(rows[s]))
+                   int(obs_step_id) + int(kept_ids[rows[s]]))
                   for s, (q14, grip) in enumerate(traj)]
         with self._lock:
             cur = self._current_row_id

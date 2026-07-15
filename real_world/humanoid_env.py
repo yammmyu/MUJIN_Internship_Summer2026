@@ -481,7 +481,9 @@ class HumanoidEnv:
     def _solve_chunk_ik(self, action_chunk, seed_q, skip_unreachable=False):
         """Solve IK for an ENTIRE chunk (workspace check H4 + orientation smoothing H3 + dual-arm IK
         with nominal-posture fallback) on the caller's thread. Delegated to the pipeline; returns
-        (configs, ok, reason) with configs = [(q14, [gl,gr]), ...] for the sim to validate."""
+        (configs, kept_ids, ok, reason) with configs = [(q14, [gl,gr]), ...] for the sim to validate
+        and kept_ids[j] = the original chunk-row index of configs[j] (differs from j only when
+        skip_unreachable dropped an unreachable row)."""
         return self.pipeline.solve_chunk_ik(action_chunk, seed_q, skip_unreachable=skip_unreachable)
 
     def _validate_chunk(self, configs, seed_q, fast=False, substeps_per_row=None):
@@ -505,8 +507,8 @@ class HumanoidEnv:
         recordings before trusting validation, or it will false-positive on normal poses."""
         if self.sim is None:
             return False, "no sim running"
-        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14,
-                                                   skip_unreachable=True)
+        configs, _kept, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14,
+                                                          skip_unreachable=True)
         if not ok:
             return False, reason
         self.sim.validate(configs, self._last_q14, MAX_JOINT_STEP, learn=True,
@@ -532,7 +534,7 @@ class HumanoidEnv:
 
         # Solve IK for the whole chunk first (outside the sim job), then validate the resulting
         # joint configs kinematically. On an IK/envelope failure there's nothing to validate.
-        configs, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14)
+        configs, _kept, ok, reason = self._solve_chunk_ik(action_chunk, self._last_q14)
         traj, ok, reason, _rows = (self._validate_chunk(configs, self._last_q14)
                                    if ok else ([], False, reason, []))
         with self._lock:

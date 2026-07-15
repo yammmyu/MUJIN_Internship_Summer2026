@@ -16,8 +16,9 @@ def test_rows_index_exact(verbose=True):
     env, sim, seed = A._env_with_sim()
     seed14 = np.concatenate([np.asarray(seed, float)[:7], np.zeros(7)])
     actions = T._synthetic_actions(env, seed)
-    configs, ok, r = env.pipeline.solve_chunk_ik(actions[:6], seed14)
+    configs, kept_ids, ok, r = env.pipeline.solve_chunk_ik(actions[:6], seed14)
     assert ok, r
+    assert kept_ids == list(range(len(configs))), "no rows skipped here -> kept_ids is identity"
     n = len(configs)
     try:
         # Force velocity-capping on EVERY gap by using a tiny max_joint_step, so most rows emit

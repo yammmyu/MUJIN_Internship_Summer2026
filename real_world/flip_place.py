@@ -56,6 +56,7 @@ class FlipPlaceMacro:
         self.vel_frac = float(vel_frac)
         self.release_settle_s = float(release_settle_s)
         self.open_grip = float(open_grip)
+        self.enabled = True           # live on/off: False -> maybe_trigger is a no-op (macro never runs)
         self._fired = False           # already ran for the current closed episode?
         self._above_since = None      # monotonic time |Δrj7| first went >= threshold (settle timer)
         self._prev_closed = False     # right gripper closed last check (open->close edge = the grab)
@@ -67,7 +68,10 @@ class FlipPlaceMacro:
         """Loop hook: True => the macro ran this cycle (caller should skip predicting). Fires ONCE per
         closed grasp, when the right gripper is commanded closed AND the wrist-roll has ROTATED by
         rj7_change (|Δrj7|) from its value AT THE GRAB, held for settle_s. Measuring the CHANGE (not an
-        absolute angle) makes the trigger independent of the grasp orientation. Resets on release."""
+        absolute angle) makes the trigger independent of the grasp orientation. Resets on release.
+        No-op (returns False) while disabled, so the operator can turn the post-flip macro off live."""
+        if not self.enabled:
+            return False
         grip = getattr(env, "_last_grip_cmd", None)
         grip_closed = grip is not None and grip[R_GRIP_IDX] >= 1
         if not grip_closed:                          # released -> disarm; ready for the next grasp
