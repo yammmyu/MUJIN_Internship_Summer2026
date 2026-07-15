@@ -43,15 +43,9 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.models import resnet18
 
-from real_world.timing import CONTROL_HZ, MAX_JOINT_VEL
+from real_world.retreat import retreat_to_home
 
 log = logging.getLogger(__name__)
-
-# Retreat cruise speed as a fraction of the MAX_JOINT_VEL safety ceiling. The per-substep joint
-# delta handed to move_to_joints is (frac * MAX_JOINT_VEL / CONTROL_HZ), so the resulting cruise is
-# exactly frac * MAX_JOINT_VEL rad/s -- independent of move_to_joints' own default derate.
-RETREAT_JOINT_VEL_FRAC = 0.5
-RETREAT_JOINT_STEP = RETREAT_JOINT_VEL_FRAC * MAX_JOINT_VEL / CONTROL_HZ
 
 # 20-col dual_arm_ee_image action row: L[pos3,rot6d6,grip1] ++ R[pos3,rot6d6,grip1]
 L_EE = slice(0, 9)      # left [pos3, rot6d6]  (held during retreat)
@@ -200,31 +194,10 @@ class GraspRecoveryMonitor:
 
     # -- internals --------------------------------------------------------------
     def _begin_retreat(self, env, obs):
-        """Recovery = let go + reset. Clear the robot queue, OPEN the right gripper, then move BOTH
-        arms to the fixed HOME joint pose by absolute joint angles (no EE-space lift / IK). Blocks
-        until the arm arrives; the policy re-approaches from home afterwards."""
-        with env._lock:                                    # clear queue (non-estop half of lock_robot)
-            env._robot_q.clear()
-            env._staged_release.clear()
-            env._queued_through = -1                       # next append re-anchors to the clock
-        # OPENING the right gripper is the point of the recovery, so drop any anti-regrab close-latch
-        # first — otherwise a grasp that latched closed would override the open.
-        if hasattr(env, "reset_grip_latch"):
-            env.reset_grip_latch()
-        # The home move bypasses pipeline.merge(), so clear the smoothed buffer -> the FIRST post-
-        # recovery merge re-anchors from the live clock instead of materialising a stale pre-miss run.
-        env.pipeline.reset_merge()
-        # Open the right gripper (left untouched); command_gripper also updates the obs source so the
-        # policy sees "open" promptly.
-        if hasattr(env, "command_gripper"):
-            env.command_gripper(gr=self.open_grip)
-        # Move to the fixed home joint pose (absolute joints, velocity-bounded, E-stop-aware). Pin the
-        # per-substep delta so the retreat always cruises at RETREAT_JOINT_VEL_FRAC of MAX_JOINT_VEL,
-        # instead of move_to_joints' gentler default derate.
-        if self.retreat_home_q14 is not None and hasattr(env, "move_to_joints"):
-            env.move_to_joints(self.retreat_home_q14, joint_step=RETREAT_JOINT_STEP)
-        else:
-            log.warning("[recovery] no home pose / move_to_joints unavailable -> opened gripper only")
+        """Recovery = let go + reset. OPEN the right gripper + move BOTH arms to the fixed HOME joint
+        pose (shared retreat_to_home). Pins the per-substep delta so the retreat cruises at
+        RETREAT_JOINT_VEL_FRAC of MAX_JOINT_VEL. Blocks until the arm arrives; policy re-approaches."""
+        retreat_to_home(env, self.retreat_home_q14, open_grip=self.open_grip)
         self._finish()                                     # synchronous recovery done; policy resumes
 
     def _finish(self):

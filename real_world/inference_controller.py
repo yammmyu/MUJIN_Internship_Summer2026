@@ -34,6 +34,9 @@ from real_world.timing import RECORD_HZ, TRACE_DIR   # single source of timing t
 # is re-exported here so callers doing `from real_world.inference_controller import encode_image`
 # keep working.
 from real_world.build_data import encode_image, build_predict_request
+# Torch-free 'retreat to home' primitive (also used by grasp_recovery) — safe to import even when the
+# grasp detector / torch is absent, so the unreachable-target retreat works without recovery enabled.
+from real_world.retreat import retreat_to_home
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +136,14 @@ class InferenceController:
         # execute_inference_result. cursor >= chunk length => the chunk is fully consumed
         # and the manual validate buttons become no-ops (see steps_remaining).
         self._exec_cursor = 0
+        # Unreachable-target retreat: when a streaming append keeps failing because the policy's
+        # target is IK-unreachable / outside the workspace envelope, the arm would otherwise just
+        # drain its queue and stall (the "pause"). Instead, after this many CONSECUTIVE unreachable
+        # inferences we fire the same retreat as grasp recovery (open gripper + home) so the policy
+        # re-plans from home. A count > 1 rides out the ~20% spuriously-unreachable rows. Set to 0 to
+        # disable and fall back to the old skip-and-hold behaviour.
+        self.unreachable_retreat_after = 3
+        self._unreachable_streak = 0     # consecutive unreachable appends since the last good/reset
         # Open trace-file handles, kept open for the controller's life so the hot loop never
         # re-opens per inference. The emitted-buffer trace is ALWAYS on: the smoothed run fed to the
         # robot is logged to buffer.jsonl every inference so it can be joined (by master row id) to
@@ -239,6 +250,7 @@ class InferenceController:
         # the streaming-retreat mode (pumped from the auto loop) — skip predicting this cycle.
         rec = getattr(self, "recovery", None)
         if rec is not None and rec.maybe_start(env, obs):
+            self._unreachable_streak = 0        # recovery re-homed -> fresh reachability streak
             return True
 
         req = build_predict_request(obs)
@@ -317,6 +329,15 @@ class InferenceController:
             append_ok, reason = env.append_actions(buf_list, int(base_id))
             if not append_ok:
                 log.info("auto: append skipped — %s", reason)
+            # Unreachable-target retreat: an IK/workspace failure means the arm can't follow the policy
+            # here. Skipping just holds the last pose (the "pause"); after enough CONSECUTIVE such
+            # failures, retreat to home so the policy re-plans from a reachable config. Only append
+            # FAILURES that are specifically reachability-related count — a no-op success (buffer full,
+            # chunk past the window) or a non-reachability skip (collision, no sim, E-stop) does not.
+            if append_ok:
+                self._unreachable_streak = 0
+            elif self._maybe_retreat_unreachable(env, reason):
+                return True
 
         # ---- per-inference lifecycle trace ---------------------------------------------------
         # One line per inference so the timeline is legible: START/END wall-clock, how long the
@@ -365,6 +386,35 @@ class InferenceController:
             return msg
         except Exception:
             return ""
+
+    @staticmethod
+    def _is_unreachable_reason(reason):
+        """True for append-FAILURE reasons that mean the policy's TARGET can't be followed here —
+        IK-unreachable or outside the workspace envelope. Distinguishes these from setup/safety skips
+        (no sim, E-stop, real=False) and collision rejects, which should NOT retreat. Matches the
+        reason strings solve_chunk_ik emits (see real_world/postprocess.py)."""
+        r = (reason or "").lower()
+        return "unreachable" in r or "workspace envelope" in r
+
+    def _maybe_retreat_unreachable(self, env, reason):
+        """After `unreachable_retreat_after` CONSECUTIVE unreachable/out-of-envelope append failures,
+        fire the same retreat as grasp recovery (open right gripper + move both arms home) so the
+        policy re-plans from a reachable config, instead of the arm draining its queue and holding the
+        last pose (the "pause"). Returns True iff a retreat was performed — the caller then ends this
+        inference cycle. A non-reachability failure returns False and leaves the streak untouched."""
+        if self.unreachable_retreat_after <= 0 or not self._is_unreachable_reason(reason):
+            return False
+        self._unreachable_streak += 1
+        if self._unreachable_streak < self.unreachable_retreat_after:
+            log.info("[auto] target unreachable (%s) — %d/%d before retreat",
+                     reason, self._unreachable_streak, self.unreachable_retreat_after)
+            return False
+        log.warning("[auto] target unreachable %d× in a row (%s) -> retreat to home "
+                    "(open gripper + home); policy re-plans from home",
+                    self._unreachable_streak, reason)
+        retreat_to_home(env, self.auto_start_pose, open_grip=0.0)
+        self._unreachable_streak = 0
+        return True
 
     # ------------------------------------------------------------------ #
     #  Live-tunable smoothing knobs — delegated to env.pipeline (the       #
@@ -521,6 +571,7 @@ class InferenceController:
                     env.pipeline.clear_queue()
                 log.info("[auto] homing to start pose (absolute joints) before inference…")
                 env.move_to_joints(self.auto_start_pose)
+            self._unreachable_streak = 0       # fresh run -> reset the reachability streak
             # Target a fixed inference cadence so the loop is controllable via inference_hz (a
             # value <= 0 means "as fast as latency allows"). We measure each cycle and sleep only
             # the REMAINDER of the period; if an inference already overran the period we go again
@@ -535,6 +586,7 @@ class InferenceController:
                 # the brief window before we notice here.)
                 if self.humanoid_env.estopped:
                     log.warning("E-stop latched — disarming auto-inference.")
+                    self._unreachable_streak = 0
                     rec = getattr(self, "recovery", None)
                     if rec is not None:
                         rec.reset()                        # drop any in-flight retreat (queue was cleared)
@@ -548,6 +600,7 @@ class InferenceController:
                 # all inline (clears every queue before/after so auto resumes without snapping).
                 fp = getattr(self, "flip_place", None)
                 if fp is not None and fp.maybe_trigger(self.humanoid_env):
+                    self._unreachable_streak = 0       # flip macro re-homed -> fresh streak
                     continue
                 # CCDP recovery is now SYNCHRONOUS: a detected miss opens the gripper + moves the arm
                 # home inside maybe_start() (called from _run_inference below), then normal inference
