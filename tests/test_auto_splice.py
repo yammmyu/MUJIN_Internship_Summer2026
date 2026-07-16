@@ -84,6 +84,11 @@ class _ClosedLoopFake:
 
 def _env_with_sim():
     planner_mod.WORKSPACE_AABB = ((-9, 9), (-9, 9), (-9, 9))   # isolate from the H4 envelope check
+    # Widen the C7 EE safe region too: these splice tests release SAFE_SEED-based synthetic
+    # trajectories whose FK lands outside the real task box, which would otherwise latch the
+    # runtime EE watchdog. C7 itself is covered by test_safety_invariants.
+    planner_mod.EE_SAFE_REGION_LEFT = ((-9, 9), (-9, 9), (-9, 9))
+    planner_mod.EE_SAFE_REGION_RIGHT = ((-9, 9), (-9, 9), (-9, 9))
     sim = SimEnv(direct=True)
     seed = np.clip(T.SAFE_SEED, sim.model.lower, sim.model.upper)
     fake = _ClosedLoopFake(seed)                         # one object as both robot + controller

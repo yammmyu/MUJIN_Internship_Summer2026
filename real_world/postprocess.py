@@ -78,6 +78,32 @@ def pos_in_workspace(pos, side="left"):
     return xl <= x <= xh and yl <= y <= yh and zl <= z <= zh
 
 
+# --- Runtime EE safe region (C7) -----------------------------------------------------------------
+# A HARD spatial boundary (firmware EE frame, metres) checked at DISPATCH, per arm. Unlike the H4
+# envelope above — a generous, hand-set gate that only REJECTS a planning target (skip the row) —
+# this region is data-estimated and, when the actually-commanded EE leaves it, the release path
+# LATCHES THE E-STOP. It is the spatial sibling of the C6 joint-jump watchdog: C6 catches a large
+# per-command rotation, C7 catches the EE straying outside where the robot has ever safely operated
+# (a slow drift, an accumulated excursion, or a bad target that slipped past validation).
+#
+# Estimated from MDM_data_collection/recordings (165 episodes, ~87.5k frames/arm): the full
+# per-axis min/max of the demonstrated left/right EE positions, expanded by a 0.12 m margin (so
+# 100% of demonstrated motion is inside, with headroom for legitimate policy extrapolation) and
+# rounded OUTWARD to the cm. Re-estimate with scripts/estimate_ee_region.py if the task/workcell
+# changes. TUNE: widen the margin to reduce nuisance trips, tighten it for a stricter cutoff.
+EE_SAFE_REGION_LEFT  = ((0.23, 0.80), (0.04, 0.59), (0.37, 0.84))   # (x_lo,x_hi),(y..),(z..) LEFT
+EE_SAFE_REGION_RIGHT = ((0.28, 0.83), (-0.56, 0.01), (0.36, 0.92))  # RIGHT arm (negative-y half)
+
+
+def ee_in_safe_region(pos, side="left"):
+    """True if the commanded EE position is inside that arm's data-estimated safe region (C7).
+    side="right" uses the right-arm region. Reads the module globals at call time so the safety
+    suite / a workcell config can override the box."""
+    (xl, xh), (yl, yh), (zl, zh) = EE_SAFE_REGION_RIGHT if side == "right" else EE_SAFE_REGION_LEFT
+    x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+    return xl <= x <= xh and yl <= y <= yh and zl <= z <= zh
+
+
 def load_nominal_config():
     """Nominal per-arm training posture (real_world/config/nominal_arm_config.json) as a 14-vec
     [left7, right7] — the IK FALLBACK seed. Zeros if the file is absent (fallback disabled-ish)."""
@@ -88,6 +114,27 @@ def load_nominal_config():
     except Exception as e:
         print(f"[PostProcessor] nominal_arm_config.json unavailable ({e}); IK fallback seed = zeros.")
         return np.zeros(14, dtype=np.float64)
+
+
+def load_retreat_waypoints():
+    """The pre-grasp APPROACH waypoints (real_world/config/retreat_waypoints.json) as an (n, 14)
+    array [left7, right7] per row, ordered from the average start pose (row 0) to ~85% of the way to
+    the grasp (last row). The recovery retreat homes to the nearest of these that isn't ahead of the
+    arm's current approach phase; row 0 is also the auto-run start pose. Re-generate with
+    scripts/estimate_retreat_waypoints.py. Returns None if the file is absent (callers fall back to a
+    single fixed home pose)."""
+    path = pathlib.Path(__file__).parent / "config" / "retreat_waypoints.json"
+    try:
+        d = json.loads(path.read_text())
+        W = np.asarray(d["waypoints"], dtype=np.float64)
+        if W.ndim != 2 or W.shape[1] != 14 or len(W) == 0:
+            raise ValueError(f"expected (n,14) waypoints, got {W.shape}")
+        return W
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[PostProcessor] retreat_waypoints.json unusable ({e}); retreat falls back to home pose.")
+        return None
 
 
 def _limit_pinned(solver, q, margin=0.10):

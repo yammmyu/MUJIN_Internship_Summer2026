@@ -67,6 +67,17 @@ SUBSTEPS_PER_ROW = round((CONTROL_HZ / RECORD_HZ)/SPEED_SCALE)   # time-uniform 
 MAX_JOINT_VEL = 4.0                                # rad/s (~344 deg/s).
 MAX_JOINT_STEP = min(MAX_JOINT_VEL / CONTROL_HZ, 0.05)       # max per-substep joint delta (rad); the C5 cap.
 
+# --- derived: large-rotation watchdog (C6) ---------------------------------------------------
+# A HARD cutoff on a SINGLE commanded joint jump (rad) at dispatch. MAX_JOINT_STEP above bounds
+# per-substep VELOCITY — a big jump becomes a slow ramp, so a bad IK branch-flip / jumpy policy row
+# / queue seam is still executed, just slowly (the "arm swings through a huge rotation" symptom).
+# This bounds per-command DISPLACEMENT instead: a waypoint more than WATCHDOG_MAX_JOINT_JUMP from
+# the last commanded config is a discontinuity, not motion, so the release path REFUSES it (latches
+# the E-stop) rather than ramping it through. Set FAR above MAX_JOINT_STEP (~0.033) so legitimate
+# velocity-bounded motion and pre-subdivided ramps never trip it, and below a dangerous single-joint
+# rotation. TUNE on hardware: lower = stricter cutoff (more sensitive), 0 disables the watchdog.
+WATCHDOG_MAX_JOINT_JUMP = 0.5                       # rad (~29 deg); per-command joint-jump cutoff.
+
 # --- derived: ramp cruise speed --------------------------------------------------------------
 # Ramps/bridges (the initial C5 ramp-in AND the per-chunk seam bridge in append_actions) connect
 # the arm's current pose to the next action row. They are NOT trajectory-following motion, so the

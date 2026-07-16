@@ -42,7 +42,8 @@ from real_world.sim_preview import SimPreview
 # temporal-ensemble merge; later stages absorb IK, sim validation, and the queue splice). The env
 # owns one PostProcessor (self.pipeline). (GRIPPER_CLOSE_THRESH / APPEND_AHEAD_ROWS are imported for
 # the env's own use; external callers now import them from real_world.postprocess, their owner.)
-from real_world.postprocess import PostProcessor, GRIPPER_CLOSE_THRESH, APPEND_AHEAD_ROWS
+from real_world.postprocess import (PostProcessor, GRIPPER_CLOSE_THRESH, APPEND_AHEAD_ROWS,
+                                     ee_in_safe_region)
 # Producer-side observation buffers + freshness + get_obs/inf_ready (#3). extract_pose is the
 # shared status-frame parser (obs right-EE + recorder both use it).
 from real_world.observer import ObsCollector, extract_pose
@@ -52,7 +53,7 @@ from real_world.observer import ObsCollector, extract_pose
 # their owner, rather than through this module.)
 from real_world.timing import (
     RECORD_HZ, ROW_DT, CONTROL_HZ, STEP_TIME, SUBSTEPS_PER_ROW, MAX_JOINT_VEL, MAX_JOINT_STEP,
-    RAMP_JOINT_STEP, SPEED_SCALE, TRACE_DIR,
+    RAMP_JOINT_STEP, SPEED_SCALE, TRACE_DIR, WATCHDOG_MAX_JOINT_JUMP,
 )
 
 # a2d_sdk only exists on the robot machine. A sim-only machine (pybullet but no SDK) still
@@ -1002,6 +1003,13 @@ class HumanoidEnv:
                 continue
             sub = self.pipeline.pop_next_substep()       # pops + advances the master clock under the lock
             if sub is None:
+                # Idle: the queue is drained. Drop the dispatch-guard anchor so the NEXT fresh stream
+                # re-seeds it from the live pose (run_trajectory_control, C5 seed). This keeps the C6
+                # watchdog measuring discontinuities WITHIN a streamed trajectory — not the ramp-in
+                # gap between the arm's actual pose and the next trajectory's start, which the ramp-in
+                # already bridges under the velocity cap. Without it, a stale anchor from the previous
+                # trajectory could false-trip the watchdog on a legitimate ramp-in.
+                self._last_cmd_q14 = None
                 self._stop_event.wait(STEP_TIME)
                 continue
             _t0 = time.monotonic()
@@ -1122,6 +1130,46 @@ class HumanoidEnv:
             # velocity physically impossible regardless of what produced `points`. Upstream ramps keep
             # this a no-op in the common case; when it fires it means an upstream gap leaked through.
             prev = self._last_cmd_q14
+            # C6 LARGE-ROTATION WATCHDOG (defense-in-depth, BOTH arms): before ramping, hard-reject a
+            # single commanded target that lands more than WATCHDOG_MAX_JOINT_JUMP from the last
+            # commanded config on ANY joint. That is not fast motion (C5 already bounds velocity) — it
+            # is a discontinuity (bad IK branch flip, unbridged queue seam, jumpy policy row) that,
+            # ramped through, becomes a large sweep. Cut it off: latch the E-stop and send nothing more.
+            if (prev is not None and not ignore_estop and WATCHDOG_MAX_JOINT_JUMP > 0):
+                jump = np.abs(q14 - prev)
+                span_wd = float(np.max(jump))
+                if span_wd > WATCHDOG_MAX_JOINT_JUMP:
+                    j = int(np.argmax(jump))
+                    side = "L" if j < 7 else "R"
+                    print(f"[HumanoidEnv] ⛔ WATCHDOG: commanded joint jump |Δq|={span_wd:.3f} rad on "
+                          f"{side}-arm J{j % 7 + 1} exceeds cutoff {WATCHDOG_MAX_JOINT_JUMP:.3f} rad — "
+                          f"refusing motion and latching E-stop.")
+                    self.lock_robot()          # drop the queue + actively hold (ignore_estop hold path
+                    return True                # skips the watchdog); halt this batch, send nothing more.
+            # C7 EE SAFE-REGION WATCHDOG (defense-in-depth, BOTH arms): FK the commanded joints and
+            # reject a waypoint whose end-effector leaves the data-estimated safe box (postprocess.py:
+            # EE_SAFE_REGION_*). This is the SPATIAL sibling of C6 — it catches the EE straying
+            # outside where the robot has ever safely operated (drift / accumulated excursion / a bad
+            # target past validation) even when no single joint jump is large. FK is cheap (Pinocchio,
+            # ~µs); a solver bug must not kill the ONLY motion driver, so an FK error skips C7 for the
+            # tick (the joint-limit clamp + C5 + C6 still apply) rather than latching.
+            if not ignore_estop:
+                try:
+                    posL, _ = self.solver.m.fk(q14[:7])
+                    posR, _ = self.solver_r.m.fk(q14[7:14])
+                    okL = ee_in_safe_region(posL, "left")
+                    okR = ee_in_safe_region(posR, "right")
+                except Exception as e:
+                    print(f"[HumanoidEnv] C7 FK check skipped (continuing): {e}")
+                    okL = okR = True
+                if not (okL and okR):
+                    bad = "L" if not okL else "R"
+                    pos = posL if not okL else posR
+                    print(f"[HumanoidEnv] ⛔ WATCHDOG: {bad}-arm EE "
+                          f"[{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] left the safe region — "
+                          f"refusing motion and latching E-stop.")
+                    self.lock_robot()
+                    return True
             if prev is not None and not ignore_estop and MAX_JOINT_STEP > 0:
                 span = float(np.max(np.abs(q14 - prev)))
                 nseg = max(1, int(np.ceil(span / MAX_JOINT_STEP)))

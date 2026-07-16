@@ -8,6 +8,10 @@ MUST block deployment:
   C1  no sim running       -> nothing can ever be released to the robot
   C2  validation           -> steps the sim, self-collision-checks, records sim-ACHIEVED joints
   C5  rate limit / ramp    -> released steps are <= MAX_JOINT_STEP (BOTH arms), ramped from pose
+  C6  large-rotation cutoff -> a single commanded jump > WATCHDOG_MAX_JOINT_JUMP is REFUSED (E-stop
+                              latched), not ramped through — the arm never swings a large rotation
+  C7  EE safe region       -> a commanded EE outside the data-estimated EE_SAFE_REGION latches the
+                              E-stop (the arm never leaves the box it was ever demonstrated in)
   H1  one-shot release     -> a validation can be released once (no re-release snap-back)
   C3  E-stop               -> latched, actively holds, refuses release until reset
   C4  DUAL-ARM commanded   -> BOTH arms are placed in every trajectory action and the right arm is
@@ -101,7 +105,7 @@ def run(verbose=True):
     """Run all invariant checks. Returns True on success, raises AssertionError on a violation."""
     import real_world.postprocess as planner_mod
     from real_world.humanoid_env import HumanoidEnv
-    from real_world.timing import MAX_JOINT_STEP
+    from real_world.timing import MAX_JOINT_STEP, WATCHDOG_MAX_JOINT_JUMP
     from real_world.sim_backend import SimEnv
 
     # Isolate the RELEASE-pipeline invariants from the workspace-envelope check (H4 is config,
@@ -109,6 +113,11 @@ def run(verbose=True):
     # The envelopes now live in real_world.postprocess (PostProcessor.solve_chunk_ik reads them).
     planner_mod.WORKSPACE_AABB = ((-9, 9), (-9, 9), (-9, 9))
     planner_mod.WORKSPACE_AABB_RIGHT = ((-9, 9), (-9, 9), (-9, 9))
+    # Likewise widen the C7 EE safe region so the synthetic seed's FK (away from the real task box)
+    # doesn't trip the runtime EE watchdog during the C2–C6 release checks; the C7 block below
+    # narrows it back to prove the watchdog fires.
+    planner_mod.EE_SAFE_REGION_LEFT = ((-9, 9), (-9, 9), (-9, 9))
+    planner_mod.EE_SAFE_REGION_RIGHT = ((-9, 9), (-9, 9), (-9, 9))
 
     sim = SimEnv(direct=True)
     seed = np.clip(SAFE_SEED, sim.model.lower, sim.model.upper)
@@ -172,12 +181,52 @@ def run(verbose=True):
         # right arm's safety is the SAME as the left's — sim-validated (C2) + velocity-bounded (C5).
         assert ctl.right_touched, "C4: right arm was never commanded (dual-arm release expected)"
         assert not ctl.left_only, "C4: a trajectory action omitted the right arm (arms must move together)"
+
+        # C6 (large-rotation watchdog) — a single commanded target that jumps more than
+        # WATCHDOG_MAX_JOINT_JUMP from the last commanded config on any joint is REFUSED: the
+        # watchdog latches the E-stop, drops the queue, and never dispatches the oversized target
+        # (vs C5, which would ramp it through as a slow but large sweep). Drive it directly since
+        # the whole point is a target upstream subdivision failed to bound.
+        assert WATCHDOG_MAX_JOINT_JUMP > 0, "C6: watchdog disabled (WATCHDOG_MAX_JOINT_JUMP <= 0)"
+        env.reset_estop()                                   # clean, un-latched state; guard re-seeds
+        lower = np.asarray(env._jlower14, dtype=float)
+        upper = np.asarray(env._jupper14, dtype=float)
+        env._last_cmd_q14 = lower.copy()                    # seed the guard at the lower limit
+        big = upper.copy()                                  # full-range jump, in-limits by construction
+        assert float(np.max(np.abs(big - lower))) > WATCHDOG_MAX_JOINT_JUMP, \
+            "C6: test target does not exceed the cutoff (arm range too small?)"
+        n_before = len(ctl.moves)
+        env.run_trajectory_control([(big, None)])           # one oversized waypoint
+        assert env.estopped, "C6: watchdog did not latch the E-stop on a large joint jump"
+        assert env.robot_pending == 0, "C6: watchdog did not drop the queue"
+        sent = np.array(ctl.moves[n_before:]) if len(ctl.moves) > n_before else np.zeros((0, 7))
+        if len(sent):                                       # only the hold pose may be sent, never `big`
+            assert not np.any(np.all(np.isclose(sent, big[:7], atol=1e-6), axis=1)), \
+                "C6: the over-cutoff target was dispatched despite the watchdog"
+        env.reset_estop()
+
+        # C7 (EE safe-region watchdog) — a commanded target whose FK end-effector is outside the
+        # data-estimated EE_SAFE_REGION latches the E-stop. Force it with an unreachable region so
+        # ANY EE is outside, and command the live pose (zeros) so the C6 joint-jump watchdog stays
+        # silent and C7 is unambiguously the trip. Restore the region before asserting.
+        env.reset_estop()
+        saved_L = planner_mod.EE_SAFE_REGION_LEFT
+        planner_mod.EE_SAFE_REGION_LEFT = ((9.0, 9.1), (9.0, 9.1), (9.0, 9.1))   # nothing inside
+        n_before = len(ctl.moves)
+        near_live = np.clip(np.zeros(14), env._jlower14, env._jupper14)   # ~live pose -> C6 silent
+        try:
+            env.run_trajectory_control([(near_live, None)])
+        finally:
+            planner_mod.EE_SAFE_REGION_LEFT = saved_L
+        assert env.estopped, "C7: watchdog did not latch on an out-of-region EE"
+        assert env.robot_pending == 0, "C7: watchdog did not drop the queue"
+        env.reset_estop()
     finally:
         env.stop()
         sim.disconnect()
 
     if verbose:
-        print("[safety] ALL INVARIANTS PASS (C1 C2 C3 C4 C5 H1)")
+        print("[safety] ALL INVARIANTS PASS (C1 C2 C3 C4 C5 C6 C7 H1)")
     return True
 
 

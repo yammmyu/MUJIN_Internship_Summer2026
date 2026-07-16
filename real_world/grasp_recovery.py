@@ -43,7 +43,7 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.models import resnet18
 
-from real_world.retreat import retreat_to_home
+from real_world.retreat import retreat_to_nearest
 
 log = logging.getLogger(__name__)
 
@@ -90,19 +90,21 @@ class _Detector:
 class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
                  settle_sec=4.0,
-                 # ABSOLUTE 14-joint HOME pose the recovery moves BOTH arms to (open gripper + go home),
-                 # instead of a scripted EE-space lift. Passed in by the controller (= its auto start
-                 # pose, arm_joints[0] of MDM_data_collection/recordings/recording001). None -> skip the
-                 # move and only open the gripper.
-                 retreat_home_q14=None,
+                 # Pre-grasp APPROACH waypoints (n, 14) [left7, right7] the recovery retreats to (open
+                 # gripper + move BOTH arms), ordered start -> pre-grasp. Passed in by the controller
+                 # (real_world/config/retreat_waypoints.json). The retreat picks the nearest waypoint
+                 # not ahead of the arm's current phase, so it no longer always snaps to the start. A
+                 # single (14,) pose is accepted (legacy fixed-home behaviour); None -> gripper only.
+                 retreat_waypoints=None,
                  open_grip=0.0,                      # 0 = open; the recovery opens the right gripper
                  closed_grip_min=10.0,               # = postprocess.GRIPPER_CLOSE_THRESH: note_action
                                                      # reads the RAW server grip [0,~85] (pre-binarize)
                  device=None):
         self.det = _Detector(detector_path, device=device)
         self.settle_sec = settle_sec
-        self.retreat_home_q14 = (np.asarray(retreat_home_q14, dtype=float)
-                                 if retreat_home_q14 is not None else None)
+        # Normalize to (n, 14): accept a waypoint list/array or a single legacy (14,) home pose.
+        self.retreat_waypoints = (np.asarray(retreat_waypoints, dtype=float).reshape(-1, 14)
+                                  if retreat_waypoints is not None else None)
         self.open_grip = float(open_grip)
         self.closed_grip_min = float(closed_grip_min)
 
@@ -194,10 +196,17 @@ class GraspRecoveryMonitor:
 
     # -- internals --------------------------------------------------------------
     def _begin_retreat(self, env, obs):
-        """Recovery = let go + reset. OPEN the right gripper + move BOTH arms to the fixed HOME joint
-        pose (shared retreat_to_home). Pins the per-substep delta so the retreat cruises at
-        RETREAT_JOINT_VEL_FRAC of MAX_JOINT_VEL. Blocks until the arm arrives; policy re-approaches."""
-        retreat_to_home(env, self.retreat_home_q14, open_grip=self.open_grip)
+        """Recovery = let go + reset. OPEN the right gripper + move BOTH arms to the nearest pre-grasp
+        approach waypoint not ahead of the arm's current phase (shared retreat_to_nearest), so the
+        retreat backs off only as far as needed rather than all the way to the start. Pins the
+        per-substep delta so it cruises at RETREAT_JOINT_VEL_FRAC of MAX_JOINT_VEL. Blocks until the
+        arm arrives; policy re-approaches."""
+        if self.retreat_waypoints is None:
+            log.warning("[recovery] no retreat waypoints configured -> gripper-only recovery")
+            if hasattr(env, "command_gripper"):
+                env.command_gripper(gr=self.open_grip)
+            return
+        retreat_to_nearest(env, self.retreat_waypoints, open_grip=self.open_grip)
         self._finish()                                     # synchronous recovery done; policy resumes
 
     def _finish(self):

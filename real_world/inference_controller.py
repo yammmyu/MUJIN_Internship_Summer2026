@@ -125,6 +125,17 @@ class InferenceController:
             [2.041772, -0.287803, -2.07299, -1.220383, 0.279462, 1.207418, -1.292626,
              -1.525758, 0.706167, 1.504347, 0.82008, 0.019143, -1.606412, -1.901265],
             dtype=float)
+        # Pre-grasp APPROACH waypoints (n, 14) averaged from the recordings
+        # (scripts/estimate_retreat_waypoints.py -> config/retreat_waypoints.json). The missed-grasp
+        # recovery retreats to the nearest of these that isn't ahead of the arm's current approach
+        # phase, instead of always homing to the start. Row 0 is the average start pose; when the file
+        # is present it also supersedes auto_start_pose as the top-of-run homing target. Falls back to
+        # a single-waypoint [auto_start_pose] (= today's fixed-home behaviour) when the file is absent.
+        from real_world.postprocess import load_retreat_waypoints
+        _wps = load_retreat_waypoints()
+        self.retreat_waypoints = _wps if _wps is not None else self.auto_start_pose[None, :]
+        if _wps is not None:
+            self.auto_start_pose = np.asarray(_wps[0], dtype=float)   # home to waypoint 1
         # The temporal-ensemble merge state (rolling raw-chunk buffer + smoothed master buffer +
         # live-tunable smoothing config) lives in env.pipeline (a PostProcessor). This controller only
         # delegates the GUI-facing knobs to it (see set_smoothing / te_radius etc. below).
@@ -155,7 +166,7 @@ class InferenceController:
                 from real_world.grasp_recovery import GraspRecoveryMonitor
                 from real_world.postprocess import GRIPPER_CLOSE_THRESH
                 self.recovery = GraspRecoveryMonitor(det_path, closed_grip_min=GRIPPER_CLOSE_THRESH,
-                                                     retreat_home_q14=self.auto_start_pose)
+                                                     retreat_waypoints=self.retreat_waypoints)
             except Exception as e:
                 log.warning("grasp recovery disabled (failed to load %s): %r", det_path, e)
         elif det_path:
