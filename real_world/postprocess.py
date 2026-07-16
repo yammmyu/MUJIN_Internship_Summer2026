@@ -664,8 +664,10 @@ class PostProcessor:
         if seed is None:                                    # queue empty -> continue from live pose
             arm14 = self.read_arm14()
             seed = arm14 if arm14 is not None else self._last_q14   # 14-vec dual seed
-        configs, kept_ids, ok, reason = self.solve_chunk_ik(action_chunk[lo:hi + 1], seed,
-                                                            skip_unreachable=True)
+        # STRICT (skip_unreachable=False): an unreachable row aborts the whole chunk (arm HOLDS)
+        # rather than being dropped and bridged over -- dropping rows mid-stream makes the arm skip
+        # waypoints and jump across the gap, which reads as jerky/fast motion. (Bisect candidate.)
+        configs, kept_ids, ok, reason = self.solve_chunk_ik(action_chunk[lo:hi + 1], seed)
         if not ok:
             return False, reason
         K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
@@ -735,7 +737,9 @@ class PostProcessor:
         # from the arm's ACTUAL pose (what the policy observed), not a stale planned config.
         arm14 = self.read_arm14()                         # read outside the lock (DDS I/O)
         seed = arm14 if arm14 is not None else self._last_q14      # 14-vec dual seed
-        configs, kept_ids, ok, reason = self.solve_chunk_ik(action_chunk, seed, skip_unreachable=True)
+        # STRICT: abort-and-hold on an unreachable row (see the append-ahead path above); no mid-
+        # stream row-dropping that would make the arm bridge across a gap. (Bisect candidate.)
+        configs, kept_ids, ok, reason = self.solve_chunk_ik(action_chunk, seed)
         if not ok:
             return False, reason
         K = self.substeps_per_row                       # capture ONCE: sim expansion + tagging share it
