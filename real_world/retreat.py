@@ -14,7 +14,10 @@ log = logging.getLogger(__name__)
 # Retreat cruise speed as a fraction of the MAX_JOINT_VEL safety ceiling. The per-substep joint delta
 # handed to move_to_joints is (frac * MAX_JOINT_VEL / CONTROL_HZ), so the resulting cruise is exactly
 # frac * MAX_JOINT_VEL rad/s -- independent of move_to_joints' own default derate.
-RETREAT_JOINT_VEL_FRAC = 0.5
+# Kept deliberately SLOW (0.15 * 4.0 = 0.6 rad/s): a recovery/unreachable retreat should be an
+# unhurried, legible back-off, not a fast snap. Lower this to slow it further; it only sets the
+# retreat cruise, never the safety cap (MAX_JOINT_STEP still bounds every dispatched substep).
+RETREAT_JOINT_VEL_FRAC = 0.15
 RETREAT_JOINT_STEP = RETREAT_JOINT_VEL_FRAC * MAX_JOINT_VEL / CONTROL_HZ
 
 
