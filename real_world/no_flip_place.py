@@ -299,6 +299,7 @@ class NoFlipPlaceMacro:
     def __init__(self, path=DEFAULT_PATH, *,
                  detector=_UNSET,      # PORT: callable(env, arm14)->bool. default = BarcodeGate; None disables
                  commit_s=6.0,         # a barcode must be seen CONTINUOUSLY this long to LATCH no-flip
+                 grip_delay_s=1.5,     # after the grasp closes, wait this long before firing the macro
                  vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
                  release_settle_s=0.4, # pause after opening the gripper before withdrawing
                  open_grip=0.0,        # 0 = open (release)
@@ -312,6 +313,7 @@ class NoFlipPlaceMacro:
         if hasattr(self.detector, "debug"):
             self.detector.debug = bool(debug)             # route scan diagnostics to stdout
         self.commit_s = float(commit_s)
+        self.grip_delay_s = float(grip_delay_s)
         self.vel_frac = float(vel_frac)
         self.release_settle_s = float(release_settle_s)
         self.open_grip = float(open_grip)
@@ -322,9 +324,10 @@ class NoFlipPlaceMacro:
                                       #   for commit_s, or on reset().
         self._seen_since = None       # monotonic time the current unbroken barcode streak began
         self._absent_since = None     # monotonic time the barcode last went out of view (unlock timer)
+        self._grip_closed_since = None  # monotonic time the grasp closed (grip-settle timer before firing)
         self._fired = False           # macro ran for the current committed cycle (for status display)
-        log.info("NoFlipPlaceMacro ready: %d waypoints, commit=%.0fs vel=%.0f%% max, detector=%s",
-                 len(self.path), self.commit_s, self.vel_frac * 100,
+        log.info("NoFlipPlaceMacro ready: %d waypoints, commit=%.0fs grip_delay=%.1fs vel=%.0f%% max, "
+                 "detector=%s", len(self.path), self.commit_s, self.grip_delay_s, self.vel_frac * 100,
                  type(self.detector).__name__ if self.detector is not None else "None (disabled)")
 
     def _should_place(self, env, arm14) -> bool:
@@ -373,8 +376,10 @@ class NoFlipPlaceMacro:
         """Auto-loop hook: True => the macro ran this cycle (caller should skip predicting). Two stages:
 
           1. scan() — continuous detection + commit latch (see scan()).
-          2. FIRE — once committed AND the object is grasped (right gripper commanded closed), the
-             scripted place runs; the latch then CLEARS so the next object must earn its own commit.
+          2. FIRE — once committed AND the object has been grasped (right gripper commanded closed) for
+             grip_delay_s, the scripted place runs; the latch then CLEARS so the next object must earn
+             its own commit. The grip_delay_s wait lets the grasp/lift settle so the macro doesn't jump
+             in the instant the fingers close.
 
         No-op (returns False) while disabled or while no detector is wired, so it is safe by default."""
         if not self.enabled:
@@ -382,15 +387,24 @@ class NoFlipPlaceMacro:
         arm14 = env._read_arm14()
         self.scan(env, arm14)                        # 1. continuous scan + commit latch (no motion)
 
-        # 2. fire once committed and something is actually grasped
+        # 2. fire once committed and the object has been grasped for grip_delay_s
+        now = time.monotonic()
         grip = getattr(env, "_last_grip_cmd", None)
         grip_closed = grip is not None and grip[R_GRIP_IDX] >= 1
-        if self.committed and grip_closed and arm14 is not None:
-            log.warning("[no-flip-place] committed + grasped -> stop auto, run no-flip place")
+        if not grip_closed:
+            self._grip_closed_since = None           # released -> reset the grip-settle timer
+        elif self._grip_closed_since is None:
+            self._grip_closed_since = now            # grasp just closed -> start the settle timer
+        settled = (self._grip_closed_since is not None
+                   and (now - self._grip_closed_since) >= self.grip_delay_s)
+        if self.committed and grip_closed and settled and arm14 is not None:
+            log.warning("[no-flip-place] committed + grasped %.1fs -> stop auto, run no-flip place",
+                        now - self._grip_closed_since)
             self._run(env, np.asarray(arm14, dtype=np.float64))
             self.committed = False                   # lock resets after the macro fires
             self._seen_since = None
             self._absent_since = None
+            self._grip_closed_since = None
             self._fired = True
             return True
         return False
@@ -467,4 +481,5 @@ class NoFlipPlaceMacro:
         self.committed = False
         self._seen_since = None
         self._absent_since = None
+        self._grip_closed_since = None
         self._fired = False
