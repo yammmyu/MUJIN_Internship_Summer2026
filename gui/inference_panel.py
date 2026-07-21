@@ -142,6 +142,35 @@ class InferenceMixin:
         self.status_text.set("■ Auto-run stopped (queue drains naturally; E-stop halts immediately)")
         self._refresh_tuning_state()         # idle again -> unlock tuning
 
+    def _update_no_flip_indicator(self):
+        """Repaint the no-flip barcode pill from the macro's live status (~4 Hz). Green when a barcode
+        is currently seen (-> the item will be placed flat); grey when off / not loaded; amber when the
+        macro is armed but its barcode reader (zxing-cpp) isn't available."""
+        ind = getattr(self, "_no_flip_ind", None)
+        if ind is None:
+            return
+        th = self.theme
+        try:
+            st = self.inference.no_flip_place_status()
+        except Exception:
+            st = None
+        try:
+            if not st or not st.get("has_detector"):        # no macro / no detection cue wired
+                ind.config(text="○  no-flip: n/a", bg=th.APP_BG, fg=th.DOT_OFF)
+            elif not st.get("enabled"):
+                ind.config(text="○  no-flip: off", bg=th.APP_BG, fg=th.DOT_OFF)
+            elif st.get("available") is False:              # armed but zxing-cpp missing
+                ind.config(text="▲  reader missing", bg=th.WARN_SOFT, fg=th.WARN_DARK)
+            elif st.get("barcode_seen"):
+                txt = st.get("barcode_text")
+                label = f"●  barcode → placing flat" + (f"  ({txt})" if txt else "")
+                ind.config(text=label, bg=th.SUCCESS, fg="white")
+            else:
+                ind.config(text="◌  watching for barcode", bg=th.BRAND_SOFT, fg=th.BRAND_INK)
+        except tk.TclError:
+            return                                          # widget destroyed (window closed) -> stop
+        self.root.after(250, self._update_no_flip_indicator)
+
     # ------------------------------------------------------------------ #
     #  真机释放（手动单步路径）                                             #
     # ------------------------------------------------------------------ #
@@ -492,6 +521,28 @@ class InferenceMixin:
         self.tip(self._flip_place_cb,
                  "After the policy grabs, lifts and flips, automatically run the scripted release "
                  "(move out, open gripper, return). Safe to toggle mid-run.")
+
+        # No-flip release macro: when a camera sees a BARCODE on the grasped package it is right-side-up
+        # and must NOT be flipped, so place it as-is. Checkbox arms it; the pill to its right is a LIVE
+        # indicator (repainted ~4 Hz by _update_no_flip_indicator) of the barcode detection.
+        nfp_row = ttk.Frame(sec_auto)
+        nfp_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._no_flip_place_var = tk.BooleanVar(value=bool(self.inference.no_flip_place_enabled))
+        self._no_flip_place_cb = ttk.Checkbutton(
+            nfp_row, text="Place flat when a barcode is seen (skip flip)",
+            variable=self._no_flip_place_var,
+            command=lambda: setattr(self.inference, "no_flip_place_enabled", self._no_flip_place_var.get()))
+        self._no_flip_place_cb.pack(side=tk.LEFT)
+        if getattr(self.inference, "no_flip_place", None) is None:
+            self._no_flip_place_cb.state(["disabled"])
+        self.tip(self._no_flip_place_cb,
+                 "If a wrist/head camera reads a barcode on the grasped item, skip the flip and run the "
+                 "scripted release to place it as-is. Safe to toggle mid-run.")
+        # Live barcode indicator pill (green when a barcode is currently seen).
+        self._no_flip_ind = tk.Label(nfp_row, text="●  barcode", font=self.theme.ui(9, "bold"),
+                                     bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
+        self._no_flip_ind.pack(side=tk.RIGHT)
+        self._update_no_flip_indicator()          # paint once now + start the ~4 Hz refresh
 
         # (Emergency stop lives in the pinned bar at the top of this column — always reachable.)
 

@@ -2,6 +2,7 @@ numpy
 protobuf==3.12.4
 ruckig
 opencv-python==4.10.0.84
+zxing-cpp==3.1.0          # barcode read for no_flip_place.py (BarcodeGate); RGB-frame decode
 scipy
 zmq==0.0.0
 pyzmq==26.2.0

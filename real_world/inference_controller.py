@@ -185,6 +185,20 @@ class InferenceController:
         except Exception as e:
             log.warning("flip-place disabled (failed to init): %r", e)
 
+        # No-flip-place release macro (opt-in): when a camera sees a BARCODE on the grasped package it
+        # is oriented right-side-up and must NOT be flipped, so place it as-is — see
+        # real_world/no_flip_place.py. Barcode-armed, so it fires (before the flip macro) only on
+        # packages that show a code; inert otherwise.
+        self.no_flip_place = None
+        try:
+            from real_world.no_flip_place import NoFlipPlaceMacro, DEFAULT_PATH as NFP_PATH
+            if os.path.exists(NFP_PATH):
+                self.no_flip_place = NoFlipPlaceMacro()
+            else:
+                log.warning("no-flip-place disabled: release path not found at %s", NFP_PATH)
+        except Exception as e:
+            log.warning("no-flip-place disabled (failed to init): %r", e)
+
     def _trace(self, name, obj):
         """Append one JSON line to the named trace file (no-op if that file's handle isn't open:
         buffer is always open; requests/chunks only under TRACE_JSONL)."""
@@ -437,6 +451,26 @@ class InferenceController:
         elif v:
             log.warning("flip-place cannot be enabled: no macro loaded (baked release path missing).")
 
+    @property
+    def no_flip_place_enabled(self):
+        """Whether the barcode-triggered no-flip release macro is armed. False (or no macro loaded)
+        -> it never fires and auto inference just keeps running (the flip path still applies)."""
+        nfp = getattr(self, "no_flip_place", None)
+        return nfp is not None and nfp.enabled
+
+    @no_flip_place_enabled.setter
+    def no_flip_place_enabled(self, v):
+        nfp = getattr(self, "no_flip_place", None)
+        if nfp is not None:
+            nfp.enabled = bool(v)
+        elif v:
+            log.warning("no-flip-place cannot be enabled: no macro loaded (baked release path missing).")
+
+    def no_flip_place_status(self):
+        """Live snapshot for the GUI barcode indicator, or None if no macro is loaded."""
+        nfp = getattr(self, "no_flip_place", None)
+        return nfp.status() if nfp is not None else None
+
     def inference_once(self) -> bool:
         """Predict + publish only (no execution).
 
@@ -524,6 +558,9 @@ class InferenceController:
             fp = getattr(self, "flip_place", None)
             if fp is not None:
                 fp.reset()
+            nfp = getattr(self, "no_flip_place", None)
+            if nfp is not None:
+                nfp.reset()
             # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
             # the env E-stop to halt immediately instead.)
             return
@@ -570,8 +607,18 @@ class InferenceController:
                     fp = getattr(self, "flip_place", None)
                     if fp is not None:
                         fp.reset()                         # disarm the flip macro too
+                    nfp = getattr(self, "no_flip_place", None)
+                    if nfp is not None:
+                        nfp.reset()                        # ...and the no-flip macro
                     self.is_auto_inference = False
                     break
+                # No-flip-place: if a camera sees a barcode on the grasped package it is right-side-up
+                # and must NOT be flipped, so place it as-is. Checked BEFORE the flip macro so a barcode
+                # (seen right after the grasp) takes over before the wrist ever swings; on packages
+                # without a barcode this is inert and the flip path below runs instead.
+                nfp = getattr(self, "no_flip_place", None)
+                if nfp is not None and nfp.maybe_trigger(self.humanoid_env):
+                    continue
                 # Flip-place release macro: once the policy's grab+lift+flip completes, this stops
                 # predicting, moves out to the fixed release pose, opens the gripper, and comes back —
                 # all inline (clears every queue before/after so auto resumes without snapping).

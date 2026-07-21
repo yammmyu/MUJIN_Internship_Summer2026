@@ -319,6 +319,31 @@ class DemoInference(_Stub):
         self.te_buffer_len = 4
         self.is_auto_inference = False
         self._steps = 0
+        # No-flip barcode macro stand-in: a non-None marker keeps the GUI checkbox enabled, and
+        # no_flip_place_status() below reports a barcode as "seen" for part of each cycle so the live
+        # indicator pill visibly blinks green in the demo.
+        self.no_flip_place = object()
+        self._no_flip_enabled = True
+
+    @property
+    def no_flip_place_enabled(self):
+        return self._no_flip_enabled
+
+    @no_flip_place_enabled.setter
+    def no_flip_place_enabled(self, v):
+        self._no_flip_enabled = bool(v)
+
+    def no_flip_place_status(self):
+        phase = _clock()
+        seen = self._no_flip_enabled and (phase % 10.0) > 6.5   # synthetic "barcode visible" window
+        return {
+            "enabled": self._no_flip_enabled,
+            "has_detector": True,
+            "available": True,
+            "barcode_seen": seen,
+            "barcode_text": "DEMO-5901234123457" if seen else None,
+            "fired": False,
+        }
 
     def start(self):
         return None
