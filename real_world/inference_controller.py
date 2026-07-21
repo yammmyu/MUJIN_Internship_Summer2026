@@ -471,6 +471,18 @@ class InferenceController:
         nfp = getattr(self, "no_flip_place", None)
         return nfp.status() if nfp is not None else None
 
+    def no_flip_place_scan(self):
+        """Advance barcode detection one tick WITHOUT firing. Lets the GUI keep the live indicator
+        responsive while auto-run is OFF (the auto loop already scans while running). No-op if there's
+        no macro / env; failures are swallowed so a camera hiccup can never disturb the UI thread."""
+        nfp = getattr(self, "no_flip_place", None)
+        env = self.humanoid_env
+        if nfp is not None and env is not None:
+            try:
+                nfp.scan(env)
+            except Exception as e:
+                log.debug("no-flip-place idle scan skipped: %r", e)
+
     def inference_once(self) -> bool:
         """Predict + publish only (no execution).
 
@@ -574,6 +586,9 @@ class InferenceController:
         self.is_auto_inference = True
         if hasattr(env, "reset_grip_latch"):
             env.reset_grip_latch()                         # fresh run -> gripper can re-latch from scratch
+        nfp = getattr(self, "no_flip_place", None)
+        if nfp is not None:
+            nfp.reset()                                    # drop any idle pre-arm; decide live this run
 
         def _run_auto_inference():
             # Home to a fixed START pose (absolute joints, slow) BEFORE any server call, so every run

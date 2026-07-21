@@ -154,6 +154,14 @@ class InferenceMixin:
         if ind is None:
             return
         th = self.theme
+        # While auto-run is OFF, actively drive one scan tick so the indicator responds to a barcode
+        # held under a camera even when idle. During auto the loop already scans, so skip (avoid double
+        # work). Failures are swallowed inside no_flip_place_scan.
+        try:
+            if not getattr(self.inference, "is_auto_inference", False):
+                self.inference.no_flip_place_scan()
+        except Exception:
+            pass
         try:
             st = self.inference.no_flip_place_status()
         except Exception:

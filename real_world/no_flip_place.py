@@ -29,8 +29,10 @@ Detection cue — BARCODE, with a commit LATCH:
     the wrist + head frames; see BarcodeGate. The port is open: pass your own
     detector=callable(env, arm14)->bool (or None to disable) to swap the cue.
 
-    "Continuous" means every tick of the auto loop; the scan is still driven by that loop, so it runs
-    only while auto-run is active (there is no separate always-on scanner thread).
+    "Continuous" = scan() runs every auto tick while running; the GUI also calls scan() on its refresh
+    while auto is OFF, so the live indicator responds to a barcode even when idle (only scan() runs then
+    — never the FIRE stage). The commit latch is reset when auto-run STARTS, so an idle pre-arm drives
+    only the indicator and the real decision is re-made live during the run.
 
 Integration (one call-in in InferenceController._run_auto_inference, top of loop):
     nfp = getattr(self, "no_flip_place", None)
@@ -170,21 +172,14 @@ class NoFlipPlaceMacro:
             return bool(self.detector(env, arm14))
         return False
 
-    def maybe_trigger(self, env) -> bool:
-        """Loop hook: True => the macro ran this cycle (caller should skip predicting). Two stages:
-
-          1. CONTINUOUS scan — every tick (NOT gated by the grasp) the detector runs; a barcode seen
-             for an unbroken commit_s LATCHES ``self.committed`` = "the next place is no-flip". The
-             latch persists even if the barcode then leaves view (e.g. the gripper occludes it).
-          2. FIRE — once committed AND the object is grasped (right gripper commanded closed), the
-             scripted place runs; the latch then CLEARS so the next object must earn its own commit.
-
-        No-op (returns False) while disabled or while no detector is wired, so it is safe by default."""
+    def scan(self, env, arm14=None) -> bool:
+        """One detection tick: run the detector and update the commit latch. Does NOT fire / move the
+        robot, so it is safe to call outside the auto loop — e.g. the GUI calls it while auto is OFF so
+        the live indicator still responds to a barcode held under a camera. A barcode seen for an
+        unbroken commit_s LATCHES ``self.committed``; the latch persists even if the barcode then leaves
+        view. Returns the current committed state. No-op while disabled."""
         if not self.enabled:
-            return False
-        arm14 = env._read_arm14()
-
-        # 1. continuous scan + commit latch
+            return self.committed
         now = time.monotonic()
         if self._should_place(env, arm14):           # PORT: a barcode is visible this tick
             if self._seen_since is None:
@@ -196,6 +191,20 @@ class NoFlipPlaceMacro:
                             self.commit_s)
         else:
             self._seen_since = None                  # streak broken; the LATCH (if set) stays
+        return self.committed
+
+    def maybe_trigger(self, env) -> bool:
+        """Auto-loop hook: True => the macro ran this cycle (caller should skip predicting). Two stages:
+
+          1. scan() — continuous detection + commit latch (see scan()).
+          2. FIRE — once committed AND the object is grasped (right gripper commanded closed), the
+             scripted place runs; the latch then CLEARS so the next object must earn its own commit.
+
+        No-op (returns False) while disabled or while no detector is wired, so it is safe by default."""
+        if not self.enabled:
+            return False
+        arm14 = env._read_arm14()
+        self.scan(env, arm14)                        # 1. continuous scan + commit latch (no motion)
 
         # 2. fire once committed and something is actually grasped
         grip = getattr(env, "_last_grip_cmd", None)
