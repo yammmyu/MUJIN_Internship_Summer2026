@@ -143,9 +143,13 @@ class InferenceMixin:
         self._refresh_tuning_state()         # idle again -> unlock tuning
 
     def _update_no_flip_indicator(self):
-        """Repaint the no-flip barcode pill from the macro's live status (~4 Hz). Green when a barcode
-        is currently seen (-> the item will be placed flat); grey when off / not loaded; amber when the
-        macro is armed but its barcode reader (zxing-cpp) isn't available."""
+        """Repaint the no-flip barcode pill from the macro's live status (~4 Hz):
+          * grey  — off / not loaded
+          * amber — armed but the barcode reader (zxing-cpp) is missing
+          * green (solid) — LOCKED: a barcode was held long enough; the next place is no-flip
+          * blue  — a barcode is currently visible, counting up toward the lock (shows s / commit_s)
+          * faint blue — armed, watching, no barcode in view
+        """
         ind = getattr(self, "_no_flip_ind", None)
         if ind is None:
             return
@@ -161,12 +165,16 @@ class InferenceMixin:
                 ind.config(text="○  no-flip: off", bg=th.APP_BG, fg=th.DOT_OFF)
             elif st.get("available") is False:              # armed but zxing-cpp missing
                 ind.config(text="▲  reader missing", bg=th.WARN_SOFT, fg=th.WARN_DARK)
-            elif st.get("barcode_seen"):
+            elif st.get("committed"):                       # the lock is set -> next place is no-flip
                 txt = st.get("barcode_text")
-                label = f"●  barcode → placing flat" + (f"  ({txt})" if txt else "")
+                label = "●  LOCKED — next place: no-flip" + (f"  ({txt})" if txt else "")
                 ind.config(text=label, bg=th.SUCCESS, fg="white")
+            elif st.get("barcode_seen"):                    # visible, counting toward the lock
+                held = float(st.get("commit_progress", 0.0)) * float(st.get("commit_s", 0.0))
+                ind.config(text=f"◍  barcode  {held:.1f} / {st.get('commit_s', 0):.0f}s",
+                           bg=th.BRAND_SOFT, fg=th.BRAND_INK)
             else:
-                ind.config(text="◌  watching for barcode", bg=th.BRAND_SOFT, fg=th.BRAND_INK)
+                ind.config(text="◌  watching for barcode", bg=th.APP_BG, fg=th.DOT_OFF)
         except tk.TclError:
             return                                          # widget destroyed (window closed) -> stop
         self.root.after(250, self._update_no_flip_indicator)
@@ -536,8 +544,9 @@ class InferenceMixin:
         if getattr(self.inference, "no_flip_place", None) is None:
             self._no_flip_place_cb.state(["disabled"])
         self.tip(self._no_flip_place_cb,
-                 "If a wrist/head camera reads a barcode on the grasped item, skip the flip and run the "
-                 "scripted release to place it as-is. Safe to toggle mid-run.")
+                 "Scan the wrist/head cameras continuously; once a barcode is held ~6 s the next place "
+                 "locks to no-flip (place as-is via the scripted release), and the lock clears after it "
+                 "fires. Safe to toggle mid-run.")
         # Live barcode indicator pill (green when a barcode is currently seen).
         self._no_flip_ind = tk.Label(nfp_row, text="●  barcode", font=self.theme.ui(9, "bold"),
                                      bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
