@@ -575,7 +575,7 @@ class InferenceMixin:
         if getattr(self.inference, "no_flip_place", None) is None:
             self._no_flip_place_cb.state(["disabled"])
         self.tip(self._no_flip_place_cb,
-                 "Scan the wrist/head cameras continuously; once a barcode is held ~6 s the next place "
+                 "Scan the head camera continuously; once a barcode is held ~6 s the next place "
                  "locks to no-flip (place as-is via the scripted release), and the lock clears after it "
                  "fires. Safe to toggle mid-run.")
         # Live barcode indicator pill (green when a barcode is currently seen).

@@ -26,7 +26,7 @@ Detection cue — BARCODE, with a commit LATCH:
     dropped again in any of three ways: the scripted place fires (once the object is grasped), the
     barcode stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
     gripper crossing the code during the grasp) is tolerated — only a full commit_s of absence unlocks.
-    Detection uses the zxing-cpp library (`pip install zxing-cpp`) over the wrist + head frames; see
+    Detection uses the zxing-cpp library (`pip install zxing-cpp`) over the HEAD camera frame; see
     BarcodeGate. The port is open: pass your own detector=callable(env, arm14)->bool (or None) to swap.
 
     "Continuous" = scan() runs every auto tick while running; the GUI also calls scan() on its refresh
@@ -48,9 +48,9 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# Cameras to scan for a barcode, in order. The right wrist eye-in-hand camera looks straight at the
-# object the right gripper is holding; the head camera is a wider fallback. (Names per humanoid_env.)
-BARCODE_CAMERAS = ("hand_right", "head")
+# Camera(s) to scan for a barcode. Only the HEAD camera is used — the operator presents the barcode
+# to the head camera to decide no-flip. (Name per humanoid_env AGENT_CAMERA.)
+BARCODE_CAMERAS = ("head",)
 
 # Placeholder: reuses the flip variant's recorded path so the macro is runnable today. Swap this for a
 # dedicated no-flip placement path once one is recorded (the release EE point likely differs).
