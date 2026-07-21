@@ -84,6 +84,8 @@ class BarcodeGate:
         self.last_camera = None           # which camera saw it
         self.last_seen_monotonic = 0.0    # time.monotonic() of the last hit (0 = never)
         self.last_frame_cams = ()         # cameras that delivered a frame on the last scan (diagnostics)
+        self.debug = False                # set True (via NoFlipPlaceMacro debug) to print per-scan diag
+        self._last_diag = 0.0             # throttle timer for the debug print
         try:
             import zxingcpp
             self._zxing = zxingcpp
@@ -104,15 +106,21 @@ class BarcodeGate:
     def __call__(self, env, arm14) -> bool:
         if self._zxing is None:
             self.last_frame_cams = ()
+            self._diag("zxing-cpp NOT available (reader missing)")
             return False
         got = []                                      # cameras that actually delivered a frame this scan
+        diag = []                                     # per-camera one-liners for the debug print
+        hit = False
         for name in self.cameras:
             frame = env.get_frame(name)               # also request()s the camera -> switches it ON
             if frame is None:                         # not warmed up / not streaming yet
+                diag.append(f"{name}=NO-FRAME")
                 continue
             got.append(name)
+            shape = getattr(frame, "shape", None)
             frame = self._as_uint8_rgb(frame)         # coerce to what zxing expects (drop alpha, etc.)
             if frame is None:
+                diag.append(f"{name}=BAD-FMT{shape}")
                 continue
             try:
                 if self.symbologies is not None:
@@ -120,10 +128,13 @@ class BarcodeGate:
                 else:
                     results = self._zxing.read_barcodes(frame)
             except Exception as e:                    # never let a decode hiccup kill the auto loop
+                diag.append(f"{name}=ERR({e})")
                 if not self._warned:
                     log.warning("[no-flip-place] barcode read failed on '%s': %s", name, e)
                     self._warned = True
                 continue
+            texts = [r.text for r in results if r.text]
+            diag.append(f"{name}{shape}={len(texts)}code(s)" + (f":{texts[0]}" if texts else ""))
             for r in results:
                 if r.text:                            # a barcode was decoded -> it is seen
                     self.last_text = r.text            # publish live state for the GUI indicator
@@ -133,9 +144,20 @@ class BarcodeGate:
                     self.last_frame_cams = tuple(got)
                     log.info("[no-flip-place] barcode seen on '%s' (%s: %s) -> place without flipping",
                              name, r.format, r.text)
+                    self._diag("  ".join(diag))
                     return True
         self.last_frame_cams = tuple(got)             # for diagnostics: which cams are feeding frames
-        return False
+        self._diag("  ".join(diag) if diag else "(no cameras configured)")
+        return hit
+
+    def _diag(self, msg):
+        """Throttled (~1 Hz) diagnostic print of what the scan saw, gated by self.debug."""
+        if not self.debug:
+            return
+        now = time.monotonic()
+        if now - self._last_diag >= 1.0:
+            self._last_diag = now
+            print(f"[no-flip scan] cams={list(self.cameras)}  {msg}")
 
     @staticmethod
     def _as_uint8_rgb(frame):
@@ -164,12 +186,15 @@ class NoFlipPlaceMacro:
                  commit_s=6.0,         # a barcode must be seen CONTINUOUSLY this long to LATCH no-flip
                  vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
                  release_settle_s=0.4, # pause after opening the gripper before withdrawing
-                 open_grip=0.0):       # 0 = open (release)
+                 open_grip=0.0,        # 0 = open (release)
+                 debug=True):          # print a throttled per-scan diagnostic (frames + decode results)
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints
         if self.path.ndim != 2 or self.path.shape[1] != 14:
             raise ValueError(f"no-flip release path must be (M,14); got {self.path.shape}")
         # default cue = barcode seen -> don't flip; pass detector=None to disable, or your own callable
         self.detector = BarcodeGate() if detector is self._UNSET else detector
+        if hasattr(self.detector, "debug"):
+            self.detector.debug = bool(debug)             # route scan diagnostics to stdout
         self.commit_s = float(commit_s)
         self.vel_frac = float(vel_frac)
         self.release_settle_s = float(release_settle_s)

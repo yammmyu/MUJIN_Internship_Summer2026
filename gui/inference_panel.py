@@ -5,6 +5,7 @@
 import json
 import pathlib
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -156,16 +157,18 @@ class InferenceMixin:
         th = self.theme
         # While auto-run is OFF, actively drive one scan tick so the indicator responds to a barcode
         # held under a camera even when idle. During auto the loop already scans, so skip (avoid double
-        # work). Failures are swallowed inside no_flip_place_scan.
+        # work). Failures are surfaced (not swallowed) so a broken scan is visible while debugging.
+        scan_err = None
         try:
             if not getattr(self.inference, "is_auto_inference", False):
                 self.inference.no_flip_place_scan()
-        except Exception:
-            pass
+        except Exception as e:
+            scan_err = e
         try:
             st = self.inference.no_flip_place_status()
-        except Exception:
+        except Exception as e:
             st = None
+            scan_err = scan_err or e
 
         # Classify into one discrete state, then paint the pill AND (on state CHANGES) push a one-time
         # status-bar message — so there are two distinct events: "barcode detected" the instant it is
@@ -207,6 +210,21 @@ class InferenceMixin:
                 self.status_text.set("● Barcode held — LOCKED: the next item will be placed flat "
                                      "(no flip)" + (f"  [{txt}]" if txt else ""))
             self._no_flip_prev_state = state
+
+        # Throttled (~1 Hz) UI-side diagnostic: proves the refresh loop is alive and shows what status
+        # it got + what it painted. Compare with the "[no-flip scan]" backend line: if these print but
+        # the pill doesn't move -> display issue; if status never flips barcode_seen -> code/detection.
+        now = time.monotonic()
+        if now - getattr(self, "_no_flip_diag_t", 0.0) >= 1.0:
+            self._no_flip_diag_t = now
+            auto = getattr(self.inference, "is_auto_inference", False)
+            if scan_err is not None:
+                print(f"[no-flip UI] refresh alive, auto={auto}, SCAN ERROR: {scan_err!r}")
+            else:
+                keys = ("available", "frames_ok", "frame_cams", "barcode_seen", "commit_progress",
+                        "committed")
+                brief = {k: st.get(k) for k in keys} if st else None
+                print(f"[no-flip UI] refresh alive, auto={auto}, state={state!r}, status={brief}")
 
         self.root.after(250, self._update_no_flip_indicator)
 
