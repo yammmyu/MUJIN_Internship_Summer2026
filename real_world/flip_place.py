@@ -6,7 +6,7 @@ module watches for the flip completing and then, INLINE in the auto loop, takes 
 
     1. stop predicting + clear ALL queues (so nothing stale runs)
     2. move the RIGHT arm from its LIVE flip-complete pose to a FIXED release pose, following the
-       shape recorded in recording107 (real_world/assets/flip_release_path.npy), OPEN the gripper
+       shape recorded in recording206 (real_world/assets/flip_release_path.npy), OPEN the gripper
        there (release), then reverse the exact same path back to the live start
     3. clear everything again and hand back -> auto inference resumes from the live pose
 
@@ -14,7 +14,7 @@ Design decisions (see the plan discussion):
   * JOINT space, not EE: the flip is a ~180 deg wrist swing; a fixed END joint config guarantees the
     same release EE point via FK with NO IK (no redundancy branch-flip / wrong-direction wrist).
   * The start ADAPTS to wherever the flip ended up (varies), the END is FIXED: a decaying-offset warp
-    re-anchors recording107's shape so out[0]=live pose and out[-1]=the recorded release config.
+    re-anchors recording206's shape so out[0]=live pose and out[-1]=the recorded release config.
   * Slow + smooth: streamed at vel_frac of max joint velocity, subdivided, from the live pose (zero
     seam); recording lightly pre-smoothed offline.
   * No snap on return: the robot queue + staging + merge buffer + grip latch are ALL cleared before

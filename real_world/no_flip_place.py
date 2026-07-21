@@ -60,9 +60,9 @@ ARUCO_DICT = "DICT_4X4_50"
 # to the head camera to decide no-flip. (Name per humanoid_env AGENT_CAMERA.)
 BARCODE_CAMERAS = ("head",)
 
-# Placeholder: reuses the flip variant's recorded path so the macro is runnable today. Swap this for a
-# dedicated no-flip placement path once one is recorded (the release EE point likely differs).
-DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "assets", "flip_release_path.npy")
+# No-flip reach+release path, built from recording205 (see scripts/build_release_path.py). Distinct
+# from the flip variant's flip_release_path.npy (recording206) — the two cases use different releases.
+DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "assets", "no_flip_release_path.npy")
 
 R_GRIP_IDX = 1          # right channel in a [gl, gr] gripper command
 
