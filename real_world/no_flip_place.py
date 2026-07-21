@@ -19,15 +19,18 @@ Design decisions (shared with the flip variant):
   * No snap on return: robot queue + staging + merge buffer + grip latch are ALL cleared before and
     after, and the arm ends at the live start, so the first resumed inference is fresh.
 
-Detection cue — BARCODE, with a commit LATCH:
-    A package that shows a barcode is oriented correctly and must NOT be flipped. The detector scans
-    CONTINUOUSLY every auto tick (not gated by the grasp). When a barcode is seen for an unbroken
+Detection cue — ARUCO MARKER, with a commit LATCH:
+    A package that shows an ArUco marker is oriented correctly and must NOT be flipped. The detector
+    scans CONTINUOUSLY every auto tick (not gated by the grasp). When a marker is seen for an unbroken
     ``commit_s`` (default 6 s) the macro LATCHES: it now knows the next place is no-flip. The latch is
     dropped again in any of three ways: the scripted place fires (once the object is grasped), the
-    barcode stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
-    gripper crossing the code during the grasp) is tolerated — only a full commit_s of absence unlocks.
-    Detection uses the zxing-cpp library (`pip install zxing-cpp`) over the HEAD camera frame; see
-    BarcodeGate. The port is open: pass your own detector=callable(env, arm14)->bool (or None) to swap.
+    marker stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
+    gripper crossing the marker during the grasp) is tolerated — only a full commit_s of absence unlocks.
+    Detection uses OpenCV's cv2.aruco (no extra dependency) over the HEAD camera frame; see ArucoGate.
+    ArUco is chosen over a 1-D barcode / QR because it decodes at a far smaller on-screen size (~12 px
+    vs ~200 px for EAN-13) and tolerates angle — the head camera's wide FOV makes 1-D codes unreadable
+    unless held right against the lens. The port is open: pass your own detector=callable(env,
+    arm14)->bool (or None) to swap the cue; BarcodeGate (zxing-cpp) remains available for that.
 
     "Continuous" = scan() runs every auto tick while running; the GUI also calls scan() on its refresh
     while auto is OFF, so the live indicator responds to a barcode even when idle (only scan() runs then
@@ -44,9 +47,14 @@ import logging
 import os
 import time
 
+import cv2
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# ArUco dictionary: 4x4 markers (small, robust, 50 ids). Present the operator a printed marker from
+# this dict (see scripts/barcode_webcam_test.py --make-aruco, or cv2.aruco.generateImageMarker).
+ARUCO_DICT = "DICT_4X4_50"
 
 # Camera(s) to scan for a barcode. Only the HEAD camera is used — the operator presents the barcode
 # to the head camera to decide no-flip. (Name per humanoid_env AGENT_CAMERA.)
@@ -57,6 +65,113 @@ BARCODE_CAMERAS = ("head",)
 DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "assets", "flip_release_path.npy")
 
 R_GRIP_IDX = 1          # right channel in a [gl, gr] gripper command
+
+
+class ArucoGate:
+    """Detection port for the no-flip case: "does the head camera see an ArUco marker?".
+
+    A visible marker means the package is oriented right-side-up and must NOT be flipped, so the macro
+    should place it as-is. Uses OpenCV's cv2.aruco (bundled with opencv-python; no extra dependency),
+    which locates 4x4 markers down to ~12 px on-screen and tolerates rotation — far better at the head
+    camera's distance/FOV than a 1-D barcode. A marker counts as SEEN when detected; pass ids=(7, ...)
+    to only accept specific marker id(s), else any marker in the dictionary counts.
+
+    Callable, so it drops straight into NoFlipPlaceMacro(detector=...). The commit_s latch debounces it
+    (a marker must be held that long before no-flip locks in).
+    """
+
+    def __init__(self, cameras=BARCODE_CAMERAS, *, dict_name=ARUCO_DICT, ids=None):
+        self.cameras = tuple(cameras)
+        self.ids = set(ids) if ids is not None else None   # None => accept any marker id
+        self.dict_name = dict_name
+        self._warned = False
+        self.last_text = None             # "id=<n>" of the most recent hit (for the GUI indicator)
+        self.last_id = None
+        self.last_camera = None
+        self.last_seen_monotonic = 0.0
+        self.last_frame_cams = ()
+        self.debug = False
+        self._last_diag = 0.0
+        try:
+            aruco = cv2.aruco
+            dictionary = aruco.getPredefinedDictionary(getattr(aruco, dict_name))
+            self._detector = aruco.ArucoDetector(dictionary, aruco.DetectorParameters())
+        except Exception as e:
+            self._detector = None
+            log.error("[no-flip-place] cv2.aruco unavailable (%r); marker detection disabled -> "
+                      "macro will never fire", e)
+
+    @property
+    def available(self) -> bool:
+        """True when the ArUco detector built (i.e. detection can actually run)."""
+        return self._detector is not None
+
+    def seen_within(self, hold_s) -> bool:
+        """Was a marker detected in the last `hold_s` seconds? (drives the live GUI indicator)."""
+        return self.last_seen_monotonic > 0.0 and (time.monotonic() - self.last_seen_monotonic) < hold_s
+
+    def __call__(self, env, arm14) -> bool:
+        if self._detector is None:
+            self.last_frame_cams = ()
+            self._diag("cv2.aruco NOT available (reader missing)")
+            return False
+        got, diag = [], []
+        for name in self.cameras:
+            frame = env.get_frame(name)               # also request()s the camera -> switches it ON
+            if frame is None:
+                diag.append(f"{name}=NO-FRAME")
+                continue
+            got.append(name)
+            shape = getattr(frame, "shape", None)
+            gray = self._as_gray(frame)
+            if gray is None:
+                diag.append(f"{name}=BAD-FMT{shape}")
+                continue
+            _corners, ids, _rej = self._detector.detectMarkers(gray)
+            found = [] if ids is None else [int(i) for i in ids.flatten()]
+            if self.ids is not None:
+                found = [i for i in found if i in self.ids]
+            diag.append(f"{name}{shape}={len(found)}marker(s)" + (f":{found}" if found else ""))
+            if found:
+                self.last_id = found[0]
+                self.last_text = f"id={found[0]}"
+                self.last_camera = name
+                self.last_seen_monotonic = time.monotonic()
+                self.last_frame_cams = tuple(got)
+                log.info("[no-flip-place] ArUco marker %s seen on '%s' -> place without flipping",
+                         found, name)
+                self._diag("  ".join(diag))
+                return True
+        self.last_frame_cams = tuple(got)
+        self._diag("  ".join(diag) if diag else "(no cameras configured)")
+        return False
+
+    def _diag(self, msg):
+        """Throttled (~1 Hz) diagnostic print of what the scan saw, gated by self.debug."""
+        if not self.debug:
+            return
+        now = time.monotonic()
+        if now - self._last_diag >= 1.0:
+            self._last_diag = now
+            print(f"[no-flip scan] cams={list(self.cameras)} dict={self.dict_name}  {msg}")
+
+    @staticmethod
+    def _as_gray(frame):
+        """Coerce a camera frame to a uint8 single-channel image for cv2.aruco. Colour order is
+        irrelevant (markers are black/white). Returns None for anything unusable."""
+        try:
+            if frame.dtype != np.uint8:
+                return None
+            if frame.ndim == 2:
+                return frame
+            if frame.ndim == 3:
+                if frame.shape[2] == 4:
+                    return cv2.cvtColor(frame, cv2.COLOR_RGBA2GRAY)
+                if frame.shape[2] == 3:
+                    return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            return None
+        except (AttributeError, cv2.error):
+            return None
 
 
 class BarcodeGate:
@@ -191,8 +306,9 @@ class NoFlipPlaceMacro:
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints
         if self.path.ndim != 2 or self.path.shape[1] != 14:
             raise ValueError(f"no-flip release path must be (M,14); got {self.path.shape}")
-        # default cue = barcode seen -> don't flip; pass detector=None to disable, or your own callable
-        self.detector = BarcodeGate() if detector is self._UNSET else detector
+        # default cue = ArUco marker seen -> don't flip; pass detector=None to disable, BarcodeGate()
+        # for zxing barcodes/QR, or your own callable
+        self.detector = ArucoGate() if detector is self._UNSET else detector
         if hasattr(self.detector, "debug"):
             self.detector.debug = bool(debug)             # route scan diagnostics to stdout
         self.commit_s = float(commit_s)
