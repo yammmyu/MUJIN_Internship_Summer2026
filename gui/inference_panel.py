@@ -143,12 +143,12 @@ class InferenceMixin:
         self._refresh_tuning_state()         # idle again -> unlock tuning
 
     def _update_no_flip_indicator(self):
-        """Repaint the no-flip barcode pill from the macro's live status (~4 Hz):
-          * grey  — off / not loaded
+        """Repaint the no-flip barcode pill from the macro's live status (~4 Hz), and push a one-time
+        status-bar message on the two key edges (first detection, and the 6 s lock):
+          * grey  — off / not loaded / watching (no barcode in view)
           * amber — armed but the barcode reader (zxing-cpp) is missing
-          * green (solid) — LOCKED: a barcode was held long enough; the next place is no-flip
-          * blue  — a barcode is currently visible, counting up toward the lock (shows s / commit_s)
-          * faint blue — armed, watching, no barcode in view
+          * blue  — barcode DETECTED (fires immediately), counting up toward the lock (s / commit_s)
+          * green (solid) — LOCKED: held commit_s; the next place is no-flip
         """
         ind = getattr(self, "_no_flip_ind", None)
         if ind is None:
@@ -166,25 +166,46 @@ class InferenceMixin:
             st = self.inference.no_flip_place_status()
         except Exception:
             st = None
+
+        # Classify into one discrete state, then paint the pill AND (on state CHANGES) push a one-time
+        # status-bar message — so there are two distinct events: "barcode detected" the instant it is
+        # first seen, and "LOCKED" when it has been held commit_s. seen_within's hold debounces flicker,
+        # so a steadily-held code fires each message once, not repeatedly.
+        commit_s = float(st.get("commit_s", 0.0)) if st else 0.0
+        held = float(st.get("commit_progress", 0.0)) * commit_s if st else 0.0
+        txt = st.get("barcode_text") if st else None
+        if not st or not st.get("has_detector"):
+            state, label, bg, fg = "na", "○  no-flip: n/a", th.APP_BG, th.DOT_OFF
+        elif not st.get("enabled"):
+            state, label, bg, fg = "off", "○  no-flip: off", th.APP_BG, th.DOT_OFF
+        elif st.get("available") is False:
+            state, label, bg, fg = "missing", "▲  reader missing", th.WARN_SOFT, th.WARN_DARK
+        elif st.get("committed"):
+            state = "locked"
+            label = "●  LOCKED — next place: no-flip" + (f"  ({txt})" if txt else "")
+            bg, fg = th.SUCCESS, "white"
+        elif st.get("barcode_seen"):
+            state = "seen"
+            label = f"◉  barcode detected  {held:.1f} / {commit_s:.0f}s"
+            bg, fg = th.BRAND_SOFT, th.BRAND_INK
+        else:
+            state, label, bg, fg = "watching", "◌  watching for barcode", th.APP_BG, th.DOT_OFF
+
         try:
-            if not st or not st.get("has_detector"):        # no macro / no detection cue wired
-                ind.config(text="○  no-flip: n/a", bg=th.APP_BG, fg=th.DOT_OFF)
-            elif not st.get("enabled"):
-                ind.config(text="○  no-flip: off", bg=th.APP_BG, fg=th.DOT_OFF)
-            elif st.get("available") is False:              # armed but zxing-cpp missing
-                ind.config(text="▲  reader missing", bg=th.WARN_SOFT, fg=th.WARN_DARK)
-            elif st.get("committed"):                       # the lock is set -> next place is no-flip
-                txt = st.get("barcode_text")
-                label = "●  LOCKED — next place: no-flip" + (f"  ({txt})" if txt else "")
-                ind.config(text=label, bg=th.SUCCESS, fg="white")
-            elif st.get("barcode_seen"):                    # visible, counting toward the lock
-                held = float(st.get("commit_progress", 0.0)) * float(st.get("commit_s", 0.0))
-                ind.config(text=f"◍  barcode  {held:.1f} / {st.get('commit_s', 0):.0f}s",
-                           bg=th.BRAND_SOFT, fg=th.BRAND_INK)
-            else:
-                ind.config(text="◌  watching for barcode", bg=th.APP_BG, fg=th.DOT_OFF)
+            ind.config(text=label, bg=bg, fg=fg)
         except tk.TclError:
             return                                          # widget destroyed (window closed) -> stop
+
+        prev = getattr(self, "_no_flip_prev_state", None)
+        if state != prev:
+            if state == "seen":
+                self.status_text.set("◉ Barcode detected — hold it in view to lock no-flip "
+                                     f"({commit_s:.0f}s)…")
+            elif state == "locked":
+                self.status_text.set("● Barcode held — LOCKED: the next item will be placed flat "
+                                     "(no flip)" + (f"  [{txt}]" if txt else ""))
+            self._no_flip_prev_state = state
+
         self.root.after(250, self._update_no_flip_indicator)
 
     # ------------------------------------------------------------------ #
