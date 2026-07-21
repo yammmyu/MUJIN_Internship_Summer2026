@@ -188,6 +188,8 @@ class InferenceMixin:
             state = "seen"
             label = f"◉  barcode detected  {held:.1f} / {commit_s:.0f}s"
             bg, fg = th.BRAND_SOFT, th.BRAND_INK
+        elif st.get("frames_ok") is False:              # scanning, but no camera frame is arriving
+            state, label, bg, fg = "nocam", "◌  waiting for camera…", th.WARN_SOFT, th.WARN_DARK
         else:
             state, label, bg, fg = "watching", "◌  watching for barcode", th.APP_BG, th.DOT_OFF
 

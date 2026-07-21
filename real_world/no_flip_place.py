@@ -83,6 +83,7 @@ class BarcodeGate:
         self.last_format = None           # symbology name of that hit
         self.last_camera = None           # which camera saw it
         self.last_seen_monotonic = 0.0    # time.monotonic() of the last hit (0 = never)
+        self.last_frame_cams = ()         # cameras that delivered a frame on the last scan (diagnostics)
         try:
             import zxingcpp
             self._zxing = zxingcpp
@@ -102,9 +103,15 @@ class BarcodeGate:
 
     def __call__(self, env, arm14) -> bool:
         if self._zxing is None:
+            self.last_frame_cams = ()
             return False
+        got = []                                      # cameras that actually delivered a frame this scan
         for name in self.cameras:
-            frame = env.get_frame(name)               # latest RGB frame (copy), or None while warming up
+            frame = env.get_frame(name)               # also request()s the camera -> switches it ON
+            if frame is None:                         # not warmed up / not streaming yet
+                continue
+            got.append(name)
+            frame = self._as_uint8_rgb(frame)         # coerce to what zxing expects (drop alpha, etc.)
             if frame is None:
                 continue
             try:
@@ -123,10 +130,30 @@ class BarcodeGate:
                     self.last_format = str(r.format)
                     self.last_camera = name
                     self.last_seen_monotonic = time.monotonic()
+                    self.last_frame_cams = tuple(got)
                     log.info("[no-flip-place] barcode seen on '%s' (%s: %s) -> place without flipping",
                              name, r.format, r.text)
                     return True
+        self.last_frame_cams = tuple(got)             # for diagnostics: which cams are feeding frames
         return False
+
+    @staticmethod
+    def _as_uint8_rgb(frame):
+        """Coerce a camera frame to the uint8 HxWx3 zxing wants: drop an alpha channel, and treat a
+        single-channel image as grayscale. Returns None for anything unusable (so the caller skips it)."""
+        try:
+            if frame.dtype != np.uint8:
+                return None
+            if frame.ndim == 2:
+                return frame                          # grayscale is fine
+            if frame.ndim == 3:
+                if frame.shape[2] == 4:
+                    return np.ascontiguousarray(frame[:, :, :3])
+                if frame.shape[2] == 3:
+                    return frame
+            return None
+        except AttributeError:
+            return None
 
 
 class NoFlipPlaceMacro:
@@ -269,12 +296,16 @@ class NoFlipPlaceMacro:
             commit_progress — 0..1 toward the commit_s lock while a barcode is continuously held
             commit_s        — the hold-time threshold (s)
             fired           — the macro has run for the current committed cycle
+            frames_ok       — the last scan got a camera frame (distinguishes "camera not feeding"
+                              from "frames arriving but no code decoded"); None if unknown
+            frame_cams      — which cameras delivered a frame on the last scan
         """
         det = self.detector
         if self._seen_since is not None and self.commit_s > 0:
             progress = min(1.0, (time.monotonic() - self._seen_since) / self.commit_s)
         else:
             progress = 0.0
+        frame_cams = getattr(det, "last_frame_cams", None)
         return {
             "enabled": self.enabled,
             "has_detector": det is not None,
@@ -286,6 +317,8 @@ class NoFlipPlaceMacro:
             "commit_progress": progress,
             "commit_s": self.commit_s,
             "fired": self._fired,
+            "frames_ok": (len(frame_cams) > 0) if frame_cams is not None else None,
+            "frame_cams": list(frame_cams) if frame_cams else [],
         }
 
     def reset(self):
