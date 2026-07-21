@@ -22,12 +22,12 @@ Design decisions (shared with the flip variant):
 Detection cue — BARCODE, with a commit LATCH:
     A package that shows a barcode is oriented correctly and must NOT be flipped. The detector scans
     CONTINUOUSLY every auto tick (not gated by the grasp). When a barcode is seen for an unbroken
-    ``commit_s`` (default 6 s) the macro LATCHES: it now knows the next place is no-flip. The latch
-    holds even if the barcode then leaves view (the gripper may occlude it during the grasp), and it
-    fires the scripted place once the object is actually grasped, then CLEARS so the next object must
-    earn its own 6-s barcode hold. Detection uses the zxing-cpp library (`pip install zxing-cpp`) over
-    the wrist + head frames; see BarcodeGate. The port is open: pass your own
-    detector=callable(env, arm14)->bool (or None to disable) to swap the cue.
+    ``commit_s`` (default 6 s) the macro LATCHES: it now knows the next place is no-flip. The latch is
+    dropped again in any of three ways: the scripted place fires (once the object is grasped), the
+    barcode stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
+    gripper crossing the code during the grasp) is tolerated — only a full commit_s of absence unlocks.
+    Detection uses the zxing-cpp library (`pip install zxing-cpp`) over the wrist + head frames; see
+    BarcodeGate. The port is open: pass your own detector=callable(env, arm14)->bool (or None) to swap.
 
     "Continuous" = scan() runs every auto tick while running; the GUI also calls scan() on its refresh
     while auto is OFF, so the live indicator responds to a barcode even when idle (only scan() runs then
@@ -150,9 +150,10 @@ class NoFlipPlaceMacro:
         self.enabled = True           # live on/off: False -> maybe_trigger is a no-op (macro never runs)
         # Continuous-scan + commit-latch state:
         self.committed = False        # THE LOCK: barcode held commit_s -> "the next place is no-flip".
-                                      #   Persists even if the barcode later leaves view; cleared only
-                                      #   when the macro fires (or on reset()).
+                                      #   Cleared when the macro fires, when the barcode has been GONE
+                                      #   for commit_s, or on reset().
         self._seen_since = None       # monotonic time the current unbroken barcode streak began
+        self._absent_since = None     # monotonic time the barcode last went out of view (unlock timer)
         self._fired = False           # macro ran for the current committed cycle (for status display)
         log.info("NoFlipPlaceMacro ready: %d waypoints, commit=%.0fs vel=%.0f%% max, detector=%s",
                  len(self.path), self.commit_s, self.vel_frac * 100,
@@ -176,12 +177,13 @@ class NoFlipPlaceMacro:
         """One detection tick: run the detector and update the commit latch. Does NOT fire / move the
         robot, so it is safe to call outside the auto loop — e.g. the GUI calls it while auto is OFF so
         the live indicator still responds to a barcode held under a camera. A barcode seen for an
-        unbroken commit_s LATCHES ``self.committed``; the latch persists even if the barcode then leaves
-        view. Returns the current committed state. No-op while disabled."""
+        unbroken commit_s LATCHES ``self.committed``; the latch is dropped again if the barcode then
+        stays OUT of view for commit_s. Returns the current committed state. No-op while disabled."""
         if not self.enabled:
             return self.committed
         now = time.monotonic()
         if self._should_place(env, arm14):           # PORT: a barcode is visible this tick
+            self._absent_since = None                # seen -> reset the unlock (absence) timer
             if self._seen_since is None:
                 self._seen_since = now
             if not self.committed and (now - self._seen_since) >= self.commit_s:
@@ -190,7 +192,13 @@ class NoFlipPlaceMacro:
                 log.warning("[no-flip-place] barcode held >= %.0fs -> LOCKED: next place is no-flip",
                             self.commit_s)
         else:
-            self._seen_since = None                  # streak broken; the LATCH (if set) stays
+            self._seen_since = None                  # streak broken; restart the seen timer
+            if self._absent_since is None:
+                self._absent_since = now
+            if self.committed and (now - self._absent_since) >= self.commit_s:
+                self.committed = False               # UNLOCK: barcode gone for commit_s
+                log.warning("[no-flip-place] barcode gone >= %.0fs -> UNLOCKED (no-flip latch dropped)",
+                            self.commit_s)
         return self.committed
 
     def maybe_trigger(self, env) -> bool:
@@ -214,6 +222,7 @@ class NoFlipPlaceMacro:
             self._run(env, np.asarray(arm14, dtype=np.float64))
             self.committed = False                   # lock resets after the macro fires
             self._seen_since = None
+            self._absent_since = None
             self._fired = True
             return True
         return False
@@ -280,7 +289,8 @@ class NoFlipPlaceMacro:
         }
 
     def reset(self):
-        """Drop the commit latch + streak (e.g. on auto stop / E-stop) so a restart begins fresh."""
+        """Drop the commit latch + timers (e.g. on auto stop / E-stop) so a restart begins fresh."""
         self.committed = False
         self._seen_since = None
+        self._absent_since = None
         self._fired = False
