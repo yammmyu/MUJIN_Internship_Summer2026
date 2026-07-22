@@ -172,6 +172,10 @@ class InferenceController:
         elif det_path:
             log.warning("grasp recovery disabled: detector checkpoint not found at %s", det_path)
 
+        # Speed of the scripted place macros (flip + no-flip), as a fraction of MAX joint velocity.
+        # Lower = slower/gentler release motion. (The policy's own auto motion is env.speed_scale.)
+        PLACE_MACRO_VEL_FRAC = 0.25
+
         # Flip-place release macro (opt-in): after the policy's grab+lift+flip, move out to a fixed
         # release pose, open the gripper, and come back — see real_world/flip_place.py. Inert unless the
         # baked recording path exists.
@@ -179,7 +183,7 @@ class InferenceController:
         try:
             from real_world.flip_place import FlipPlaceMacro, DEFAULT_PATH
             if os.path.exists(DEFAULT_PATH):
-                self.flip_place = FlipPlaceMacro()
+                self.flip_place = FlipPlaceMacro(vel_frac=PLACE_MACRO_VEL_FRAC)
             else:
                 log.warning("flip-place disabled: release path not found at %s", DEFAULT_PATH)
         except Exception as e:
@@ -193,7 +197,7 @@ class InferenceController:
         try:
             from real_world.no_flip_place import NoFlipPlaceMacro, DEFAULT_PATH as NFP_PATH
             if os.path.exists(NFP_PATH):
-                self.no_flip_place = NoFlipPlaceMacro()
+                self.no_flip_place = NoFlipPlaceMacro(vel_frac=PLACE_MACRO_VEL_FRAC)
             else:
                 log.warning("no-flip-place disabled: release path not found at %s", NFP_PATH)
         except Exception as e:
