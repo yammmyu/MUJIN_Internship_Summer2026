@@ -84,7 +84,7 @@ class LabelGate:
     """
 
     def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.03, min_fill=0.50,
-                 min_edge_density=0.04, min_char_comps=2, max_aspect=6.0):
+                 min_edge_density=0.04, min_char_comps=6, max_aspect=6.0):
         self.cameras = tuple(cameras)
         self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the frame
         self.min_fill = float(min_fill)               # contourArea / boundingRect area (fills a quad?)
@@ -97,6 +97,8 @@ class LabelGate:
         self.last_frame_cams = ()
         self.debug = False
         self._last_diag = 0.0
+        self.snapshot_path = None         # if set (+debug), write an annotated head frame here ~1 Hz
+        self._last_snap = 0.0
 
     @property
     def available(self) -> bool:
@@ -123,6 +125,8 @@ class LabelGate:
             blocks = self.find_label_blocks(gray)     # list of (x, y, w, h, comps)
             diag.append(f"{name}{shape}={len(blocks)}block(s)"
                         + (f":{[(b[2], b[3]) for b in blocks]}" if blocks else ""))
+            if self.debug and self.snapshot_path:     # dump an annotated HEAD frame to inspect live
+                self._save_snapshot(frame, blocks)
             if blocks:
                 x, y, w, h, _c = max(blocks, key=lambda b: b[2] * b[3])   # biggest block
                 self.last_text = f"{w}x{h}"
@@ -186,6 +190,32 @@ class LabelGate:
         if now - self._last_diag >= 1.0:
             self._last_diag = now
             print(f"[no-flip scan] cams={list(self.cameras)}  {msg}")
+
+    def _save_snapshot(self, frame, blocks):
+        """Throttled (~1 Hz) write of the HEAD frame with detected label blocks drawn, so you can SEE
+        what the head-camera detection is doing without a live window (headless-friendly). Overwrites
+        self.snapshot_path each time; open/refresh that file to watch."""
+        now = time.monotonic()
+        if now - self._last_snap < 1.0:
+            return
+        self._last_snap = now
+        try:
+            img = frame
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)   # frames are RGB; imwrite wants BGR
+            img = np.ascontiguousarray(img)
+            for (x, y, w, h, c) in blocks:
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 200, 0), 2)
+                cv2.putText(img, f"{w}x{h} {c}ch", (x, max(12, y - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2, cv2.LINE_AA)
+            cv2.putText(img, f"blocks={len(blocks)}", (8, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.imwrite(self.snapshot_path, img)
+        except Exception as e:
+            if self.debug:
+                print(f"[no-flip scan] snapshot save failed: {e!r}")
 
     @staticmethod
     def _as_gray(frame):
@@ -344,6 +374,11 @@ class NoFlipPlaceMacro:
         self.detector = LabelGate() if detector is self._UNSET else detector
         if hasattr(self.detector, "debug"):
             self.detector.debug = bool(debug)             # route scan diagnostics to stdout
+        if debug and hasattr(self.detector, "snapshot_path") and self.detector.snapshot_path is None:
+            # dump an annotated HEAD frame here ~1 Hz so you can SEE detection headless: open/refresh it
+            self.detector.snapshot_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "no_flip_head_debug.png"))
+            log.info("[no-flip-place] head detection snapshots -> %s", self.detector.snapshot_path)
         self.commit_s = float(commit_s)
         self.grip_delay_s = float(grip_delay_s)
         self.vel_frac = float(vel_frac)
