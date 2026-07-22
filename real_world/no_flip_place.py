@@ -84,10 +84,11 @@ class LabelGate:
     The thresholds are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps.
     """
 
-    def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.03, min_fill=0.50,
+    def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.03, max_area_frac=0.20, min_fill=0.50,
                  min_edge_density=0.04, min_char_comps=6, max_aspect=6.0):
         self.cameras = tuple(cameras)
         self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the frame
+        self.max_area_frac = float(max_area_frac)     # largest block (rejects big blobs = a chunk of scene)
         self.min_fill = float(min_fill)               # contourArea / boundingRect area (fills a quad?)
         self.min_edge_density = float(min_edge_density)  # fraction of edge pixels inside the block
         self.min_char_comps = int(min_char_comps)     # # character-sized edge components in the block
@@ -149,8 +150,8 @@ class LabelGate:
     def analyze(self, gray):
         """Evaluate EVERY candidate block and report why it passed/failed — for the live tuning view.
         Returns a list of dicts: {x, y, w, h, comps, fill, dens, aspect, reason}. reason is None for an
-        accepted label block, else the FIRST failing gate: 'small' / 'fill' / 'aspect' / 'density' /
-        'chars' (same order find_label_blocks applies). find_label_blocks is just the accepted subset."""
+        accepted label block, else the FIRST failing gate: 'small' / 'big' / 'fill' / 'aspect' /
+        'density' / 'chars' (same order find_label_blocks applies). find_label_blocks = accepted subset."""
         h_img, w_img = gray.shape[:2]
         frame_area = h_img * w_img
         g = cv2.GaussianBlur(gray, (3, 3), 0)                       # kill sensor noise
@@ -184,6 +185,8 @@ class LabelGate:
             comps = int(inside.sum())
             if area < self.min_area_frac * frame_area:
                 reason = "small"
+            elif area > self.max_area_frac * frame_area:
+                reason = "big"
             elif fill < self.min_fill:
                 reason = "fill"
             elif aspect > self.max_aspect:

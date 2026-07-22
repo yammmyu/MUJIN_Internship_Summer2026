@@ -476,7 +476,8 @@ class InferenceController:
         return nfp.status() if nfp is not None else None
 
     # LabelGate tunables the GUI exposes for live calibration (order = display order).
-    _LABEL_PARAM_KEYS = ("min_area_frac", "min_fill", "min_edge_density", "min_char_comps", "max_aspect")
+    _LABEL_PARAM_KEYS = ("min_area_frac", "max_area_frac", "min_fill", "min_edge_density",
+                         "min_char_comps", "max_aspect")
 
     def no_flip_detector(self):
         """The live no-flip detector object (LabelGate) for the tuning page to run analyze() on, or

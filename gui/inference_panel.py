@@ -241,6 +241,9 @@ class InferenceMixin:
          "(rejects streaks/wrinkles with a few specks)."),
         ("min_area_frac", "Min size (frac)", 0.0, 0.3, 0.005, False,
          "Smallest block as a fraction of the frame. Higher = the label must appear bigger / closer."),
+        ("max_area_frac", "Max size (frac)", 0.02, 1.0, 0.01, False,
+         "Largest block as a fraction of the frame. Lower = rejects big blobs (a chunk of the scene "
+         "mistaken for a tag). Must stay above Min size."),
         ("max_aspect", "Max aspect ≤", 1.0, 20.0, 0.5, False,
          "Longest ÷ shortest side. Lower = rejects thin streaks (tape/wrinkles) more aggressively."),
         ("commit_count", "Detections to lock", 1, 200, 1, True,
