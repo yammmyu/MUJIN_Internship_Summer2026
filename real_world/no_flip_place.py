@@ -19,21 +19,21 @@ Design decisions (shared with the flip variant):
   * No snap on return: robot queue + staging + merge buffer + grip latch are ALL cleared before and
     after, and the arm ends at the live start, so the first resumed inference is fresh.
 
-Detection cue — ARUCO MARKER, with a commit LATCH:
-    A package that shows an ArUco marker is oriented correctly and must NOT be flipped. The detector
-    scans CONTINUOUSLY every auto tick (not gated by the grasp). When a marker is seen for an unbroken
+Detection cue — PRINTED LABEL, with a commit LATCH:
+    A package that shows a printed label is oriented correctly and must NOT be flipped. The detector
+    scans CONTINUOUSLY every auto tick (not gated by the grasp). When a label is seen for an unbroken
     ``commit_s`` (default 6 s) the macro LATCHES: it now knows the next place is no-flip. The latch is
     dropped again in any of three ways: the scripted place fires (once the object is grasped), the
-    marker stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
-    gripper crossing the marker during the grasp) is tolerated — only a full commit_s of absence unlocks.
-    Detection uses OpenCV's cv2.aruco (no extra dependency) over the HEAD camera frame; see ArucoGate.
-    ArUco is chosen over a 1-D barcode / QR because it decodes at a far smaller on-screen size (~12 px
-    vs ~200 px for EAN-13) and tolerates angle — the head camera's wide FOV makes 1-D codes unreadable
-    unless held right against the lens. The port is open: pass your own detector=callable(env,
-    arm14)->bool (or None) to swap the cue; BarcodeGate (zxing-cpp) remains available for that.
+    label stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
+    gripper crossing the label during the grasp) is tolerated — only a full commit_s of absence unlocks.
+    Detection uses OpenCV (no extra dependency) over the HEAD camera frame; see LabelGate. It finds
+    printed TEXT (gradient edges), groups it into blocks, and keeps only filled, character-dense
+    rectangles — which the soft fabric, wrinkles, tape and glare never form. The port is open: pass
+    your own detector=callable(env, arm14)->bool (or None) to swap the cue; BarcodeGate (zxing-cpp)
+    remains available for barcodes/QR.
 
     "Continuous" = scan() runs every auto tick while running; the GUI also calls scan() on its refresh
-    while auto is OFF, so the live indicator responds to a barcode even when idle (only scan() runs then
+    while auto is OFF, so the live indicator responds to a label even when idle (only scan() runs then
     — never the FIRE stage). The commit latch is reset when auto-run STARTS, so an idle pre-arm drives
     only the indicator and the real decision is re-made live during the run.
 
@@ -52,13 +52,9 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# ArUco dictionary: 4x4 markers (small, robust, 50 ids). Present the operator a printed marker from
-# this dict (see scripts/barcode_webcam_test.py --make-aruco, or cv2.aruco.generateImageMarker).
-ARUCO_DICT = "DICT_4X4_50"
-
-# Camera(s) to scan for a barcode. Only the HEAD camera is used — the operator presents the barcode
-# to the head camera to decide no-flip. (Name per humanoid_env AGENT_CAMERA.)
-BARCODE_CAMERAS = ("head",)
+# Camera(s) to scan. Only the HEAD camera is used — the operator presents the labelled package to the
+# head camera to decide no-flip. (Name per humanoid_env AGENT_CAMERA.)
+SCAN_CAMERAS = ("head",)
 
 # No-flip reach+release path, built from recording205 (see scripts/build_release_path.py). Distinct
 # from the flip variant's flip_release_path.npy (recording206) — the two cases use different releases.
@@ -67,54 +63,51 @@ DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "assets", "no_flip_releas
 R_GRIP_IDX = 1          # right channel in a [gl, gr] gripper command
 
 
-class ArucoGate:
-    """Detection port for the no-flip case: "does the head camera see an ArUco marker?".
+class LabelGate:
+    """Detection port for the no-flip case: "does the head camera see a printed LABEL?".
 
-    A visible marker means the package is oriented right-side-up and must NOT be flipped, so the macro
-    should place it as-is. Uses OpenCV's cv2.aruco (bundled with opencv-python; no extra dependency),
-    which locates 4x4 markers down to ~12 px on-screen and tolerates rotation — far better at the head
-    camera's distance/FOV than a 1-D barcode. A marker counts as SEEN when detected; pass ids=(7, ...)
-    to only accept specific marker id(s), else any marker in the dictionary counts.
+    A shipping/product label carries dense printed TEXT that fills a rectangle; the soft
+    fabric-through-plastic, wrinkles, tape and glare do not. So a label is SEEN when the frame contains
+    a filled, character-dense rectangular text block. Two steps (per the method):
 
-    Callable, so it drops straight into NoFlipPlaceMacro(detector=...). The commit_s latch debounces it
-    (a marker must be held that long before no-flip locks in).
+      1. FIND TEXT — a morphological/Sobel gradient highlights character strokes (printed text has many
+         sharp edges; smooth fabric ~none). Otsu-threshold -> an edge mask.
+      2. GROUP + SHAPE-CHECK — close the edge mask horizontally (chars->words->lines) then vertically
+         (lines->block), find contours, and keep only blocks that (a) are big enough, (b) FILL their
+         bounding rectangle (extent >= min_fill), (c) are not thin streaks (aspect <= max_aspect),
+         (d) are densely edged, and (e) contain >= min_char_comps character-sized components. That quad
+         + char-density test kills wrinkles, tape and glare (thin/streaky/smooth, never a filled quad).
+
+    Dependency-free (cv2 + numpy only). Callable, so it drops into NoFlipPlaceMacro(detector=...); the
+    commit_s latch debounces it (a label must be held that long before no-flip locks in). The thresholds
+    are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps on real packages.
     """
 
-    def __init__(self, cameras=BARCODE_CAMERAS, *, dict_name=ARUCO_DICT, ids=None):
+    def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.003, min_fill=0.50,
+                 min_edge_density=0.10, min_char_comps=6, max_aspect=6.0):
         self.cameras = tuple(cameras)
-        self.ids = set(ids) if ids is not None else None   # None => accept any marker id
-        self.dict_name = dict_name
-        self._warned = False
-        self.last_text = None             # "id=<n>" of the most recent hit (for the GUI indicator)
-        self.last_id = None
+        self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the frame
+        self.min_fill = float(min_fill)               # contourArea / boundingRect area (fills a quad?)
+        self.min_edge_density = float(min_edge_density)  # fraction of edge pixels inside the block
+        self.min_char_comps = int(min_char_comps)     # # character-sized edge components in the block
+        self.max_aspect = float(max_aspect)           # reject thin streaks (tape/wrinkle)
+        self.last_text = None             # "WxH" of the most recent label block (for the GUI indicator)
         self.last_camera = None
         self.last_seen_monotonic = 0.0
         self.last_frame_cams = ()
         self.debug = False
         self._last_diag = 0.0
-        try:
-            aruco = cv2.aruco
-            dictionary = aruco.getPredefinedDictionary(getattr(aruco, dict_name))
-            self._detector = aruco.ArucoDetector(dictionary, aruco.DetectorParameters())
-        except Exception as e:
-            self._detector = None
-            log.error("[no-flip-place] cv2.aruco unavailable (%r); marker detection disabled -> "
-                      "macro will never fire", e)
 
     @property
     def available(self) -> bool:
-        """True when the ArUco detector built (i.e. detection can actually run)."""
-        return self._detector is not None
+        """Always True — detection is pure OpenCV (no external backend to be missing)."""
+        return True
 
     def seen_within(self, hold_s) -> bool:
-        """Was a marker detected in the last `hold_s` seconds? (drives the live GUI indicator)."""
+        """Was a label detected in the last `hold_s` seconds? (drives the live GUI indicator)."""
         return self.last_seen_monotonic > 0.0 and (time.monotonic() - self.last_seen_monotonic) < hold_s
 
     def __call__(self, env, arm14) -> bool:
-        if self._detector is None:
-            self.last_frame_cams = ()
-            self._diag("cv2.aruco NOT available (reader missing)")
-            return False
         got, diag = [], []
         for name in self.cameras:
             frame = env.get_frame(name)               # also request()s the camera -> switches it ON
@@ -127,24 +120,63 @@ class ArucoGate:
             if gray is None:
                 diag.append(f"{name}=BAD-FMT{shape}")
                 continue
-            _corners, ids, _rej = self._detector.detectMarkers(gray)
-            found = [] if ids is None else [int(i) for i in ids.flatten()]
-            if self.ids is not None:
-                found = [i for i in found if i in self.ids]
-            diag.append(f"{name}{shape}={len(found)}marker(s)" + (f":{found}" if found else ""))
-            if found:
-                self.last_id = found[0]
-                self.last_text = f"id={found[0]}"
+            blocks = self.find_label_blocks(gray)     # list of (x, y, w, h, comps)
+            diag.append(f"{name}{shape}={len(blocks)}block(s)"
+                        + (f":{[(b[2], b[3]) for b in blocks]}" if blocks else ""))
+            if blocks:
+                x, y, w, h, _c = max(blocks, key=lambda b: b[2] * b[3])   # biggest block
+                self.last_text = f"{w}x{h}"
                 self.last_camera = name
                 self.last_seen_monotonic = time.monotonic()
                 self.last_frame_cams = tuple(got)
-                log.info("[no-flip-place] ArUco marker %s seen on '%s' -> place without flipping",
-                         found, name)
+                log.info("[no-flip-place] label block %dx%d seen on '%s' -> place without flipping",
+                         w, h, name)
                 self._diag("  ".join(diag))
                 return True
         self.last_frame_cams = tuple(got)
         self._diag("  ".join(diag) if diag else "(no cameras configured)")
         return False
+
+    def find_label_blocks(self, gray):
+        """Return [(x, y, w, h, char_comps), ...] filled, char-dense rectangular text blocks."""
+        h_img, w_img = gray.shape[:2]
+        frame_area = h_img * w_img
+        g = cv2.GaussianBlur(gray, (3, 3), 0)                       # kill sensor noise
+        gx = cv2.Sobel(g, cv2.CV_16S, 1, 0, ksize=3)
+        gy = cv2.Sobel(g, cv2.CV_16S, 0, 1, ksize=3)
+        mag = cv2.convertScaleAbs(cv2.magnitude(gx.astype(np.float32), gy.astype(np.float32)))
+        _, edges = cv2.threshold(mag, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        _n_lab, _lab, stats, _cent = cv2.connectedComponentsWithStats(edges, 8)
+        # group chars -> lines (horizontal close) then lines -> block (vertical close). No opening.
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w_img // 45), 1)))
+        closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(11, h_img // 35))))
+        cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # component centroids/sizes (vectorized char-count per block); index 0 is the background
+        cx = stats[1:, cv2.CC_STAT_LEFT] + stats[1:, cv2.CC_STAT_WIDTH] / 2.0
+        cy = stats[1:, cv2.CC_STAT_TOP] + stats[1:, cv2.CC_STAT_HEIGHT] / 2.0
+        cw = stats[1:, cv2.CC_STAT_WIDTH].astype(np.float64)
+        ch = stats[1:, cv2.CC_STAT_HEIGHT].astype(np.float64)
+        out = []
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            area = w * h
+            if area < self.min_area_frac * frame_area:             # too small
+                continue
+            if cv2.contourArea(c) / float(area) < self.min_fill:   # doesn't fill a rectangle
+                continue
+            if max(w, h) / float(min(w, h)) > self.max_aspect:     # thin streak (tape/wrinkle)
+                continue
+            if edges[y:y + h, x:x + w].mean() / 255.0 < self.min_edge_density:   # not densely edged
+                continue
+            inside = ((cx >= x) & (cx <= x + w) & (cy >= y) & (cy <= y + h)
+                      & (cw >= 2) & (cw <= 0.5 * w) & (ch >= 2) & (ch <= 0.6 * h))
+            comps = int(inside.sum())
+            if comps < self.min_char_comps:                        # not enough character-like pieces
+                continue
+            out.append((x, y, w, h, comps))
+        return out
 
     def _diag(self, msg):
         """Throttled (~1 Hz) diagnostic print of what the scan saw, gated by self.debug."""
@@ -153,12 +185,12 @@ class ArucoGate:
         now = time.monotonic()
         if now - self._last_diag >= 1.0:
             self._last_diag = now
-            print(f"[no-flip scan] cams={list(self.cameras)} dict={self.dict_name}  {msg}")
+            print(f"[no-flip scan] cams={list(self.cameras)}  {msg}")
 
     @staticmethod
     def _as_gray(frame):
-        """Coerce a camera frame to a uint8 single-channel image for cv2.aruco. Colour order is
-        irrelevant (markers are black/white). Returns None for anything unusable."""
+        """Coerce a camera frame to a uint8 single-channel image. Colour order is irrelevant here.
+        Returns None for anything unusable."""
         try:
             if frame.dtype != np.uint8:
                 return None
@@ -189,7 +221,7 @@ class BarcodeGate:
     that long before no-flip locks in).
     """
 
-    def __init__(self, cameras=BARCODE_CAMERAS, *, symbologies=None):
+    def __init__(self, cameras=SCAN_CAMERAS, *, symbologies=None):
         self.cameras = tuple(cameras)
         self.symbologies = symbologies    # None => accept any; else a zxingcpp.BarcodeFormat mask
         self._warned = False
@@ -307,9 +339,9 @@ class NoFlipPlaceMacro:
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints
         if self.path.ndim != 2 or self.path.shape[1] != 14:
             raise ValueError(f"no-flip release path must be (M,14); got {self.path.shape}")
-        # default cue = ArUco marker seen -> don't flip; pass detector=None to disable, BarcodeGate()
+        # default cue = printed label seen -> don't flip; pass detector=None to disable, BarcodeGate()
         # for zxing barcodes/QR, or your own callable
-        self.detector = ArucoGate() if detector is self._UNSET else detector
+        self.detector = LabelGate() if detector is self._UNSET else detector
         if hasattr(self.detector, "debug"):
             self.detector.debug = bool(debug)             # route scan diagnostics to stdout
         self.commit_s = float(commit_s)

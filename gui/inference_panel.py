@@ -146,9 +146,9 @@ class InferenceMixin:
     def _update_no_flip_indicator(self):
         """Repaint the no-flip barcode pill from the macro's live status (~4 Hz), and push a one-time
         status-bar message on the two key edges (first detection, and the 6 s lock):
-          * grey  — off / not loaded / watching (no marker in view)
-          * amber — armed but the marker detector (cv2.aruco) is unavailable, or no camera frame
-          * blue  — marker DETECTED (fires immediately), counting up toward the lock (s / commit_s)
+          * grey  — off / not loaded / watching (no label in view)
+          * amber — armed but the label detector is unavailable, or no camera frame
+          * blue  — label DETECTED (fires immediately), counting up toward the lock (s / commit_s)
           * green (solid) — LOCKED: held commit_s; the next place is no-flip
         """
         ind = getattr(self, "_no_flip_ind", None)
@@ -189,12 +189,12 @@ class InferenceMixin:
             bg, fg = th.SUCCESS, "white"
         elif st.get("barcode_seen"):
             state = "seen"
-            label = f"◉  marker detected  {held:.1f} / {commit_s:.0f}s"
+            label = f"◉  label detected  {held:.1f} / {commit_s:.0f}s"
             bg, fg = th.BRAND_SOFT, th.BRAND_INK
         elif st.get("frames_ok") is False:              # scanning, but no camera frame is arriving
             state, label, bg, fg = "nocam", "◌  waiting for camera…", th.WARN_SOFT, th.WARN_DARK
         else:
-            state, label, bg, fg = "watching", "◌  watching for marker", th.APP_BG, th.DOT_OFF
+            state, label, bg, fg = "watching", "◌  watching for label", th.APP_BG, th.DOT_OFF
 
         try:
             ind.config(text=label, bg=bg, fg=fg)
@@ -204,10 +204,10 @@ class InferenceMixin:
         prev = getattr(self, "_no_flip_prev_state", None)
         if state != prev:
             if state == "seen":
-                self.status_text.set("◉ Marker detected — hold it in view to lock no-flip "
+                self.status_text.set("◉ Label detected — hold it in view to lock no-flip "
                                      f"({commit_s:.0f}s)…")
             elif state == "locked":
-                self.status_text.set("● Marker held — LOCKED: the next item will be placed flat "
+                self.status_text.set("● Label held — LOCKED: the next item will be placed flat "
                                      "(no flip)" + (f"  [{txt}]" if txt else ""))
             self._no_flip_prev_state = state
 
@@ -579,25 +579,25 @@ class InferenceMixin:
                  "After the policy grabs, lifts and flips, automatically run the scripted release "
                  "(move out, open gripper, return). Safe to toggle mid-run.")
 
-        # No-flip release macro: when the head camera sees an ArUco MARKER on the grasped package it is
+        # No-flip release macro: when the head camera sees a printed LABEL on the grasped package it is
         # right-side-up and must NOT be flipped, so place it as-is. Checkbox arms it; the pill to its
-        # right is a LIVE indicator (repainted ~4 Hz by _update_no_flip_indicator) of marker detection.
+        # right is a LIVE indicator (repainted ~4 Hz by _update_no_flip_indicator) of label detection.
         nfp_row = ttk.Frame(sec_auto)
         nfp_row.pack(fill=tk.X, padx=8, pady=(0, 8))
         self._no_flip_place_var = tk.BooleanVar(value=bool(self.inference.no_flip_place_enabled))
         self._no_flip_place_cb = ttk.Checkbutton(
-            nfp_row, text="Place flat when a marker is seen (skip flip)",
+            nfp_row, text="Place flat when a label is seen (skip flip)",
             variable=self._no_flip_place_var,
             command=lambda: setattr(self.inference, "no_flip_place_enabled", self._no_flip_place_var.get()))
         self._no_flip_place_cb.pack(side=tk.LEFT)
         if getattr(self.inference, "no_flip_place", None) is None:
             self._no_flip_place_cb.state(["disabled"])
         self.tip(self._no_flip_place_cb,
-                 "Scan the head camera continuously; once an ArUco marker is held ~6 s the next place "
+                 "Scan the head camera continuously; once a printed label is held ~6 s the next place "
                  "locks to no-flip (place as-is via the scripted release), and the lock clears after it "
                  "fires. Safe to toggle mid-run.")
-        # Live marker indicator pill (green when a marker is currently seen).
-        self._no_flip_ind = tk.Label(nfp_row, text="●  marker", font=self.theme.ui(9, "bold"),
+        # Live label indicator pill (green when a label is currently seen).
+        self._no_flip_ind = tk.Label(nfp_row, text="●  label", font=self.theme.ui(9, "bold"),
                                      bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
         self._no_flip_ind.pack(side=tk.RIGHT)
         self._update_no_flip_indicator()          # paint once now + start the ~4 Hz refresh
