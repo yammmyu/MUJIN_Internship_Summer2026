@@ -112,9 +112,14 @@ class DetectorTuningMixin:
             img = img[:, :, :3]
         if img.dtype != np.uint8:
             img = np.clip(img, 0, 255).astype(np.uint8)
-        vis = np.ascontiguousarray(img)          # RGB working copy for drawing
 
         det = self.inference.no_flip_detector() if hasattr(self, "inference") else None
+        # Show/analyze only what the detector sees: crop off the same noisy top strip it ignores, so the
+        # view matches detection and the drawn boxes are in the cropped frame's coordinates.
+        if det is not None and hasattr(det, "crop_roi"):
+            img = det.crop_roi(img)
+        vis = np.ascontiguousarray(img)          # RGB working copy for drawing
+
         accepted = drawn = 0
         if det is not None and hasattr(det, "analyze"):
             gray = cv2.cvtColor(vis, cv2.COLOR_RGB2GRAY)

@@ -84,10 +84,13 @@ class LabelGate:
     The thresholds are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps.
     """
 
-    def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.03, max_area_frac=0.20, min_fill=0.50,
+    def __init__(self, cameras=SCAN_CAMERAS, *, roi_top_frac=0.33, noise_floor_px=1200,
+                 min_area_frac=0.03, max_area_frac=0.20, min_fill=0.50,
                  min_edge_density=0.04, min_char_comps=6, max_aspect=6.0):
         self.cameras = tuple(cameras)
-        self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the frame
+        self.roi_top_frac = float(roi_top_frac)       # ignore this fraction of the frame TOP (all noise)
+        self.noise_floor_px = int(noise_floor_px)     # blobs smaller than this (px area) aren't candidates
+        self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the (cropped) frame
         self.max_area_frac = float(max_area_frac)     # largest block (rejects big blobs = a chunk of scene)
         self.min_fill = float(min_fill)               # contourArea / boundingRect area (fills a quad?)
         self.min_edge_density = float(min_edge_density)  # fraction of edge pixels inside the block
@@ -122,6 +125,7 @@ class LabelGate:
             if gray is None:
                 diag.append(f"{name}=BAD-FMT{shape}")
                 continue
+            gray = self.crop_roi(gray)                # drop the noisy top strip before detecting
             blocks = self.find_label_blocks(gray)     # list of (x, y, w, h, comps)
             diag.append(f"{name}{shape}={len(blocks)}block(s)"
                         + (f":{[(b[2], b[3]) for b in blocks]}" if blocks else ""))
@@ -139,13 +143,19 @@ class LabelGate:
         self._diag("  ".join(diag) if diag else "(no cameras configured)")
         return False
 
+    def crop_roi(self, img):
+        """Drop the top roi_top_frac of the image (that strip is all noise). Returns the bottom region;
+        pass this to analyze()/find_label_blocks so detection ignores the top. 0 => no crop."""
+        f = min(max(self.roi_top_frac, 0.0), 0.95)
+        if f <= 0.0:
+            return img
+        y0 = int(round(f * img.shape[0]))
+        return img[y0:, :]
+
     def find_label_blocks(self, gray):
         """Return [(x, y, w, h, char_comps), ...] filled, char-dense rectangular text blocks."""
         return [(c["x"], c["y"], c["w"], c["h"], c["comps"])
                 for c in self.analyze(gray) if c["reason"] is None]
-
-    # noise floor: contours smaller than this (px) are ignored entirely (not even shown as rejects)
-    _NOISE_FLOOR_PX = 200
 
     def analyze(self, gray):
         """Evaluate EVERY candidate block and report why it passed/failed — for the live tuning view.
@@ -175,7 +185,7 @@ class LabelGate:
         for c in cnts:
             x, y, w, h = cv2.boundingRect(c)
             area = w * h
-            if area < self._NOISE_FLOOR_PX:                        # pure noise -> ignore entirely
+            if area < self.noise_floor_px:                         # below the noise dial -> ignore entirely
                 continue
             fill = cv2.contourArea(c) / float(area)
             aspect = max(w, h) / float(min(w, h))
