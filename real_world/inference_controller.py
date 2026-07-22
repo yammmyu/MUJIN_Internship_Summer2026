@@ -475,6 +475,34 @@ class InferenceController:
         nfp = getattr(self, "no_flip_place", None)
         return nfp.status() if nfp is not None else None
 
+    # LabelGate tunables the GUI exposes for live calibration (order = display order).
+    _LABEL_PARAM_KEYS = ("min_area_frac", "min_fill", "min_edge_density", "min_char_comps", "max_aspect")
+
+    def no_flip_detector_params(self):
+        """Current live no-flip detection tunables (LabelGate params + commit_count), or None if there
+        is no macro / the detector isn't a LabelGate. Used to seed the GUI tuning widgets."""
+        nfp = getattr(self, "no_flip_place", None)
+        det = getattr(nfp, "detector", None) if nfp is not None else None
+        if det is None or not all(hasattr(det, k) for k in self._LABEL_PARAM_KEYS):
+            return None
+        out = {k: getattr(det, k) for k in self._LABEL_PARAM_KEYS}
+        out["commit_count"] = nfp.commit_count
+        return out
+
+    def set_no_flip_param(self, name, value):
+        """Live-set one no-flip detection tunable (a LabelGate param, or commit_count on the macro).
+        Takes effect on the very next scan. No-op if there's no macro / the param isn't present."""
+        nfp = getattr(self, "no_flip_place", None)
+        if nfp is None:
+            return
+        if name == "commit_count":
+            nfp.commit_count = max(1, int(value))
+            return
+        det = getattr(nfp, "detector", None)
+        if det is not None and hasattr(det, name):
+            cur = getattr(det, name)
+            setattr(det, name, type(cur)(value))     # keep the param's original type (int vs float)
+
     def no_flip_place_scan(self):
         """Advance barcode detection one tick WITHOUT firing. Lets the GUI keep the live indicator
         responsive while auto-run is OFF (the auto loop already scans while running). No-op if there's

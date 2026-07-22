@@ -228,6 +228,34 @@ class InferenceMixin:
 
         self.root.after(250, self._update_no_flip_indicator)
 
+    # Label-detection tuning params: (attr, label, from, to, step, is_int, tooltip). Editable ANYTIME
+    # (they change detection only, no motion), so they are NOT part of the idle-only tuning lock.
+    _LABEL_PARAM_SPEC = (
+        ("min_fill", "Rectangle fill ≥", 0.0, 1.0, 0.05, False,
+         "How much of its bounding box the text block must fill. Higher = stricter 'solid rectangle' "
+         "(rejects scattered edges / glare)."),
+        ("min_edge_density", "Edge density ≥", 0.0, 0.5, 0.01, False,
+         "Fraction of edge pixels inside the block. Higher = demands denser printed text."),
+        ("min_char_comps", "Min characters ≥", 1, 60, 1, True,
+         "How many character-sized pieces the block must contain. Higher = demands more text "
+         "(rejects streaks/wrinkles with a few specks)."),
+        ("min_area_frac", "Min size (frac)", 0.0, 0.3, 0.005, False,
+         "Smallest block as a fraction of the frame. Higher = the label must appear bigger / closer."),
+        ("max_aspect", "Max aspect ≤", 1.0, 20.0, 0.5, False,
+         "Longest ÷ shortest side. Lower = rejects thin streaks (tape/wrinkles) more aggressively."),
+        ("commit_count", "Detections to lock", 1, 200, 1, True,
+         "Consecutive detections needed to LOCK no-flip (and consecutive misses to unlock)."),
+    )
+
+    def _apply_label_param(self, name, var, is_int):
+        """Push one live label-detection tunable to the running LabelGate (takes effect next scan)."""
+        try:
+            val = int(float(var.get())) if is_int else float(var.get())
+        except (tk.TclError, ValueError):
+            return
+        self.inference.set_no_flip_param(name, val)
+        self.status_text.set(f"Label detection: {name} = {val}")
+
     # ------------------------------------------------------------------ #
     #  真机释放（手动单步路径）                                             #
     # ------------------------------------------------------------------ #
@@ -601,6 +629,34 @@ class InferenceMixin:
                                      bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
         self._no_flip_ind.pack(side=tk.RIGHT)
         self._update_no_flip_indicator()          # paint once now + start the ~4 Hz refresh
+
+        # Live label-detection tuning: adjust the LabelGate thresholds while watching the pill/logs.
+        # Editable ANYTIME (detection-only, no motion), so NOT gated by the idle tuning lock.
+        lp_grid = ttk.Frame(sec_auto)
+        lp_grid.pack(fill=tk.X, padx=8, pady=(0, 8))
+        lp_grid.columnconfigure(1, weight=1)
+        ttk.Label(lp_grid, text="Label detection (live)", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        cur = self.inference.no_flip_detector_params() or {}
+        no_macro = getattr(self.inference, "no_flip_place", None) is None
+        self._label_param_vars = {}
+        for i, (attr, text, frm, to, step, is_int, tip) in enumerate(self._LABEL_PARAM_SPEC, start=1):
+            lbl = ttk.Label(lp_grid, text=text, anchor="w")
+            lbl.grid(row=i, column=0, sticky="w", pady=2)
+            self.tip(lbl, tip)
+            default = cur.get(attr, (2 if is_int else 0.1))
+            var = (tk.IntVar if is_int else tk.DoubleVar)(value=default)
+            self._label_param_vars[attr] = var
+            sb = ttk.Spinbox(lp_grid, from_=frm, to=to, increment=step, width=8, textvariable=var,
+                             command=lambda a=attr, v=var, ii=is_int: self._apply_label_param(a, v, ii))
+            self._bind_spinbox_apply(
+                sb, lambda a=attr, v=var, ii=is_int: self._apply_label_param(a, v, ii))
+            sb.grid(row=i, column=2, sticky="e", padx=4)
+            if no_macro:
+                sb.state(["disabled"])
+        if no_macro:
+            ttk.Label(lp_grid, text="(no-flip macro not loaded)", style="Caption.TLabel").grid(
+                row=len(self._LABEL_PARAM_SPEC) + 1, column=0, columnspan=3, sticky="w")
 
         # (Emergency stop lives in the pinned bar at the top of this column — always reachable.)
 
