@@ -19,6 +19,10 @@ from PIL import Image, ImageTk
 class DetectorTuningMixin:
     """Live label-detector tuning tab (view + threshold controls)."""
 
+    # Rejected candidates smaller than this fraction of the frame are NOT drawn (declutters the sea of
+    # tiny fragments from fabric texture). Accepted (green) blocks are always drawn regardless.
+    _REJECT_DRAW_MIN_FRAC = 0.004
+
     def setup_detector_tuning_panel(self, parent):
         self._tune_view_w = 760            # rendered view width (px); height follows the frame aspect
 
@@ -111,22 +115,31 @@ class DetectorTuningMixin:
         vis = np.ascontiguousarray(img)          # RGB working copy for drawing
 
         det = self.inference.no_flip_detector() if hasattr(self, "inference") else None
-        accepted = total = 0
+        accepted = drawn = 0
         if det is not None and hasattr(det, "analyze"):
             gray = cv2.cvtColor(vis, cv2.COLOR_RGB2GRAY)
             cands = det.analyze(gray)
-            total = len(cands)
+            # Accepted blocks are ALWAYS drawn (green). Rejects are drawn (red) only if they are big
+            # enough on screen to be worth looking at — this hides the sea of tiny fragments that the
+            # gradient/close step produces on textured fabric (the "20-30 tiny red boxes"). Threshold is
+            # a fixed fraction of the frame, independent of the min-size knob so it stays clean while
+            # you tune. Raise _REJECT_DRAW_MIN_FRAC to show fewer, lower it to show more.
+            reject_floor = self._REJECT_DRAW_MIN_FRAC * (vis.shape[0] * vis.shape[1])
             for c in cands:
                 x, y, w, h = c["x"], c["y"], c["w"], c["h"]
                 if c["reason"] is None:
                     col, txt = (0, 200, 0), f"{w}x{h} {c['comps']}ch"
                     accepted += 1
+                elif (w * h) < reject_floor:
+                    continue                         # too small on screen to be useful -> skip
                 else:
                     col, txt = (235, 70, 70), c["reason"]
                 cv2.rectangle(vis, (x, y), (x + w, y + h), col, 2)
                 cv2.putText(vis, txt, (x, max(14, y - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
-            self._tune_stats_var.set(f"accepted {accepted} / {total} candidate block(s)")
+                drawn += 1
+            self._tune_stats_var.set(
+                f"accepted {accepted}  ·  {drawn} box(es) shown  ·  {len(cands)} candidates total")
         else:
             self._tune_stats_var.set("no LabelGate detector loaded (showing raw frame)")
 
