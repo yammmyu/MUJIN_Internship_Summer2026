@@ -21,11 +21,12 @@ Design decisions (shared with the flip variant):
 
 Detection cue — PRINTED LABEL, with a commit LATCH:
     A package that shows a printed label is oriented correctly and must NOT be flipped. The detector
-    scans CONTINUOUSLY every auto tick (not gated by the grasp). When a label is seen for an unbroken
-    ``commit_s`` (default 6 s) the macro LATCHES: it now knows the next place is no-flip. The latch is
-    dropped again in any of three ways: the scripted place fires (once the object is grasped), the
-    label stays OUT of view for commit_s, or reset() (auto stop / E-stop). A brief occlusion (e.g. the
-    gripper crossing the label during the grasp) is tolerated — only a full commit_s of absence unlocks.
+    scans CONTINUOUSLY every auto tick (not gated by the grasp). When a label is detected on
+    ``commit_count`` consecutive scans (default 20) the macro LATCHES: it now knows the next place is
+    no-flip. The latch is dropped again in any of three ways: the scripted place fires (once the object
+    is grasped), the label is MISSED commit_count scans in a row, or reset() (auto stop / E-stop). A
+    brief occlusion (e.g. the gripper crossing the label during the grasp) is tolerated — only
+    commit_count consecutive misses unlock.
     Detection uses OpenCV (no extra dependency) over the HEAD camera frame; see LabelGate. It finds
     printed TEXT (gradient edges), groups it into blocks, and keeps only filled, character-dense
     rectangles — which the soft fabric, wrinkles, tape and glare never form. The port is open: pass
@@ -79,8 +80,8 @@ class LabelGate:
          + char-density test kills wrinkles, tape and glare (thin/streaky/smooth, never a filled quad).
 
     Dependency-free (cv2 + numpy only). Callable, so it drops into NoFlipPlaceMacro(detector=...); the
-    commit_s latch debounces it (a label must be held that long before no-flip locks in). The thresholds
-    are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps on real packages.
+    commit_count latch debounces it (a label must be detected that many scans before no-flip locks in).
+    The thresholds are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps.
     """
 
     def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.03, min_fill=0.50,
@@ -217,8 +218,8 @@ class BarcodeGate:
 
     zxing-cpp is imported lazily so the module still loads on a machine without it (the gate then
     logs once and never fires, exactly like a disabled detector). Callable, so it drops straight into
-    NoFlipPlaceMacro(detector=...), which debounces it via the commit_s latch (a barcode must be held
-    that long before no-flip locks in).
+    NoFlipPlaceMacro(detector=...), which debounces it via the commit_count latch (a barcode must be
+    detected that many scans before no-flip locks in).
     """
 
     def __init__(self, cameras=SCAN_CAMERAS, *, symbologies=None):
@@ -330,7 +331,7 @@ class NoFlipPlaceMacro:
 
     def __init__(self, path=DEFAULT_PATH, *,
                  detector=_UNSET,      # PORT: callable(env, arm14)->bool. default = BarcodeGate; None disables
-                 commit_s=6.0,         # a barcode must be seen CONTINUOUSLY this long to LATCH no-flip
+                 commit_count=20,      # a label must be detected this many consecutive scans to LATCH no-flip
                  grip_delay_s=1.5,     # after the grasp closes, wait this long before firing the macro
                  vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
                  release_settle_s=0.4, # pause after opening the gripper before withdrawing
@@ -344,22 +345,23 @@ class NoFlipPlaceMacro:
         self.detector = LabelGate() if detector is self._UNSET else detector
         if hasattr(self.detector, "debug"):
             self.detector.debug = bool(debug)             # route scan diagnostics to stdout
-        self.commit_s = float(commit_s)
+        self.commit_count = max(1, int(commit_count))
         self.grip_delay_s = float(grip_delay_s)
         self.vel_frac = float(vel_frac)
         self.release_settle_s = float(release_settle_s)
         self.open_grip = float(open_grip)
         self.enabled = True           # live on/off: False -> maybe_trigger is a no-op (macro never runs)
         # Continuous-scan + commit-latch state:
-        self.committed = False        # THE LOCK: barcode held commit_s -> "the next place is no-flip".
-                                      #   Cleared when the macro fires, when the barcode has been GONE
-                                      #   for commit_s, or on reset().
-        self._seen_since = None       # monotonic time the current unbroken barcode streak began
-        self._absent_since = None     # monotonic time the barcode last went out of view (unlock timer)
+        self.committed = False        # THE LOCK: label detected commit_count scans -> "next place is no-flip".
+                                      #   Cleared when the macro fires, when the label has been MISSED
+                                      #   commit_count scans in a row, or on reset().
+        self._seen_count = 0          # consecutive scans the label has been detected (lock counter)
+        self._absent_count = 0        # consecutive scans the label has been missed (unlock counter)
         self._grip_closed_since = None  # monotonic time the grasp closed (grip-settle timer before firing)
         self._fired = False           # macro ran for the current committed cycle (for status display)
-        log.info("NoFlipPlaceMacro ready: %d waypoints, commit=%.0fs grip_delay=%.1fs vel=%.0f%% max, "
-                 "detector=%s", len(self.path), self.commit_s, self.grip_delay_s, self.vel_frac * 100,
+        log.info("NoFlipPlaceMacro ready: %d waypoints, commit=%d detections grip_delay=%.1fs vel=%.0f%% "
+                 "max, detector=%s", len(self.path), self.commit_count, self.grip_delay_s,
+                 self.vel_frac * 100,
                  type(self.detector).__name__ if self.detector is not None else "None (disabled)")
 
     def _should_place(self, env, arm14) -> bool:
@@ -379,29 +381,26 @@ class NoFlipPlaceMacro:
     def scan(self, env, arm14=None) -> bool:
         """One detection tick: run the detector and update the commit latch. Does NOT fire / move the
         robot, so it is safe to call outside the auto loop — e.g. the GUI calls it while auto is OFF so
-        the live indicator still responds to a barcode held under a camera. A barcode seen for an
-        unbroken commit_s LATCHES ``self.committed``; the latch is dropped again if the barcode then
-        stays OUT of view for commit_s. Returns the current committed state. No-op while disabled."""
+        the live indicator still responds to a label held under a camera. A label detected for
+        commit_count consecutive scans LATCHES ``self.committed``; the latch is dropped again if the
+        label is then MISSED commit_count scans in a row. Returns committed. No-op while disabled."""
         if not self.enabled:
             return self.committed
-        now = time.monotonic()
-        if self._should_place(env, arm14):           # PORT: a barcode is visible this tick
-            self._absent_since = None                # seen -> reset the unlock (absence) timer
-            if self._seen_since is None:
-                self._seen_since = now
-            if not self.committed and (now - self._seen_since) >= self.commit_s:
-                self.committed = True                # LATCH: hold survived commit_s
+        if self._should_place(env, arm14):           # PORT: a label is visible this scan
+            self._absent_count = 0                   # seen -> reset the unlock (miss) counter
+            self._seen_count += 1
+            if not self.committed and self._seen_count >= self.commit_count:
+                self.committed = True                # LATCH: detected commit_count scans in a row
                 self._fired = False                  # fresh committed cycle
-                log.warning("[no-flip-place] barcode held >= %.0fs -> LOCKED: next place is no-flip",
-                            self.commit_s)
+                log.warning("[no-flip-place] label detected %dx -> LOCKED: next place is no-flip",
+                            self.commit_count)
         else:
-            self._seen_since = None                  # streak broken; restart the seen timer
-            if self._absent_since is None:
-                self._absent_since = now
-            if self.committed and (now - self._absent_since) >= self.commit_s:
-                self.committed = False               # UNLOCK: barcode gone for commit_s
-                log.warning("[no-flip-place] barcode gone >= %.0fs -> UNLOCKED (no-flip latch dropped)",
-                            self.commit_s)
+            self._seen_count = 0                     # streak broken; restart the seen counter
+            self._absent_count += 1
+            if self.committed and self._absent_count >= self.commit_count:
+                self.committed = False               # UNLOCK: label missed commit_count scans in a row
+                log.warning("[no-flip-place] label missed %dx -> UNLOCKED (no-flip latch dropped)",
+                            self.commit_count)
         return self.committed
 
     def maybe_trigger(self, env) -> bool:
@@ -434,8 +433,8 @@ class NoFlipPlaceMacro:
                         now - self._grip_closed_since)
             self._run(env, np.asarray(arm14, dtype=np.float64))
             self.committed = False                   # lock resets after the macro fires
-            self._seen_since = None
-            self._absent_since = None
+            self._seen_count = 0
+            self._absent_count = 0
             self._grip_closed_since = None
             self._fired = True
             return True
@@ -480,18 +479,16 @@ class NoFlipPlaceMacro:
             barcode_seen    — a barcode was decoded within hold_s (visible right now)
             barcode_text    — payload of the most recent hit (or None)
             committed       — THE LOCK is set: the next place is committed to no-flip
-            commit_progress — 0..1 toward the commit_s lock while a barcode is continuously held
-            commit_s        — the hold-time threshold (s)
+            commit_progress — 0..1 toward the lock (seen_count / commit_count)
+            seen_count      — consecutive scans the label has been detected so far
+            commit_count    — detections-in-a-row needed to lock
             fired           — the macro has run for the current committed cycle
             frames_ok       — the last scan got a camera frame (distinguishes "camera not feeding"
-                              from "frames arriving but no code decoded"); None if unknown
+                              from "frames arriving but no label found"); None if unknown
             frame_cams      — which cameras delivered a frame on the last scan
         """
         det = self.detector
-        if self._seen_since is not None and self.commit_s > 0:
-            progress = min(1.0, (time.monotonic() - self._seen_since) / self.commit_s)
-        else:
-            progress = 0.0
+        progress = min(1.0, self._seen_count / self.commit_count) if self.commit_count > 0 else 0.0
         frame_cams = getattr(det, "last_frame_cams", None)
         return {
             "enabled": self.enabled,
@@ -502,16 +499,17 @@ class NoFlipPlaceMacro:
             "barcode_text": getattr(det, "last_text", None),
             "committed": self.committed,
             "commit_progress": progress,
-            "commit_s": self.commit_s,
+            "seen_count": self._seen_count,
+            "commit_count": self.commit_count,
             "fired": self._fired,
             "frames_ok": (len(frame_cams) > 0) if frame_cams is not None else None,
             "frame_cams": list(frame_cams) if frame_cams else [],
         }
 
     def reset(self):
-        """Drop the commit latch + timers (e.g. on auto stop / E-stop) so a restart begins fresh."""
+        """Drop the commit latch + counters (e.g. on auto stop / E-stop) so a restart begins fresh."""
         self.committed = False
-        self._seen_since = None
-        self._absent_since = None
+        self._seen_count = 0
+        self._absent_count = 0
         self._grip_closed_since = None
         self._fired = False

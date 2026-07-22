@@ -335,21 +335,22 @@ class DemoInference(_Stub):
 
     def no_flip_place_status(self):
         # Synthetic 14 s cycle so the pill visibly walks: watching -> counting -> LOCKED (persists a
-        # few seconds after the barcode leaves view) -> reset.
-        commit_s = 6.0
+        # few seconds after the label leaves view) -> reset.
+        commit_count = 20
         t = _clock() % 14.0
-        seen = self._no_flip_enabled and t < 8.0        # barcode visible for the first 8 s
+        seen = self._no_flip_enabled and t < 8.0        # label visible for the first 8 s
         committed = self._no_flip_enabled and 6.0 <= t < 12.0   # latches at 6 s, holds past 8 s, resets at 12 s
-        held = min(t, commit_s) if seen else 0.0
+        seen_count = int(min(t, 6.0) / 6.0 * commit_count) if seen else 0
         return {
             "enabled": self._no_flip_enabled,
             "has_detector": True,
             "available": True,
             "barcode_seen": seen,
-            "barcode_text": "DEMO-5901234123457" if (seen or committed) else None,
+            "barcode_text": "DEMO-LABEL 220x150" if (seen or committed) else None,
             "committed": committed,
-            "commit_progress": held / commit_s,
-            "commit_s": commit_s,
+            "commit_progress": seen_count / commit_count,
+            "seen_count": seen_count,
+            "commit_count": commit_count,
             "fired": False,
         }
 

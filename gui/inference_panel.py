@@ -144,12 +144,12 @@ class InferenceMixin:
         self._refresh_tuning_state()         # idle again -> unlock tuning
 
     def _update_no_flip_indicator(self):
-        """Repaint the no-flip barcode pill from the macro's live status (~4 Hz), and push a one-time
-        status-bar message on the two key edges (first detection, and the 6 s lock):
+        """Repaint the no-flip label pill from the macro's live status (~4 Hz), and push a one-time
+        status-bar message on the two key edges (first detection, and the lock):
           * grey  — off / not loaded / watching (no label in view)
           * amber — armed but the label detector is unavailable, or no camera frame
-          * blue  — label DETECTED (fires immediately), counting up toward the lock (s / commit_s)
-          * green (solid) — LOCKED: held commit_s; the next place is no-flip
+          * blue  — label DETECTED (fires immediately), counting up toward the lock (seen / commit_count)
+          * green (solid) — LOCKED: detected commit_count scans; the next place is no-flip
         """
         ind = getattr(self, "_no_flip_ind", None)
         if ind is None:
@@ -171,11 +171,11 @@ class InferenceMixin:
             scan_err = scan_err or e
 
         # Classify into one discrete state, then paint the pill AND (on state CHANGES) push a one-time
-        # status-bar message — so there are two distinct events: "barcode detected" the instant it is
-        # first seen, and "LOCKED" when it has been held commit_s. seen_within's hold debounces flicker,
-        # so a steadily-held code fires each message once, not repeatedly.
-        commit_s = float(st.get("commit_s", 0.0)) if st else 0.0
-        held = float(st.get("commit_progress", 0.0)) * commit_s if st else 0.0
+        # status-bar message — so there are two distinct events: "label detected" the instant it is
+        # first seen, and "LOCKED" when detected commit_count scans in a row. seen_within's hold
+        # debounces flicker, so a steadily-held label fires each message once, not repeatedly.
+        commit_count = int(st.get("commit_count", 0)) if st else 0
+        seen_count = int(st.get("seen_count", 0)) if st else 0
         txt = st.get("barcode_text") if st else None
         if not st or not st.get("has_detector"):
             state, label, bg, fg = "na", "○  no-flip: n/a", th.APP_BG, th.DOT_OFF
@@ -189,7 +189,7 @@ class InferenceMixin:
             bg, fg = th.SUCCESS, "white"
         elif st.get("barcode_seen"):
             state = "seen"
-            label = f"◉  label detected  {held:.1f} / {commit_s:.0f}s"
+            label = f"◉  label detected  {seen_count} / {commit_count}"
             bg, fg = th.BRAND_SOFT, th.BRAND_INK
         elif st.get("frames_ok") is False:              # scanning, but no camera frame is arriving
             state, label, bg, fg = "nocam", "◌  waiting for camera…", th.WARN_SOFT, th.WARN_DARK
@@ -205,7 +205,7 @@ class InferenceMixin:
         if state != prev:
             if state == "seen":
                 self.status_text.set("◉ Label detected — hold it in view to lock no-flip "
-                                     f"({commit_s:.0f}s)…")
+                                     f"({commit_count} detections)…")
             elif state == "locked":
                 self.status_text.set("● Label held — LOCKED: the next item will be placed flat "
                                      "(no flip)" + (f"  [{txt}]" if txt else ""))
