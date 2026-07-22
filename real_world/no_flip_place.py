@@ -140,6 +140,17 @@ class LabelGate:
 
     def find_label_blocks(self, gray):
         """Return [(x, y, w, h, char_comps), ...] filled, char-dense rectangular text blocks."""
+        return [(c["x"], c["y"], c["w"], c["h"], c["comps"])
+                for c in self.analyze(gray) if c["reason"] is None]
+
+    # noise floor: contours smaller than this (px) are ignored entirely (not even shown as rejects)
+    _NOISE_FLOOR_PX = 200
+
+    def analyze(self, gray):
+        """Evaluate EVERY candidate block and report why it passed/failed — for the live tuning view.
+        Returns a list of dicts: {x, y, w, h, comps, fill, dens, aspect, reason}. reason is None for an
+        accepted label block, else the FIRST failing gate: 'small' / 'fill' / 'aspect' / 'density' /
+        'chars' (same order find_label_blocks applies). find_label_blocks is just the accepted subset."""
         h_img, w_img = gray.shape[:2]
         frame_area = h_img * w_img
         g = cv2.GaussianBlur(gray, (3, 3), 0)                       # kill sensor noise
@@ -163,20 +174,28 @@ class LabelGate:
         for c in cnts:
             x, y, w, h = cv2.boundingRect(c)
             area = w * h
-            if area < self.min_area_frac * frame_area:             # too small
+            if area < self._NOISE_FLOOR_PX:                        # pure noise -> ignore entirely
                 continue
-            if cv2.contourArea(c) / float(area) < self.min_fill:   # doesn't fill a rectangle
-                continue
-            if max(w, h) / float(min(w, h)) > self.max_aspect:     # thin streak (tape/wrinkle)
-                continue
-            if edges[y:y + h, x:x + w].mean() / 255.0 < self.min_edge_density:   # not densely edged
-                continue
+            fill = cv2.contourArea(c) / float(area)
+            aspect = max(w, h) / float(min(w, h))
+            dens = edges[y:y + h, x:x + w].mean() / 255.0
             inside = ((cx >= x) & (cx <= x + w) & (cy >= y) & (cy <= y + h)
                       & (cw >= 2) & (cw <= 0.5 * w) & (ch >= 2) & (ch <= 0.6 * h))
             comps = int(inside.sum())
-            if comps < self.min_char_comps:                        # not enough character-like pieces
-                continue
-            out.append((x, y, w, h, comps))
+            if area < self.min_area_frac * frame_area:
+                reason = "small"
+            elif fill < self.min_fill:
+                reason = "fill"
+            elif aspect > self.max_aspect:
+                reason = "aspect"
+            elif dens < self.min_edge_density:
+                reason = "density"
+            elif comps < self.min_char_comps:
+                reason = "chars"
+            else:
+                reason = None
+            out.append({"x": x, "y": y, "w": w, "h": h, "comps": comps,
+                        "fill": fill, "dens": dens, "aspect": aspect, "reason": reason})
         return out
 
     def _diag(self, msg):

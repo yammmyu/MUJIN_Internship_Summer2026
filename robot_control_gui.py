@@ -25,8 +25,8 @@ import argparse
 # those imports so the console can also launch in --demo mode on any laptop, where
 # the whole stack is replaced by gui.demo_backend. Names left as None here are only
 # ever dereferenced on the real (non-demo) path.
-from gui import (StyleMixin, CameraMixin, InferenceMixin, VRMixin,
-                 DataCollectionMixin, EvalMixin)
+from gui import (StyleMixin, CameraMixin, InferenceMixin, DetectorTuningMixin,
+                 VRMixin, DataCollectionMixin, EvalMixin)
 from real_world.timing import RECORD_HZ
 
 try:
@@ -46,8 +46,8 @@ except Exception as _e:                       # missing SDK / ROS / zmq / pybull
     _HW_IMPORT_ERROR = _e
 
 
-class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin,
-                      DataCollectionMixin, EvalMixin):
+class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, DetectorTuningMixin,
+                      VRMixin, DataCollectionMixin, EvalMixin):
     def __init__(self, root, camera_mode="all", demo=False):
         self.root = root
         self.demo = demo
@@ -246,12 +246,17 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, VRMixin,
         self.setup_camera_panel(left_frame)         # left: camera views
         self.setup_inference_panel(right_frame)     # right: grippers + inference + substep monitor
 
-        # ---- Tab 2: VR teleop (toggle + sensitivity + data collection) ----
+        # ---- Tab 2: Detector tuning (live boxed head-cam view + LabelGate thresholds) ----
+        tune_tab = ttk.Frame(tabs)
+        tabs.add(tune_tab, text="   Detector tuning   ")
+        self.setup_detector_tuning_panel(tune_tab)
+
+        # ---- Tab 3: VR teleop (toggle + sensitivity + data collection) ----
         vr_tab = ttk.Frame(tabs)
         tabs.add(vr_tab, text="   VR teleop   ")
         self.setup_vr_panel(vr_tab)
 
-        # ---- Tab 3: Evaluation dashboard (live success-rate KPIs) ----
+        # ---- Tab 4: Evaluation dashboard (live success-rate KPIs) ----
         eval_tab = ttk.Frame(tabs)
         tabs.add(eval_tab, text="   Evaluation   ")
         self.setup_eval_panel(eval_tab)

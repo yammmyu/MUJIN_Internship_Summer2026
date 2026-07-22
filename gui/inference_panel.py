@@ -629,34 +629,7 @@ class InferenceMixin:
                                      bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
         self._no_flip_ind.pack(side=tk.RIGHT)
         self._update_no_flip_indicator()          # paint once now + start the ~4 Hz refresh
-
-        # Live label-detection tuning: adjust the LabelGate thresholds while watching the pill/logs.
-        # Editable ANYTIME (detection-only, no motion), so NOT gated by the idle tuning lock.
-        lp_grid = ttk.Frame(sec_auto)
-        lp_grid.pack(fill=tk.X, padx=8, pady=(0, 8))
-        lp_grid.columnconfigure(1, weight=1)
-        ttk.Label(lp_grid, text="Label detection (live)", style="Section.TLabel").grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
-        cur = self.inference.no_flip_detector_params() or {}
-        no_macro = getattr(self.inference, "no_flip_place", None) is None
-        self._label_param_vars = {}
-        for i, (attr, text, frm, to, step, is_int, tip) in enumerate(self._LABEL_PARAM_SPEC, start=1):
-            lbl = ttk.Label(lp_grid, text=text, anchor="w")
-            lbl.grid(row=i, column=0, sticky="w", pady=2)
-            self.tip(lbl, tip)
-            default = cur.get(attr, (2 if is_int else 0.1))
-            var = (tk.IntVar if is_int else tk.DoubleVar)(value=default)
-            self._label_param_vars[attr] = var
-            sb = ttk.Spinbox(lp_grid, from_=frm, to=to, increment=step, width=8, textvariable=var,
-                             command=lambda a=attr, v=var, ii=is_int: self._apply_label_param(a, v, ii))
-            self._bind_spinbox_apply(
-                sb, lambda a=attr, v=var, ii=is_int: self._apply_label_param(a, v, ii))
-            sb.grid(row=i, column=2, sticky="e", padx=4)
-            if no_macro:
-                sb.state(["disabled"])
-        if no_macro:
-            ttk.Label(lp_grid, text="(no-flip macro not loaded)", style="Caption.TLabel").grid(
-                row=len(self._LABEL_PARAM_SPEC) + 1, column=0, columnspan=3, sticky="w")
+        # (Tune the label detector — with a live boxed camera view — in the "Detector tuning" tab.)
 
         # (Emergency stop lives in the pinned bar at the top of this column — always reachable.)
 

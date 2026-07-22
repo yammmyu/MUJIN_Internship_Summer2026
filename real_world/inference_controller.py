@@ -478,6 +478,12 @@ class InferenceController:
     # LabelGate tunables the GUI exposes for live calibration (order = display order).
     _LABEL_PARAM_KEYS = ("min_area_frac", "min_fill", "min_edge_density", "min_char_comps", "max_aspect")
 
+    def no_flip_detector(self):
+        """The live no-flip detector object (LabelGate) for the tuning page to run analyze() on, or
+        None if there's no macro. Same instance the tuning widgets mutate, so edits show immediately."""
+        nfp = getattr(self, "no_flip_place", None)
+        return getattr(nfp, "detector", None) if nfp is not None else None
+
     def no_flip_detector_params(self):
         """Current live no-flip detection tunables (LabelGate params + commit_count), or None if there
         is no macro / the detector isn't a LabelGate. Used to seed the GUI tuning widgets."""
