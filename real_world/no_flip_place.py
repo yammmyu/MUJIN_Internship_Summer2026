@@ -83,8 +83,8 @@ class LabelGate:
     are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps on real packages.
     """
 
-    def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.003, min_fill=0.50,
-                 min_edge_density=0.10, min_char_comps=6, max_aspect=6.0):
+    def __init__(self, cameras=SCAN_CAMERAS, *, min_area_frac=0.03, min_fill=0.50,
+                 min_edge_density=0.04, min_char_comps=2, max_aspect=6.0):
         self.cameras = tuple(cameras)
         self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the frame
         self.min_fill = float(min_fill)               # contourArea / boundingRect area (fills a quad?)
