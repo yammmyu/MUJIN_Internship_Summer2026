@@ -4,6 +4,6 @@
   "te_sigma": 1.4,
   "te_m": 0.123,
   "te_buffer_len": 8,
-  "speed_scale": 2.7941860465116277,
-  "append_ahead_rows": 3
+  "speed_scale": 1.3967391304347827,
+  "append_ahead_rows": 5
 }

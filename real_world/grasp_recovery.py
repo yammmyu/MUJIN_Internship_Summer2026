@@ -89,7 +89,7 @@ class _Detector:
 
 class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
-                 settle_sec=4.0,
+                 settle_sec=1.0,
                  # Pre-grasp APPROACH waypoints (n, 14) [left7, right7] the recovery retreats to (open
                  # gripper + move BOTH arms), ordered start -> pre-grasp. Passed in by the controller
                  # (real_world/config/retreat_waypoints.json). The retreat picks the nearest waypoint

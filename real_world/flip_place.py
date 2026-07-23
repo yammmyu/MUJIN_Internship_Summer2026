@@ -44,8 +44,8 @@ class FlipPlaceMacro:
     def __init__(self, path=DEFAULT_PATH, *,
                  rj7_change=2.5,       # fire when right wrist-roll has ROTATED this far since the grab
                                        # (|Δrj7|); the flip swings ~3.0-3.5 rad, so ~2.5 is near-complete
-                 settle_s=0.3,         # |Δrj7| must stay >= threshold this long (never fire mid-flip)
-                 vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
+                 settle_s=0.8,         # |Δrj7| must stay >= threshold this long (never fire mid-flip)
+                 vel_frac=0.3,         # streaming speed = fraction of MAX joint velocity
                  release_settle_s=0.4, # pause after opening the gripper before withdrawing
                  open_grip=0.0):       # 0 = open (release)
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints

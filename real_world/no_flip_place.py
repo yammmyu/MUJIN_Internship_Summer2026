@@ -402,9 +402,9 @@ class NoFlipPlaceMacro:
     def __init__(self, path=DEFAULT_PATH, *,
                  detector=_UNSET,      # PORT: callable(env, arm14)->bool. default = YoloGate; None disables
                  commit_count=20,      # a label must be detected this many consecutive scans to LATCH no-flip
-                 grip_delay_s=1.5,     # after the grasp closes, wait this long before firing the macro
-                 vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
-                 release_settle_s=0.4, # pause after opening the gripper before withdrawing
+                 grip_delay_s=1.2,     # after the grasp closes, wait this long before firing the macro
+                 vel_frac=0.3,         # streaming speed = fraction of MAX joint velocity
+                 release_settle_s=0.8, # pause after opening the gripper before withdrawing
                  open_grip=0.0,        # 0 = open (release)
                  debug=True):          # print a throttled per-scan diagnostic (frames + decode results)
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints
