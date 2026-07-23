@@ -475,19 +475,18 @@ class InferenceController:
         nfp = getattr(self, "no_flip_place", None)
         return nfp.status() if nfp is not None else None
 
-    # LabelGate tunables the GUI exposes for live calibration (order = display order).
-    _LABEL_PARAM_KEYS = ("roi_top_frac", "noise_floor_px", "min_area_frac", "max_area_frac",
-                         "min_fill", "min_edge_density", "min_char_comps", "max_aspect")
+    # YoloGate tunables the GUI exposes for live calibration (order = display order).
+    _LABEL_PARAM_KEYS = ("conf", "iou", "imgsz")
 
     def no_flip_detector(self):
-        """The live no-flip detector object (LabelGate) for the tuning page to run analyze() on, or
+        """The live no-flip detector object (YoloGate) for the tuning page to run analyze() on, or
         None if there's no macro. Same instance the tuning widgets mutate, so edits show immediately."""
         nfp = getattr(self, "no_flip_place", None)
         return getattr(nfp, "detector", None) if nfp is not None else None
 
     def no_flip_detector_params(self):
-        """Current live no-flip detection tunables (LabelGate params + commit_count), or None if there
-        is no macro / the detector isn't a LabelGate. Used to seed the GUI tuning widgets."""
+        """Current live no-flip detection tunables (YoloGate params + commit_count), or None if there
+        is no macro / the detector isn't a YoloGate. Used to seed the GUI tuning widgets."""
         nfp = getattr(self, "no_flip_place", None)
         det = getattr(nfp, "detector", None) if nfp is not None else None
         if det is None or not all(hasattr(det, k) for k in self._LABEL_PARAM_KEYS):
@@ -497,7 +496,7 @@ class InferenceController:
         return out
 
     def set_no_flip_param(self, name, value):
-        """Live-set one no-flip detection tunable (a LabelGate param, or commit_count on the macro).
+        """Live-set one no-flip detection tunable (a YoloGate param, or commit_count on the macro).
         Takes effect on the very next scan. No-op if there's no macro / the param isn't present."""
         nfp = getattr(self, "no_flip_place", None)
         if nfp is None:

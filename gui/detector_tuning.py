@@ -1,11 +1,11 @@
-"""Detector-tuning page: a live head-camera view with detection boxes drawn, next to the LabelGate
-threshold controls — so you can tune the no-flip label detector and watch the effect in real time.
+"""Detector-tuning page: a live head-camera view with YOLO detection boxes drawn, next to the YoloGate
+controls — so you can watch the no-flip detector and adjust its confidence/IoU in real time.
 
-Boxes: GREEN = an accepted label block (labelled WxH + char count); RED = a rejected candidate,
-labelled with the FIRST gate it failed ('small' / 'fill' / 'aspect' / 'density' / 'chars'). Adjust the
-sliders on the right until the things you WANT are green and everything else is red/absent.
+Boxes: GREEN = an accepted detection, labelled with its class + confidence. (Until the trained model
+is added the view just shows the raw frame — see the status line.) Adjust the sliders on the right so
+the target you WANT is detected and nothing else is.
 
-The view runs only while this tab is visible (winfo_viewable), and it runs the SAME LabelGate instance
+The view runs only while this tab is visible (winfo_viewable), and it runs the SAME YoloGate instance
 the macro uses (via inference.no_flip_detector()), so edits here apply to the live robot immediately.
 """
 import tkinter as tk
@@ -122,31 +122,31 @@ class DetectorTuningMixin:
 
         accepted = drawn = 0
         if det is not None and hasattr(det, "analyze"):
-            gray = cv2.cvtColor(vis, cv2.COLOR_RGB2GRAY)
-            cands = det.analyze(gray)
-            # Accepted blocks are ALWAYS drawn (green). Rejects are drawn (red) only if they are big
-            # enough on screen to be worth looking at — this hides the sea of tiny fragments that the
-            # gradient/close step produces on textured fabric (the "20-30 tiny red boxes"). Threshold is
-            # a fixed fraction of the frame, independent of the min-size knob so it stays clean while
-            # you tune. Raise _REJECT_DRAW_MIN_FRAC to show fewer, lower it to show more.
+            cands = det.analyze(vis)                  # YoloGate: predict on the RGB frame -> box dicts
+            # Accepted detections (reason is None) are drawn green with their label+confidence; any box
+            # the detector reports as a reject is drawn red only if big enough on screen to be worth
+            # looking at. Keys other than x/y/w/h are read defensively so any detector's dicts render.
             reject_floor = self._REJECT_DRAW_MIN_FRAC * (vis.shape[0] * vis.shape[1])
             for c in cands:
                 x, y, w, h = c["x"], c["y"], c["w"], c["h"]
-                if c["reason"] is None:
-                    col, txt = (0, 200, 0), f"{w}x{h} {c['comps']}ch"
+                if c.get("reason") is None:
+                    col = (0, 200, 0)
+                    txt = c.get("text") or f"{w}x{h}"
                     accepted += 1
                 elif (w * h) < reject_floor:
                     continue                         # too small on screen to be useful -> skip
                 else:
-                    col, txt = (235, 70, 70), c["reason"]
+                    col, txt = (235, 70, 70), c.get("reason")
                 cv2.rectangle(vis, (x, y), (x + w, y + h), col, 2)
                 cv2.putText(vis, txt, (x, max(14, y - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
                 drawn += 1
+            avail = getattr(det, "available", None)
+            note = "" if avail is not False else "  ·  model not loaded (add weights)"
             self._tune_stats_var.set(
-                f"accepted {accepted}  ·  {drawn} box(es) shown  ·  {len(cands)} candidates total")
+                f"detections {accepted}  ·  {drawn} box(es) shown{note}")
         else:
-            self._tune_stats_var.set("no LabelGate detector loaded (showing raw frame)")
+            self._tune_stats_var.set("no YOLO detector loaded (showing raw frame)")
 
         # resize to the view width, keep aspect, render (PhotoImage kept referenced to avoid GC)
         pil = Image.fromarray(vis)

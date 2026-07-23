@@ -246,7 +246,7 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, DetectorTuningMix
         self.setup_camera_panel(left_frame)         # left: camera views
         self.setup_inference_panel(right_frame)     # right: grippers + inference + substep monitor
 
-        # ---- Tab 2: Detector tuning (live boxed head-cam view + LabelGate thresholds) ----
+        # ---- Tab 2: Detector tuning (live boxed head-cam view + YoloGate controls) ----
         tune_tab = ttk.Frame(tabs)
         tabs.add(tune_tab, text="   Detector tuning   ")
         self.setup_detector_tuning_panel(tune_tab)

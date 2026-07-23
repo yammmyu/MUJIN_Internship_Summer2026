@@ -19,19 +19,20 @@ Design decisions (shared with the flip variant):
   * No snap on return: robot queue + staging + merge buffer + grip latch are ALL cleared before and
     after, and the arm ends at the live start, so the first resumed inference is fresh.
 
-Detection cue — PRINTED LABEL, with a commit LATCH:
-    A package that shows a printed label is oriented correctly and must NOT be flipped. The detector
-    scans CONTINUOUSLY every auto tick (not gated by the grasp). When a label is detected on
+Detection cue — YOLO DETECTION, with a commit LATCH:
+    A package that shows a printed label/barcode is oriented correctly and must NOT be flipped. The
+    detector scans CONTINUOUSLY every auto tick (not gated by the grasp). When the target is detected on
     ``commit_count`` consecutive scans (default 20) the macro LATCHES: it now knows the next place is
     no-flip. The latch is dropped again in any of three ways: the scripted place fires (once the object
-    is grasped), the label is MISSED commit_count scans in a row, or reset() (auto stop / E-stop). A
+    is grasped), the target is MISSED commit_count scans in a row, or reset() (auto stop / E-stop). A
     brief occlusion (e.g. the gripper crossing the label during the grasp) is tolerated — only
     commit_count consecutive misses unlock.
-    Detection uses OpenCV (no extra dependency) over the HEAD camera frame; see LabelGate. It finds
-    printed TEXT (gradient edges), groups it into blocks, and keeps only filled, character-dense
-    rectangles — which the soft fabric, wrinkles, tape and glare never form. The port is open: pass
-    your own detector=callable(env, arm14)->bool (or None) to swap the cue; BarcodeGate (zxing-cpp)
-    remains available for barcodes/QR.
+    Detection uses a YOLO object detector (ultralytics) over the HEAD camera frame; see YoloGate. The
+    gate loads a trained ``.pt`` model from assets and fires when any target box clears the confidence
+    threshold. Both the package (ultralytics) and the weights file are loaded LAZILY, so the module
+    still imports before the model exists — the gate then never fires (like a disabled detector) until
+    the weights are dropped in. The port is open: pass your own detector=callable(env, arm14)->bool (or
+    None) to swap the cue; BarcodeGate (zxing-cpp) remains available for barcodes/QR.
 
     "Continuous" = scan() runs every auto tick while running; the GUI also calls scan() on its refresh
     while auto is OFF, so the live indicator responds to a label even when idle (only scan() runs then
@@ -61,154 +62,191 @@ SCAN_CAMERAS = ("head",)
 # from the flip variant's flip_release_path.npy (recording206) — the two cases use different releases.
 DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "assets", "no_flip_release_path.npy")
 
+# Trained YOLO weights the default detector loads (ultralytics .pt). Drop the trained model here (or
+# pass weights=... / call YoloGate.reload(path)); until it exists the gate loads but never fires.
+DEFAULT_WEIGHTS = os.path.join(os.path.dirname(__file__), "assets", "no_flip_yolo.pt")
+
 R_GRIP_IDX = 1          # right channel in a [gl, gr] gripper command
 
 
-class LabelGate:
-    """Detection port for the no-flip case: "does the head camera see a printed LABEL?".
+class YoloGate:
+    """Detection port for the no-flip case: "does the head camera see the target (label/barcode)?".
 
-    A shipping/product label carries dense printed TEXT that fills a rectangle; the soft
-    fabric-through-plastic, wrinkles, tape and glare do not. So a label is SEEN when the frame contains
-    a filled, character-dense rectangular text block. Two steps (per the method):
+    A package showing a printed label/barcode is oriented correctly and must NOT be flipped, so the
+    macro should place it as-is. This gate runs a trained YOLO object detector (ultralytics) on the
+    scan-camera frame and reports SEEN when any target box clears the confidence threshold. It is the
+    default no-flip cue, replacing the old OpenCV text-cluster detector.
 
-      1. FIND TEXT — a morphological/Sobel gradient highlights character strokes (printed text has many
-         sharp edges; smooth fabric ~none). Otsu-threshold -> an edge mask.
-      2. GROUP + SHAPE-CHECK — close the edge mask horizontally (chars->words->lines) then vertically
-         (lines->block), find contours, and keep only blocks that (a) are big enough, (b) FILL their
-         bounding rectangle (extent >= min_fill), (c) are not thin streaks (aspect <= max_aspect),
-         (d) are densely edged, and (e) contain >= min_char_comps character-sized components. That quad
-         + char-density test kills wrinkles, tape and glare (thin/streaky/smooth, never a filled quad).
+    Same port contract as BarcodeGate — callable(env, arm14)->bool plus the live-state attributes the
+    GUI reads (last_text/last_camera/last_seen_monotonic/last_frame_cams, seen_within, available,
+    debug) — so it drops straight into NoFlipPlaceMacro(detector=...), debounced by the commit_count
+    latch. It also exposes analyze()/conf/iou/imgsz so the detector-tuning page can draw live boxes and
+    the confidence threshold can be tuned from the GUI.
 
-    Dependency-free (cv2 + numpy only). Callable, so it drops into NoFlipPlaceMacro(detector=...); the
-    commit_count latch debounces it (a label must be detected that many scans before no-flip locks in).
-    The thresholds are tunable — expect to calibrate min_fill / min_edge_density / min_char_comps.
+    Both ultralytics AND the weights file are loaded LAZILY and tolerantly: if the package is missing
+    or the .pt does not exist yet, the gate loads, logs once, and simply never fires (exactly like a
+    disabled detector). That is the intended state until the trained model is dropped in at ``weights``
+    (or supplied via weights=... / reload()). `classes` optionally restricts which detections count
+    (a set/list of class ids or names); None = any detection counts.
     """
 
-    def __init__(self, cameras=SCAN_CAMERAS, *, roi_top_frac=0.33, noise_floor_px=1200,
-                 min_area_frac=0.03, max_area_frac=0.20, min_fill=0.50,
-                 min_edge_density=0.04, min_char_comps=6, max_aspect=6.0):
+    def __init__(self, cameras=SCAN_CAMERAS, *, weights=DEFAULT_WEIGHTS, conf=0.5, iou=0.45,
+                 imgsz=640, classes=None, device=None):
         self.cameras = tuple(cameras)
-        self.roi_top_frac = float(roi_top_frac)       # ignore this fraction of the frame TOP (all noise)
-        self.noise_floor_px = int(noise_floor_px)     # blobs smaller than this (px area) aren't candidates
-        self.min_area_frac = float(min_area_frac)     # smallest block, as a fraction of the (cropped) frame
-        self.max_area_frac = float(max_area_frac)     # largest block (rejects big blobs = a chunk of scene)
-        self.min_fill = float(min_fill)               # contourArea / boundingRect area (fills a quad?)
-        self.min_edge_density = float(min_edge_density)  # fraction of edge pixels inside the block
-        self.min_char_comps = int(min_char_comps)     # # character-sized edge components in the block
-        self.max_aspect = float(max_aspect)           # reject thin streaks (tape/wrinkle)
-        self.last_text = None             # "WxH" of the most recent label block (for the GUI indicator)
-        self.last_camera = None
-        self.last_seen_monotonic = 0.0
-        self.last_frame_cams = ()
-        self.debug = False
-        self._last_diag = 0.0
+        self.weights = str(weights)
+        self.conf = float(conf)               # min box confidence to count as a detection (GUI-tunable)
+        self.iou = float(iou)                 # NMS IoU threshold
+        self.imgsz = int(imgsz)               # inference image size (longest side)
+        self.classes = classes                # None => any class counts; else ids/names that qualify
+        self.device = device                  # None => ultralytics default (auto CPU/GPU)
+        # Live state for the GUI indicator: what/where the last detection was and when it was seen.
+        self.last_text = None                 # "name conf" of the most recent hit (for the indicator)
+        self.last_camera = None               # which camera saw it
+        self.last_seen_monotonic = 0.0        # time.monotonic() of the last hit (0 = never)
+        self.last_frame_cams = ()             # cameras that delivered a frame on the last scan (diag)
+        self.debug = False                    # set True (via NoFlipPlaceMacro debug) for per-scan diag
+        self._last_diag = 0.0                 # throttle timer for the debug print
+        self._warned = False                  # one-shot guard for repeated predict errors
+        self._model = None                    # loaded ultralytics YOLO (None => gate never fires)
+        self._load_error = None               # human-readable reason the model is not loaded
+        self._load()
+
+    def _load(self):
+        """Lazily import ultralytics and load the weights. Never raises: on any failure the gate stays
+        inert (available == False) with the reason in self._load_error."""
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            self._load_error = "ultralytics not installed (`pip install ultralytics`)"
+            log.error("[no-flip-place] %s; YOLO detection disabled -> macro will never fire",
+                      self._load_error)
+            return
+        if not os.path.exists(self.weights):
+            self._load_error = f"weights not found at {self.weights}"
+            log.warning("[no-flip-place] %s; YOLO detection disabled until the trained model is added "
+                        "-> macro will never fire", self._load_error)
+            return
+        try:
+            model = YOLO(self.weights)
+            if self.device is not None:
+                model.to(self.device)
+            self._model = model
+            self._load_error = None
+            log.info("[no-flip-place] YOLO model loaded from %s (classes=%s)",
+                     self.weights, getattr(model, "names", None))
+        except Exception as e:                # a corrupt/incompatible checkpoint must not kill import
+            self._load_error = f"failed to load YOLO weights: {e}"
+            log.error("[no-flip-place] %s -> macro will never fire", self._load_error)
+
+    def reload(self, weights=None):
+        """(Re)load the model — call after dropping a freshly trained .pt at `weights` so the running
+        gate picks it up without a restart. Returns True if a model is now loaded."""
+        if weights is not None:
+            self.weights = str(weights)
+        self._model = None
+        self._load_error = None
+        self._warned = False
+        self._load()
+        return self.available
 
     @property
     def available(self) -> bool:
-        """Always True — detection is pure OpenCV (no external backend to be missing)."""
-        return True
+        """True when the YOLO model is loaded (i.e. detection can actually run)."""
+        return self._model is not None
 
     def seen_within(self, hold_s) -> bool:
-        """Was a label detected in the last `hold_s` seconds? (drives the live GUI indicator)."""
+        """Was a target detected in the last `hold_s` seconds? (drives the live GUI indicator)."""
         return self.last_seen_monotonic > 0.0 and (time.monotonic() - self.last_seen_monotonic) < hold_s
 
+    def _class_ok(self, cls_id, names) -> bool:
+        """Whether a detected class id passes the optional `classes` filter (ids or names)."""
+        if self.classes is None:
+            return True
+        if cls_id in self.classes:
+            return True
+        name = names.get(cls_id) if isinstance(names, dict) else None
+        return name is not None and name in self.classes
+
+    def _detect(self, rgb):
+        """Run the model on one uint8 RGB frame and return accepted detections as
+        [(cls_id, conf, name, (x1, y1, x2, y2)), ...] (empty if none / no model). Never raises.
+
+        The gate's public contract is RGB in (matching env.get_frame); ultralytics assumes a numpy
+        array is BGR and flips it internally, so convert RGB->BGR right before predict to match."""
+        if self._model is None:
+            return []
+        try:
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            res = self._model.predict(bgr, conf=self.conf, iou=self.iou, imgsz=self.imgsz,
+                                      device=self.device, verbose=False)[0]
+        except Exception as e:
+            if not self._warned:
+                log.warning("[no-flip-place] YOLO predict failed: %s", e)
+                self._warned = True
+            return None                        # signal an error to the caller (vs [] = ran, no hits)
+        names = getattr(res, "names", None) or getattr(self._model, "names", {}) or {}
+        boxes = getattr(res, "boxes", None)
+        out = []
+        if boxes is not None and len(boxes):
+            for b in boxes:
+                cid = int(b.cls[0])
+                if not self._class_ok(cid, names):
+                    continue
+                cf = float(b.conf[0])
+                x1, y1, x2, y2 = (float(v) for v in b.xyxy[0].tolist())
+                out.append((cid, cf, names.get(cid, str(cid)) if isinstance(names, dict) else str(cid),
+                            (x1, y1, x2, y2)))
+        return out
+
     def __call__(self, env, arm14) -> bool:
-        got, diag = [], []
+        if self._model is None:
+            self.last_frame_cams = ()
+            self._diag(self._load_error or "YOLO model not loaded (reader missing)")
+            return False
+        got, diag = [], []                    # got: cams that delivered a frame; diag: per-cam lines
         for name in self.cameras:
-            frame = env.get_frame(name)               # also request()s the camera -> switches it ON
-            if frame is None:
+            frame = env.get_frame(name)       # also request()s the camera -> switches it ON
+            if frame is None:                 # not warmed up / not streaming yet
                 diag.append(f"{name}=NO-FRAME")
                 continue
             got.append(name)
             shape = getattr(frame, "shape", None)
-            gray = self._as_gray(frame)
-            if gray is None:
+            rgb = self._as_uint8_rgb(frame)   # coerce to the uint8 HxWx3 ultralytics expects
+            if rgb is None:
                 diag.append(f"{name}=BAD-FMT{shape}")
                 continue
-            gray = self.crop_roi(gray)                # drop the noisy top strip before detecting
-            blocks = self.find_label_blocks(gray)     # list of (x, y, w, h, comps)
-            diag.append(f"{name}{shape}={len(blocks)}block(s)"
-                        + (f":{[(b[2], b[3]) for b in blocks]}" if blocks else ""))
-            if blocks:
-                x, y, w, h, _c = max(blocks, key=lambda b: b[2] * b[3])   # biggest block
-                self.last_text = f"{w}x{h}"
+            dets = self._detect(rgb)
+            if dets is None:                  # predict errored -> already logged; skip this camera
+                diag.append(f"{name}=ERR")
+                continue
+            diag.append(f"{name}{shape}={len(dets)}det(s)"
+                        + (f":{dets[0][2]} {dets[0][1]:.2f}" if dets else ""))
+            if dets:
+                cid, cf, cname, _xyxy = max(dets, key=lambda d: d[1])   # highest-confidence detection
+                self.last_text = f"{cname} {cf:.2f}"
                 self.last_camera = name
                 self.last_seen_monotonic = time.monotonic()
                 self.last_frame_cams = tuple(got)
-                log.info("[no-flip-place] label block %dx%d seen on '%s' -> place without flipping",
-                         w, h, name)
+                log.info("[no-flip-place] YOLO saw '%s' (%.2f) on '%s' -> place without flipping",
+                         cname, cf, name)
                 self._diag("  ".join(diag))
                 return True
-        self.last_frame_cams = tuple(got)
+        self.last_frame_cams = tuple(got)     # for diagnostics: which cams are feeding frames
         self._diag("  ".join(diag) if diag else "(no cameras configured)")
         return False
 
-    def crop_roi(self, img):
-        """Drop the top roi_top_frac of the image (that strip is all noise). Returns the bottom region;
-        pass this to analyze()/find_label_blocks so detection ignores the top. 0 => no crop."""
-        f = min(max(self.roi_top_frac, 0.0), 0.95)
-        if f <= 0.0:
-            return img
-        y0 = int(round(f * img.shape[0]))
-        return img[y0:, :]
-
-    def find_label_blocks(self, gray):
-        """Return [(x, y, w, h, char_comps), ...] filled, char-dense rectangular text blocks."""
-        return [(c["x"], c["y"], c["w"], c["h"], c["comps"])
-                for c in self.analyze(gray) if c["reason"] is None]
-
-    def analyze(self, gray):
-        """Evaluate EVERY candidate block and report why it passed/failed — for the live tuning view.
-        Returns a list of dicts: {x, y, w, h, comps, fill, dens, aspect, reason}. reason is None for an
-        accepted label block, else the FIRST failing gate: 'small' / 'big' / 'fill' / 'aspect' /
-        'density' / 'chars' (same order find_label_blocks applies). find_label_blocks = accepted subset."""
-        h_img, w_img = gray.shape[:2]
-        frame_area = h_img * w_img
-        g = cv2.GaussianBlur(gray, (3, 3), 0)                       # kill sensor noise
-        gx = cv2.Sobel(g, cv2.CV_16S, 1, 0, ksize=3)
-        gy = cv2.Sobel(g, cv2.CV_16S, 0, 1, ksize=3)
-        mag = cv2.convertScaleAbs(cv2.magnitude(gx.astype(np.float32), gy.astype(np.float32)))
-        _, edges = cv2.threshold(mag, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        _n_lab, _lab, stats, _cent = cv2.connectedComponentsWithStats(edges, 8)
-        # group chars -> lines (horizontal close) then lines -> block (vertical close). No opening.
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
-                                  cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w_img // 45), 1)))
-        closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE,
-                                  cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(11, h_img // 35))))
-        cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # component centroids/sizes (vectorized char-count per block); index 0 is the background
-        cx = stats[1:, cv2.CC_STAT_LEFT] + stats[1:, cv2.CC_STAT_WIDTH] / 2.0
-        cy = stats[1:, cv2.CC_STAT_TOP] + stats[1:, cv2.CC_STAT_HEIGHT] / 2.0
-        cw = stats[1:, cv2.CC_STAT_WIDTH].astype(np.float64)
-        ch = stats[1:, cv2.CC_STAT_HEIGHT].astype(np.float64)
+    def analyze(self, frame):
+        """Detector-tuning helper: run the model on an RGB frame and return per-box dicts the tuning
+        page draws: {x, y, w, h, conf, text, reason}. reason is None for every returned box (all are
+        accepted detections above `conf`), matching find-blocks semantics. Empty while no model is
+        loaded, so the tuning view just shows the raw frame until the weights are added."""
+        dets = self._detect(frame)
+        if not dets:
+            return []
         out = []
-        for c in cnts:
-            x, y, w, h = cv2.boundingRect(c)
-            area = w * h
-            if area < self.noise_floor_px:                         # below the noise dial -> ignore entirely
-                continue
-            fill = cv2.contourArea(c) / float(area)
-            aspect = max(w, h) / float(min(w, h))
-            dens = edges[y:y + h, x:x + w].mean() / 255.0
-            inside = ((cx >= x) & (cx <= x + w) & (cy >= y) & (cy <= y + h)
-                      & (cw >= 2) & (cw <= 0.5 * w) & (ch >= 2) & (ch <= 0.6 * h))
-            comps = int(inside.sum())
-            if area < self.min_area_frac * frame_area:
-                reason = "small"
-            elif area > self.max_area_frac * frame_area:
-                reason = "big"
-            elif fill < self.min_fill:
-                reason = "fill"
-            elif aspect > self.max_aspect:
-                reason = "aspect"
-            elif dens < self.min_edge_density:
-                reason = "density"
-            elif comps < self.min_char_comps:
-                reason = "chars"
-            else:
-                reason = None
-            out.append({"x": x, "y": y, "w": w, "h": h, "comps": comps,
-                        "fill": fill, "dens": dens, "aspect": aspect, "reason": reason})
+        for _cid, cf, cname, (x1, y1, x2, y2) in dets:
+            out.append({"x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1),
+                        "conf": cf, "text": f"{cname} {cf:.2f}", "reason": None})
         return out
 
     def _diag(self, msg):
@@ -221,19 +259,19 @@ class LabelGate:
             print(f"[no-flip scan] cams={list(self.cameras)}  {msg}")
 
     @staticmethod
-    def _as_gray(frame):
-        """Coerce a camera frame to a uint8 single-channel image. Colour order is irrelevant here.
-        Returns None for anything unusable."""
+    def _as_uint8_rgb(frame):
+        """Coerce a camera frame to the uint8 HxWx3 ultralytics wants: drop an alpha channel, and treat
+        a single-channel image as grayscale->RGB. Returns None for anything unusable."""
         try:
             if frame.dtype != np.uint8:
                 return None
             if frame.ndim == 2:
-                return frame
+                return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
             if frame.ndim == 3:
                 if frame.shape[2] == 4:
-                    return cv2.cvtColor(frame, cv2.COLOR_RGBA2GRAY)
+                    return np.ascontiguousarray(frame[:, :, :3])
                 if frame.shape[2] == 3:
-                    return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                    return frame
             return None
         except (AttributeError, cv2.error):
             return None
@@ -362,7 +400,7 @@ class NoFlipPlaceMacro:
     _UNSET = object()
 
     def __init__(self, path=DEFAULT_PATH, *,
-                 detector=_UNSET,      # PORT: callable(env, arm14)->bool. default = BarcodeGate; None disables
+                 detector=_UNSET,      # PORT: callable(env, arm14)->bool. default = YoloGate; None disables
                  commit_count=20,      # a label must be detected this many consecutive scans to LATCH no-flip
                  grip_delay_s=1.5,     # after the grasp closes, wait this long before firing the macro
                  vel_frac=0.5,         # streaming speed = fraction of MAX joint velocity
@@ -372,9 +410,9 @@ class NoFlipPlaceMacro:
         self.path = np.load(path).astype(np.float64)      # (M, 14) absolute-joint waypoints
         if self.path.ndim != 2 or self.path.shape[1] != 14:
             raise ValueError(f"no-flip release path must be (M,14); got {self.path.shape}")
-        # default cue = printed label seen -> don't flip; pass detector=None to disable, BarcodeGate()
+        # default cue = YOLO sees the target -> don't flip; pass detector=None to disable, BarcodeGate()
         # for zxing barcodes/QR, or your own callable
-        self.detector = LabelGate() if detector is self._UNSET else detector
+        self.detector = YoloGate() if detector is self._UNSET else detector
         if hasattr(self.detector, "debug"):
             self.detector.debug = bool(debug)             # route scan diagnostics to stdout
         self.commit_count = max(1, int(commit_count))
@@ -399,11 +437,11 @@ class NoFlipPlaceMacro:
     def _should_place(self, env, arm14) -> bool:
         """Detection gate: True => place the object as-is (no flip).
 
-        Default cue is BarcodeGate — a camera sees a barcode on the grasped package, meaning it is
-        oriented correctly and must not be flipped. The port stays open: pass detector=your own
-        callable(env, arm14) -> bool to __init__ to swap the cue, or detector=None to disable.
+        Default cue is YoloGate — a scan camera sees the target (label/barcode) on the grasped package,
+        meaning it is oriented correctly and must not be flipped. The port stays open: pass detector=your
+        own callable(env, arm14) -> bool to __init__ to swap the cue, or detector=None to disable.
 
-        `arm14` is the live 14-vec arm_joints [left7, right7] (unused by the barcode cue; available to
+        `arm14` is the live 14-vec arm_joints [left7, right7] (unused by the YOLO cue; available to
         custom detectors). Returns False when no detector is wired, so the macro is inert by default.
         """
         if self.detector is not None:
@@ -503,13 +541,14 @@ class NoFlipPlaceMacro:
         log.info("[no-flip-place] macro complete -> auto resumes from the live pose")
 
     def status(self, hold_s=1.5):
-        """Live snapshot for the GUI indicator. `hold_s` = how long after a decode the barcode is still
-        reported as "seen" (the detector samples once per auto tick). Returns a dict:
+        """Live snapshot for the GUI indicator. `hold_s` = how long after a detection the target is still
+        reported as "seen" (the detector samples once per auto tick). Returns a dict (the barcode_*
+        keys are kept for GUI back-compat; they now carry the YOLO detection state):
             enabled         — armed?
             has_detector    — a detection cue is wired (vs detector=None)
-            available       — the detector's backend is usable (zxing-cpp import ok); None if unknown
-            barcode_seen    — a barcode was decoded within hold_s (visible right now)
-            barcode_text    — payload of the most recent hit (or None)
+            available       — the detector's backend is usable (YOLO model loaded); None if unknown
+            barcode_seen    — the target was detected within hold_s (visible right now)
+            barcode_text    — label+confidence of the most recent hit (or None)
             committed       — THE LOCK is set: the next place is committed to no-flip
             commit_progress — 0..1 toward the lock (seen_count / commit_count)
             seen_count      — consecutive scans the label has been detected so far

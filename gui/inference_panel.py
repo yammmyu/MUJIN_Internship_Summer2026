@@ -228,36 +228,23 @@ class InferenceMixin:
 
         self.root.after(250, self._update_no_flip_indicator)
 
-    # Label-detection tuning params: (attr, label, from, to, step, is_int, tooltip). Editable ANYTIME
+    # YOLO-detection tuning params: (attr, label, from, to, step, is_int, tooltip). Editable ANYTIME
     # (they change detection only, no motion), so they are NOT part of the idle-only tuning lock.
     _LABEL_PARAM_SPEC = (
-        ("roi_top_frac", "Ignore top (frac)", 0.0, 0.9, 0.05, False,
-         "Crop off this fraction of the frame TOP before detecting (the top strip is all noise). "
-         "Higher = ignore more of the top."),
-        ("noise_floor_px", "Noise floor (px)", 100, 20000, 100, True,
-         "Blobs smaller than this pixel area aren't even considered candidates. Higher = fewer tiny "
-         "boxes / less sensitive to texture; too high can drop a small/distant label."),
-        ("min_fill", "Rectangle fill ≥", 0.0, 1.0, 0.05, False,
-         "How much of its bounding box the text block must fill. Higher = stricter 'solid rectangle' "
-         "(rejects scattered edges / glare)."),
-        ("min_edge_density", "Edge density ≥", 0.0, 0.5, 0.01, False,
-         "Fraction of edge pixels inside the block. Higher = demands denser printed text."),
-        ("min_char_comps", "Min characters ≥", 1, 60, 1, True,
-         "How many character-sized pieces the block must contain. Higher = demands more text "
-         "(rejects streaks/wrinkles with a few specks)."),
-        ("min_area_frac", "Min size (frac)", 0.0, 0.3, 0.005, False,
-         "Smallest block as a fraction of the frame. Higher = the label must appear bigger / closer."),
-        ("max_area_frac", "Max size (frac)", 0.02, 1.0, 0.01, False,
-         "Largest block as a fraction of the frame. Lower = rejects big blobs (a chunk of the scene "
-         "mistaken for a tag). Must stay above Min size."),
-        ("max_aspect", "Max aspect ≤", 1.0, 20.0, 0.5, False,
-         "Longest ÷ shortest side. Lower = rejects thin streaks (tape/wrinkles) more aggressively."),
+        ("conf", "Confidence ≥", 0.0, 1.0, 0.05, False,
+         "Minimum YOLO box confidence to count as a detection. Higher = fewer false positives but the "
+         "target must be seen more clearly; lower = more sensitive."),
+        ("iou", "NMS IoU", 0.0, 1.0, 0.05, False,
+         "Non-max-suppression IoU threshold. Lower = merges overlapping boxes more aggressively."),
+        ("imgsz", "Inference size", 320, 1280, 32, True,
+         "Longest-side image size fed to the model. Higher = better on small/distant targets but "
+         "slower; must be a multiple of 32."),
         ("commit_count", "Detections to lock", 1, 200, 1, True,
          "Consecutive detections needed to LOCK no-flip (and consecutive misses to unlock)."),
     )
 
     def _apply_label_param(self, name, var, is_int):
-        """Push one live label-detection tunable to the running LabelGate (takes effect next scan)."""
+        """Push one live YOLO-detection tunable to the running YoloGate (takes effect next scan)."""
         try:
             val = int(float(var.get())) if is_int else float(var.get())
         except (tk.TclError, ValueError):
