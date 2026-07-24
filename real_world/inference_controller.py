@@ -200,10 +200,15 @@ class InferenceController:
         # real_world/no_flip_place.py. Barcode-armed, so it fires (before the flip macro) only on
         # packages that show a code; inert otherwise.
         self.no_flip_place = None
+        barcode_gate = None
         try:
-            from real_world.no_flip_place import NoFlipPlaceMacro, DEFAULT_PATH as NFP_PATH
+            from real_world.no_flip_place import NoFlipPlaceMacro, YoloGate, DEFAULT_PATH as NFP_PATH
             if os.path.exists(NFP_PATH):
-                self.no_flip_place = NoFlipPlaceMacro(vel_frac=PLACE_MACRO_VEL_FRAC)
+                # The model now emits both "barcode" and "package", so the no-flip cue must be filtered
+                # to the barcode class ONLY — otherwise a package with no barcode would false-trigger the
+                # no-flip release. (Case-insensitive: matches a model class named "Barcode" too.)
+                barcode_gate = YoloGate(classes={"barcode"})
+                self.no_flip_place = NoFlipPlaceMacro(detector=barcode_gate, vel_frac=PLACE_MACRO_VEL_FRAC)
             else:
                 log.warning("no-flip-place disabled: release path not found at %s", NFP_PATH)
         except Exception as e:

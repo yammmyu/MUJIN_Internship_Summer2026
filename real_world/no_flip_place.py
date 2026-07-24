@@ -64,7 +64,7 @@ DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "assets", "no_flip_releas
 
 # Trained YOLO weights the default detector loads (ultralytics .pt). Drop the trained model here (or
 # pass weights=... / call YoloGate.reload(path)); until it exists the gate loads but never fires.
-DEFAULT_WEIGHTS = os.path.join(os.path.dirname(__file__), "assets", "no_flip_yolo.pt")
+DEFAULT_WEIGHTS = os.path.join(os.path.dirname(__file__), "assets", "head_yolo.pt")
 
 R_GRIP_IDX = 1          # right channel in a [gl, gr] gripper command
 
@@ -91,7 +91,7 @@ class YoloGate:
     """
 
     def __init__(self, cameras=SCAN_CAMERAS, *, weights=DEFAULT_WEIGHTS, conf=0.5, iou=0.45,
-                 imgsz=640, classes=None, device=None):
+                 imgsz=640, classes=None, device=None, model=None):
         self.cameras = tuple(cameras)
         self.weights = str(weights)
         self.conf = float(conf)               # min box confidence to count as a detection (GUI-tunable)
@@ -107,9 +107,13 @@ class YoloGate:
         self.debug = False                    # set True (via NoFlipPlaceMacro debug) for per-scan diag
         self._last_diag = 0.0                 # throttle timer for the debug print
         self._warned = False                  # one-shot guard for repeated predict errors
-        self._model = None                    # loaded ultralytics YOLO (None => gate never fires)
+        self._model = model                   # loaded ultralytics YOLO (None => gate never fires)
         self._load_error = None               # human-readable reason the model is not loaded
-        self._load()
+        if model is None:
+            self._load()                      # load the weights ourselves
+        else:                                 # reuse a preloaded model (shared between gates)
+            log.info("[no-flip-place] YoloGate using a shared preloaded model (classes=%s)",
+                     getattr(model, "names", None))
 
     def _load(self):
         """Lazily import ultralytics and load the weights. Never raises: on any failure the gate stays
@@ -154,18 +158,37 @@ class YoloGate:
         """True when the YOLO model is loaded (i.e. detection can actually run)."""
         return self._model is not None
 
+    @property
+    def model(self):
+        """The loaded ultralytics model (or None) — pass to another YoloGate(model=...) to share it."""
+        return self._model
+
     def seen_within(self, hold_s) -> bool:
         """Was a target detected in the last `hold_s` seconds? (drives the live GUI indicator)."""
         return self.last_seen_monotonic > 0.0 and (time.monotonic() - self.last_seen_monotonic) < hold_s
 
     def _class_ok(self, cls_id, names) -> bool:
-        """Whether a detected class id passes the optional `classes` filter (ids or names)."""
+        """Whether a detected class id passes the optional `classes` filter (ids or names). Name
+        matching is CASE-INSENSITIVE so a filter of {"barcode"} matches a model class named "Barcode"."""
         if self.classes is None:
             return True
         if cls_id in self.classes:
             return True
         name = names.get(cls_id) if isinstance(names, dict) else None
-        return name is not None and name in self.classes
+        if name is None:
+            return False
+        name_l = name.lower()
+        return any(isinstance(c, str) and c.lower() == name_l for c in self.classes)
+
+    def has_class(self, name) -> bool:
+        """True if the loaded model can emit a class with this name (case-insensitive). Used by callers
+        that must fail-open when the class they gate on isn't in the model (e.g. a barcode-only model
+        has no 'package')."""
+        if self._model is None:
+            return False
+        names = getattr(self._model, "names", {}) or {}
+        vals = names.values() if isinstance(names, dict) else names
+        return any(isinstance(v, str) and v.lower() == str(name).lower() for v in vals)
 
     def _detect(self, rgb):
         """Run the model on one uint8 RGB frame and return accepted detections as
