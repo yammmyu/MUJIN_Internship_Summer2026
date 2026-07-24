@@ -1,8 +1,8 @@
 """Standalone CCDP-style grasp-failure recovery for the dual-arm policy.
 
-Self-contained: loads the wrist-camera grasp detector (data/grasp_detector/detector.pt,
-trained in the diffusion_policy repo) and drives failure recovery, with NO GUI coupling
-and only three small call-ins from InferenceController. Needs only torch + torchvision +
+Self-contained: loads a wrist-camera YOLO gripper-state detector (data/grasp_detector/detector.pt,
+a 3-class bbox model: open / closed-gripped / closed-empty) and drives failure recovery, with NO
+GUI coupling and only three small call-ins from InferenceController. Needs only ultralytics +
 the .pt checkpoint on the client machine (detection runs LOCALLY, not on the policy server).
 
 WHAT IT DOES
@@ -10,7 +10,8 @@ WHAT IT DOES
 Watches the RIGHT gripper command in each policy chunk. On an open->close transition it
 arms a grasp attempt and, after `settle_sec` (default 5 s — deliberately late so the check
 never perturbs the grasp itself), runs the detector on the right wrist frame
-(obs['handr_imgs'][-1]). If the gripper closed on nothing it enters RECOVERY:
+(obs['handr_imgs'][-1]). If the detector reports 'closed-empty' (gripper closed on nothing) it
+enters RECOVERY:
 
     1. clear the robot queue (drop the policy's "I grasped, now lift" rows)
     2. OPEN the right gripper, then move BOTH arms to a fixed HOME joint pose by ABSOLUTE joint
@@ -37,11 +38,8 @@ import logging
 import time
 
 import numpy as np
-import torch
-import torch.nn as nn
 from PIL import Image
-from torchvision import transforms
-from torchvision.models import resnet18
+from ultralytics import YOLO
 
 from real_world.retreat import retreat_to_nearest
 
@@ -54,37 +52,38 @@ R_POS = slice(10, 13)   # right pos3
 R_ROT = slice(13, 19)   # right rot6d6
 R_GRIP = 19
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+# 3-class wrist-camera gripper-state model. Recovery fires ONLY when the detector reports this
+# state (gripper closed but holding nothing). "open" and "closed-gripped" -> hold, no recovery.
+RECOVERY_STATE = "closed-empty"
 
 
 class _Detector:
-    """Inlined GraspDetector: ResNet18 head on the fixed finger-gap ROI crop."""
+    """Inlined YOLO gripper-state detector: a 3-class bbox model (open / closed-gripped /
+    closed-empty) over the right wrist frame. classify() returns the highest-confidence detected
+    state name and its confidence, or (None, 0.0) when nothing clears the conf threshold."""
 
-    def __init__(self, ckpt_path, device=None):
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        # weights_only=False: the checkpoint stores plain python values (roi/threshold/size) next to
-        # the state_dict, which torch>=2.6's weights_only default rejects. It's our own trusted file.
-        ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        self.roi = tuple(ck["roi"])
-        self.empty_idx = ck["empty_idx"]
-        self.threshold = ck["threshold"]
-        m = resnet18(weights=None)
-        m.fc = nn.Linear(m.fc.in_features, 2)
-        m.load_state_dict(ck["state_dict"])
-        self.model = m.to(self.device).eval()
-        self.tf = transforms.Compose([
-            transforms.Resize((ck["size"], ck["size"])),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
+    def __init__(self, ckpt_path, *, conf=0.40, device=None):
+        self.conf = float(conf)
+        self.device = device                       # None -> ultralytics auto-selects (cuda if avail)
+        self.model = YOLO(ckpt_path)
+        self.names = {int(i): str(n) for i, n in self.model.names.items()}
+        if RECOVERY_STATE not in self.names.values():
+            log.warning("[grasp-yolo] model classes %s do not include '%s' -> recovery can NEVER "
+                        "fire; retrain or rename the model's classes", self.names, RECOVERY_STATE)
 
-    @torch.no_grad()
-    def p_empty(self, frame) -> float:
+    def classify(self, frame):
+        """(state_name, confidence). state_name is None when no box clears self.conf."""
         if not isinstance(frame, Image.Image):
             frame = Image.fromarray(np.asarray(frame)[..., :3].astype(np.uint8))
-        x = self.tf(frame.convert("RGB").crop(self.roi)).unsqueeze(0).to(self.device)
-        return torch.softmax(self.model(x), dim=1)[0, self.empty_idx].item()
+        # Pass a PIL image: ultralytics treats it as RGB (obs frames are RGB), so no BGR channel swap.
+        res = self.model.predict(frame.convert("RGB"), conf=self.conf, device=self.device,
+                                 verbose=False)[0]
+        boxes = res.boxes
+        if boxes is None or len(boxes) == 0:
+            return None, 0.0
+        confs = boxes.conf.cpu().numpy()
+        i = int(confs.argmax())                    # highest-confidence detection is the gripper state
+        return self.names.get(int(boxes.cls[i].item())), float(confs[i])
 
 
 class GraspRecoveryMonitor:
@@ -99,8 +98,9 @@ class GraspRecoveryMonitor:
                  open_grip=0.0,                      # 0 = open; the recovery opens the right gripper
                  closed_grip_min=10.0,               # = postprocess.GRIPPER_CLOSE_THRESH: note_action
                                                      # reads the RAW server grip [0,~85] (pre-binarize)
+                 conf=0.40,                          # min YOLO box confidence to accept a state
                  device=None):
-        self.det = _Detector(detector_path, device=device)
+        self.det = _Detector(detector_path, conf=conf, device=device)
         self.settle_sec = settle_sec
         # Normalize to (n, 14): accept a waypoint list/array or a single legacy (14,) home pose.
         self.retreat_waypoints = (np.asarray(retreat_waypoints, dtype=float).reshape(-1, 14)
@@ -118,9 +118,9 @@ class GraspRecoveryMonitor:
         # auto-loop interface.
         self._retreating = False
         self._log_ts = {}             # key -> last monotonic log time (rate-limits hot-loop logs)
-        log.info("GraspRecoveryMonitor ready: settle=%.1fs closed_grip_min=%.1f roi=%s thr=%.2f "
-                 "device=%s", settle_sec, self.closed_grip_min, self.det.roi, self.det.threshold,
-                 self.det.device)
+        log.info("GraspRecoveryMonitor ready: settle=%.1fs closed_grip_min=%.1f classes=%s "
+                 "recover_on='%s' conf>=%.2f device=%s", settle_sec, self.closed_grip_min,
+                 self.det.names, RECOVERY_STATE, self.det.conf, self.det.device or "auto")
 
     def _throttled(self, key, interval=2.0):
         now = time.monotonic()
@@ -174,15 +174,15 @@ class GraspRecoveryMonitor:
                         "cannot run detector", list(obs.keys()))
             return False
 
-        p = self.det.p_empty(frame)
-        if p < self.det.threshold:
-            log.info("[grasp-check] detector P_empty=%.2f < thr=%.2f -> grasp HELD, no recovery",
-                     p, self.det.threshold)
+        state, conf = self.det.classify(frame)
+        if state != RECOVERY_STATE:
+            log.info("[grasp-check] detector state=%s (conf=%.2f), recover only on '%s' -> grasp "
+                     "HELD, no recovery", state, conf, RECOVERY_STATE)
             return False
 
         self._begin_retreat(env, obs)
-        log.warning("[recovery] missed grasp (P_empty=%.2f >= thr=%.2f) -> opened gripper + moved home",
-                    p, self.det.threshold)
+        log.warning("[recovery] missed grasp (state=%s conf=%.2f) -> opened gripper + moved home",
+                    state, conf)
         return True
 
     @property

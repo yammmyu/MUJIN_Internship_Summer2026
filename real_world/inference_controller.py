@@ -97,13 +97,19 @@ def post_predict(host: str, port: int, req: dict, timeout: float = 60.0) -> dict
         conn.close()
 
 
+# Default grasp-detector checkpoint: the 3-class YOLO gripper-state model shipped next to this
+# file in real_world/assets/. Resolved from __file__ so it works regardless of the CWD.
+DEFAULT_GRASP_DETECTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "assets", "right_yolo.pt")
+
+
 class InferenceController:
     """Drives the left_arm_ee_image policy: server round-trip + env hand-off."""
 
     def __init__(self, env, robot_info=None,
                  host=PC4080_HOST, port=PC4080_PORT,
                  record_hz=RECORD_HZ, inference_hz=INFERENCE_HZ,
-                 obs_source=None, grasp_detector_path='/home/mujin/workspaces/humanoid/data/grasp_detector/detector.pt'):
+                 obs_source=None, grasp_detector_path=DEFAULT_GRASP_DETECTOR):
         self.humanoid_env = env                 # owned/started/stopped by the caller (GUI)
         self.robot_info = robot_info            # shared with robot_info_server (None = headless)
         # Where observations come from: the live env by default, or an injected source (e.g.

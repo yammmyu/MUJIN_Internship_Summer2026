@@ -114,7 +114,7 @@ class RobotControlGUI(StyleMixin, CameraMixin, InferenceMixin, DetectorTuningMix
         self._sim_stop = threading.Event()
 
         # 策略推理控制器（复用注入的 env）
-        self.inference = InferenceController(self.env, self.robot_info, grasp_detector_path="data/grasp_detector/detector.pt")
+        self.inference = InferenceController(self.env, self.robot_info)
 
         # ---- VR data channel ----
         # Uplink (:5556): headset -> _handle_vr_joints (the only place VR poses reach the robot).
