@@ -7,11 +7,10 @@ the .pt checkpoint on the client machine (detection runs LOCALLY, not on the pol
 
 WHAT IT DOES
 ------------
-Watches the RIGHT gripper command in each policy chunk. On an open->close transition it
-arms a grasp attempt and, after `settle_sec` (default 5 s — deliberately late so the check
-never perturbs the grasp itself), runs the detector on the right wrist frame
-(obs['handr_imgs'][-1]). If the detector reports 'closed-empty' (gripper closed on nothing) it
-enters RECOVERY:
+Whenever the RIGHT gripper is commanded CLOSED, runs the YOLO detector on the right wrist frame
+(obs['handr_imgs'][-1]) EVERY loop — no settle wait, no one-shot latch. The instant it reports
+'closed-empty' (gripper closed on nothing) for `confirm_frames` consecutive checks (default 1 =
+immediately) it enters RECOVERY:
 
     1. clear the robot queue (drop the policy's "I grasped, now lift" rows)
     2. OPEN the right gripper, then move BOTH arms to a fixed HOME joint pose by ABSOLUTE joint
@@ -71,13 +70,17 @@ class _Detector:
             log.warning("[grasp-yolo] model classes %s do not include '%s' -> recovery can NEVER "
                         "fire; retrain or rename the model's classes", self.names, RECOVERY_STATE)
 
-    def classify(self, frame):
-        """(state_name, confidence). state_name is None when no box clears self.conf."""
+    def classify(self, frame, imgsz=None):
+        """(state_name, confidence). state_name is None when no box clears self.conf. `imgsz` lets a
+        caller run a cheaper forward pass (e.g. the live GUI pill at the wrist frame's native 320px)
+        without touching the full-res recovery check."""
         if not isinstance(frame, Image.Image):
             frame = Image.fromarray(np.asarray(frame)[..., :3].astype(np.uint8))
+        kw = {"conf": self.conf, "device": self.device, "verbose": False}
+        if imgsz is not None:
+            kw["imgsz"] = int(imgsz)
         # Pass a PIL image: ultralytics treats it as RGB (obs frames are RGB), so no BGR channel swap.
-        res = self.model.predict(frame.convert("RGB"), conf=self.conf, device=self.device,
-                                 verbose=False)[0]
+        res = self.model.predict(frame.convert("RGB"), **kw)[0]
         boxes = res.boxes
         if boxes is None or len(boxes) == 0:
             return None, 0.0
@@ -117,7 +120,9 @@ class _Detector:
 
 class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
-                 settle_sec=1.0,
+                 confirm_frames=1,                   # consecutive closed-empty detections before it
+                                                     # fires (1 = the instant one is seen; raise to
+                                                     # debounce single-frame YOLO false positives)
                  # Pre-grasp APPROACH waypoints (n, 14) [left7, right7] the recovery retreats to (open
                  # gripper + move BOTH arms), ordered start -> pre-grasp. Passed in by the controller
                  # (real_world/config/retreat_waypoints.json). The retreat picks the nearest waypoint
@@ -130,25 +135,30 @@ class GraspRecoveryMonitor:
                  conf=0.40,                          # min YOLO box confidence to accept a state
                  device=None):
         self.det = _Detector(detector_path, conf=conf, device=device)
-        self.settle_sec = settle_sec
+        self.confirm_frames = max(1, int(confirm_frames))
         # Normalize to (n, 14): accept a waypoint list/array or a single legacy (14,) home pose.
         self.retreat_waypoints = (np.asarray(retreat_waypoints, dtype=float).reshape(-1, 14)
                                   if retreat_waypoints is not None else None)
         self.open_grip = float(open_grip)
         self.closed_grip_min = float(closed_grip_min)
 
-        # grasp-attempt tracking
+        # grasp-attempt tracking. The detector now runs EVERY tick while the right gripper is closed
+        # (no settle wait, no one-shot latch) and fires the instant it sees closed-empty, so all we
+        # keep is the consecutive-empty streak and the last commanded grip state (heartbeat fallback).
         self._prev_closed = False
-        self._close_t = None          # monotonic time of the last open->close transition
-        self._checked = False         # detector already run for this closure?
+        self._empty_streak = 0        # consecutive closed-empty detections while the gripper is closed
+        # Cached last gripper read for the (cheap) GUI pill. Updated by maybe_start during auto and by
+        # the controller's gripper_scan() when idle, so the pill NEVER runs its own forward pass on the
+        # UI thread while auto is running (which would double-infer AND race the loop on one YOLO model).
+        self._live = {"available": True, "frame_ok": False, "state": None, "conf": 0.0}
 
-        # recovery state. The retreat is now SYNCHRONOUS (open gripper + move_to_joints home in
+        # recovery state. The retreat is SYNCHRONOUS (open gripper + move_to_joints home in
         # _begin_retreat), so _retreating never latches True and pump() is a no-op — kept only for the
         # auto-loop interface.
         self._retreating = False
         self._log_ts = {}             # key -> last monotonic log time (rate-limits hot-loop logs)
-        log.info("GraspRecoveryMonitor ready: settle=%.1fs closed_grip_min=%.1f classes=%s "
-                 "recover_on='%s' conf>=%.2f device=%s", settle_sec, self.closed_grip_min,
+        log.info("GraspRecoveryMonitor ready: confirm_frames=%d closed_grip_min=%.1f classes=%s "
+                 "recover_on='%s' conf>=%.2f device=%s", self.confirm_frames, self.closed_grip_min,
                  self.det.names, RECOVERY_STATE, self.det.conf, self.det.device or "auto")
 
     def _throttled(self, key, interval=2.0):
@@ -158,65 +168,102 @@ class GraspRecoveryMonitor:
             return True
         return False
 
-    # -- hook 1: every policy chunk, to track the right-grip command ------------
+    # -- hook 1: every policy chunk. Heartbeat + a fallback 'right gripper closed?' signal for envs
+    #    that don't expose _last_grip_cmd (maybe_start prefers that; this is only a backstop).
     def note_action(self, action_chunk):
         a = np.asarray(action_chunk, dtype=float)
         if a.ndim != 2 or a.shape[1] <= R_GRIP:
-            if self._throttled("shape", 5.0):
-                log.warning("[grasp-check] action chunk shape %s has no right-grip col (need 2-D with "
-                            ">%d cols, i.e. a 20-col dual-arm row) -> grip tracking OFF, detector will "
-                            "never fire", a.shape, R_GRIP)
-            return
+            return                                        # not a 20-col dual-arm chunk -> ignore
         rgrip = float(a[-1, R_GRIP])
-        closed_now = bool(rgrip >= self.closed_grip_min)
+        self._prev_closed = bool(rgrip >= self.closed_grip_min)
         if self._throttled("grip", 2.0):                  # heartbeat: proves note_action is running
-            log.info("[grasp-check] right grip=%.1f (close>=%.1f) closed=%s armed=%s checked=%s",
-                     rgrip, self.closed_grip_min, closed_now, self._close_t is not None, self._checked)
-        if closed_now and not self._prev_closed:          # open -> close: attempt starts
-            self._close_t = time.monotonic()
-            self._checked = False
-            log.info("[grasp-check] open->close (grip=%.1f) -> attempt ARMED, detector check in %.1fs",
-                     rgrip, self.settle_sec)
-        elif not closed_now and self._prev_closed and not self._checked:
-            self._close_t = None                          # released before the check -> cancel it
-            log.info("[grasp-check] released before the %.1fs check -> attempt cancelled", self.settle_sec)
-        self._prev_closed = closed_now
+            log.info("[grasp-check] right grip=%.1f (close>=%.1f) closed=%s streak=%d",
+                     rgrip, self.closed_grip_min, self._prev_closed, self._empty_streak)
+
+    def _right_gripper_closed(self, env) -> bool:
+        """Is the RIGHT gripper commanded closed right now? Prefer the env's EFFECTIVE binary grip
+        command (_last_grip_cmd = [gl, gr], what no_flip/flip/package-gate all read); fall back to the
+        state note_action tracked from the action chunk."""
+        grip = getattr(env, "_last_grip_cmd", None)
+        if grip is not None and len(grip) > 1:
+            return bool(grip[1])
+        return self._prev_closed
 
     # -- hook 2: every loop BEFORE predict. True => entered recovery (skip predict)
     def maybe_start(self, env, obs) -> bool:
-        if self._retreating or self._close_t is None or self._checked:
+        """Runs the gripper detector on the right-wrist frame EVERY tick while the right gripper is
+        closed (a miss can only happen while closed) and, the instant it sees 'closed-empty' for
+        `confirm_frames` consecutive checks, opens the gripper and retreats. No settle wait and no
+        one-shot latch — it keeps watching so a miss is caught as soon as the model reports it."""
+        if self._retreating:
             return False
-        waited = time.monotonic() - self._close_t
-        if waited < self.settle_sec:
-            if self._throttled("settle", 1.0):
-                log.info("[grasp-check] grasp armed, settling %.1f/%.1fs before detector runs",
-                         waited, self.settle_sec)
+        if not self._right_gripper_closed(env):           # open / approach -> nothing to recover
+            self._empty_streak = 0
+            self._live = {"available": True, "frame_ok": True, "state": "open", "conf": 0.0}
             return False
-        self._checked = True
-        log.info("[grasp-check] settle elapsed -> running detector on right wrist frame")
 
         frame = obs.get("handr_imgs")
         if isinstance(frame, (list, tuple)):
             frame = frame[-1] if frame else None
         if frame is None:
-            log.warning("[grasp-check] no 'handr_imgs' right-wrist frame in obs (keys=%s) -> "
-                        "cannot run detector", list(obs.keys()))
+            if self._throttled("noframe", 2.0):
+                log.warning("[grasp-check] gripper closed but no 'handr_imgs' right-wrist frame in obs "
+                            "(keys=%s) -> cannot run detector", list(obs.keys()))
             return False
 
         state, conf = self.det.classify(frame)
+        self._live = {"available": True, "frame_ok": True, "state": state, "conf": float(conf)}
         if state != RECOVERY_STATE:
-            log.info("[grasp-check] detector state=%s (conf=%.2f), recover only on '%s' -> grasp "
-                     "HELD, no recovery", state, conf, RECOVERY_STATE)
+            self._empty_streak = 0
+            if self._throttled("held", 2.0):
+                log.info("[grasp-check] closed; state=%s conf=%.2f (recover on '%s') -> HELD",
+                         state, conf, RECOVERY_STATE)
             return False
 
+        # closed-empty seen -> count consecutive detections; fire the moment we reach confirm_frames.
+        self._empty_streak += 1
+        log.warning("[grasp-check] closed-empty detected (conf=%.2f) %d/%d",
+                    conf, self._empty_streak, self.confirm_frames)
+        if self._empty_streak < self.confirm_frames:
+            return False
+        self._empty_streak = 0
         self._begin_retreat(env, obs)
-        log.warning("[recovery] missed grasp (state=%s conf=%.2f) -> opened gripper + moved home",
-                    state, conf)
+        log.warning("[recovery] missed grasp (closed-empty conf=%.2f) -> opened gripper + retreated",
+                    conf)
         return True
 
     @property
     def is_retreating(self) -> bool:
         return self._retreating
+
+    def live_status(self):
+        """Cheap read of the last gripper state for the GUI pill — NO forward pass. Reflects the auto
+        loop's own detections during auto, or the controller's idle gripper_scan() otherwise."""
+        d = dict(self._live)
+        d["recover_on"] = RECOVERY_STATE
+        d["classes"] = list(self.det.names.values())
+        return d
+
+    def scan_live(self, env, imgsz=320):
+        """Run ONE cheap forward pass on the right-wrist frame and cache the result for the pill. Used
+        only while auto is OFF (during auto, maybe_start already refreshes the cache). imgsz defaults to
+        the wrist frame's native 320px so the idle pill is ~2.4x cheaper than the full recovery check."""
+        frame = None
+        if env is not None:
+            try:
+                frame = env.get_frame("hand_right")   # right wrist cam; request()s it -> keeps it ON
+            except Exception:
+                frame = None
+        if not (isinstance(frame, np.ndarray) and frame.size > 0):
+            self._live = {"available": True, "frame_ok": False, "state": None, "conf": 0.0}
+            return
+        try:
+            state, conf = self.det.classify(frame, imgsz=imgsz)
+        except Exception as e:
+            log.debug("gripper live scan skipped: %r", e)
+            self._live = {"available": True, "frame_ok": False, "state": None, "conf": 0.0}
+            return
+        self._live = {"available": True, "frame_ok": True, "state": state, "conf": float(conf)}
 
     # -- hook 3: kept for the auto-loop interface. The retreat is now synchronous (done inside
     # _begin_retreat), so there is nothing to stream here.
@@ -242,7 +289,7 @@ class GraspRecoveryMonitor:
         self._retreating = False
         # gripper is open now; re-arm grip tracking so the next close is a fresh attempt
         self._prev_closed = False
-        self._close_t = None
+        self._empty_streak = 0
 
     def reset(self):
         self._finish()
