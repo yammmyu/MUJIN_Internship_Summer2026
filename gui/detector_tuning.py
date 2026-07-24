@@ -29,8 +29,8 @@ class DetectorTuningMixin:
         outer = ttk.Frame(parent)
         outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # ---- left: live annotated head-camera view ----
-        left = ttk.LabelFrame(outer, text="  Head camera · live detection  ")
+        # ---- left: live annotated camera view (head OR right-wrist, per the source selector) ----
+        left = ttk.LabelFrame(outer, text="  Live detection  ")
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
         self._tune_view = tk.Label(left, bg="#111418")
         self._tune_view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -38,13 +38,24 @@ class DetectorTuningMixin:
         ttk.Label(left, textvariable=self._tune_stats_var, style="Value.TLabel").pack(
             anchor="w", padx=8, pady=(0, 6))
         ttk.Label(left, style="Caption.TLabel", justify="left",
-                  text="GREEN = accepted label block (WxH + #chars).   RED = rejected — the tag is the "
-                       "first failed gate (small / fill / aspect / density / chars).").pack(
+                  text="GREEN = accepted detection (class + confidence).   RED = below the confidence "
+                       "threshold (near-miss). Pick which model/camera to watch on the right.").pack(
             anchor="w", padx=8, pady=(0, 6))
 
         # ---- right: threshold controls (same live tunables as the macro) ----
         right = ttk.LabelFrame(outer, text="  Thresholds · live  ")
         right.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(8, 0))
+
+        # Live source: which model + camera the annotated view runs. "head" = the no-flip label YoloGate
+        # on the head camera (with its full threshold set below); "gripper" = the grasp-recovery
+        # right-wrist YOLO (open / closed-gripped / closed-empty), tuned by its own confidence spinbox.
+        src = ttk.Frame(right)
+        src.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ttk.Label(src, text="Live source", style="Caption.TLabel").pack(anchor="w")
+        self._tune_source_var = tk.StringVar(value="head")
+        for val, text in (("head", "Head · no-flip label"), ("gripper", "Right wrist · gripper")):
+            ttk.Radiobutton(src, text=text, value=val, variable=self._tune_source_var).pack(anchor="w")
+
         grid = ttk.Frame(right)
         grid.pack(fill=tk.X, padx=10, pady=10)
         grid.columnconfigure(1, weight=1)
@@ -73,7 +84,35 @@ class DetectorTuningMixin:
             ttk.Label(grid, text="(no-flip macro not loaded)", style="Caption.TLabel").grid(
                 row=len(self._LABEL_PARAM_SPEC) + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        # Gripper (right-wrist) detector: a single confidence threshold for the grasp-recovery YOLO.
+        # Applies to the live recovery check too (same detector instance). Disabled if it isn't loaded.
+        ttk.Separator(right, orient="horizontal").pack(fill=tk.X, padx=10, pady=(2, 6))
+        gframe = ttk.Frame(right)
+        gframe.pack(fill=tk.X, padx=10, pady=(0, 10))
+        gp = (self.inference.gripper_detector_params() if hasattr(self, "inference") else None) or None
+        glbl = ttk.Label(gframe, text="Gripper conf", anchor="w")
+        glbl.grid(row=0, column=0, sticky="w")
+        self.tip(glbl, "Min confidence for the right-wrist grasp-recovery detector (open / "
+                       "closed-gripped / closed-empty). Higher = stricter. Applies to recovery live.")
+        gframe.columnconfigure(1, weight=1)
+        self._tune_grip_conf = tk.DoubleVar(value=(gp or {}).get("conf", 0.40))
+        gsb = ttk.Spinbox(gframe, from_=0.05, to=0.95, increment=0.05, width=8,
+                          textvariable=self._tune_grip_conf, command=self._apply_gripper_conf)
+        self._bind_spinbox_apply(gsb, self._apply_gripper_conf)
+        gsb.grid(row=0, column=2, sticky="e", padx=4)
+        if gp is None:
+            gsb.state(["disabled"])
+            ttk.Label(gframe, text="(gripper detector not loaded)", style="Caption.TLabel").grid(
+                row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         self._detector_tuning_refresh()    # start the ~10 Hz live view (self-reschedules)
+
+    def _apply_gripper_conf(self, *_):
+        """Push the gripper-detector confidence to the live recovery detector (takes effect next scan)."""
+        try:
+            self.inference.set_gripper_param("conf", float(self._tune_grip_conf.get()))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     def _detector_tuning_refresh(self):
@@ -97,13 +136,17 @@ class DetectorTuningMixin:
         self.root.after(100, self._detector_tuning_refresh)
 
     def _render_detector_tuning(self):
+        # Source selector: "gripper" -> right-wrist camera + grasp-recovery YOLO; else head + no-flip.
+        source = getattr(self, "_tune_source_var", None)
+        source = source.get() if source is not None else "head"
+        cam = "hand_right" if source == "gripper" else "head"
         frame = None
         try:
-            frame = self.env.get_frame("head")   # also keeps the head camera ON while this tab is up
+            frame = self.env.get_frame(cam)      # also keeps that camera ON while this tab is up
         except Exception:
             frame = None
         if not isinstance(frame, np.ndarray) or frame.size == 0:
-            self._tune_stats_var.set("waiting for head camera…")
+            self._tune_stats_var.set(f"waiting for {cam} camera…")
             return
         img = frame
         if img.ndim == 2:
@@ -113,7 +156,11 @@ class DetectorTuningMixin:
         if img.dtype != np.uint8:
             img = np.clip(img, 0, 255).astype(np.uint8)
 
-        det = self.inference.no_flip_detector() if hasattr(self, "inference") else None
+        if hasattr(self, "inference"):
+            det = (self.inference.gripper_detector() if source == "gripper"
+                   else self.inference.no_flip_detector())
+        else:
+            det = None
         # Show/analyze only what the detector sees: crop off the same noisy top strip it ignores, so the
         # view matches detection and the drawn boxes are in the cropped frame's coordinates.
         if det is not None and hasattr(det, "crop_roi"):
@@ -144,9 +191,9 @@ class DetectorTuningMixin:
             avail = getattr(det, "available", None)
             note = "" if avail is not False else "  ·  model not loaded (add weights)"
             self._tune_stats_var.set(
-                f"detections {accepted}  ·  {drawn} box(es) shown{note}")
+                f"[{cam}]  detections {accepted}  ·  {drawn} box(es) shown{note}")
         else:
-            self._tune_stats_var.set("no YOLO detector loaded (showing raw frame)")
+            self._tune_stats_var.set(f"[{cam}]  no YOLO detector loaded (showing raw frame)")
 
         # resize to the view width, keep aspect, render (PhotoImage kept referenced to avoid GC)
         pil = Image.fromarray(vis)

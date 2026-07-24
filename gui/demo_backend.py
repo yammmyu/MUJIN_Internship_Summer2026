@@ -354,6 +354,25 @@ class DemoInference(_Stub):
             "present_count": int(min(t, 3.0)) if present else 0,
         }
 
+    def gripper_state_status(self):
+        # Synthetic 12 s cycle so the gripper pill visibly walks the three states:
+        # closed-gripped (holding) -> open -> closed-empty (a missed grasp -> recovery).
+        t = _clock() % 12.0
+        if t < 5.0:
+            state, conf = "closed-gripped", 0.90
+        elif t < 8.0:
+            state, conf = "open", 0.82
+        else:
+            state, conf = "closed-empty", 0.86
+        return {"available": True, "frame_ok": True, "state": state, "conf": conf,
+                "recover_on": "closed-empty", "classes": ["open", "closed-gripped", "closed-empty"]}
+
+    def gripper_detector(self):
+        return None            # demo has no real weights; the tuning view shows the synthetic frame
+
+    def gripper_detector_params(self):
+        return None
+
     @property
     def no_flip_place_enabled(self):
         return self._no_flip_enabled

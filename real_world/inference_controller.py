@@ -544,6 +544,55 @@ class InferenceController:
             except Exception as e:
                 log.debug("no-flip-place idle scan skipped: %r", e)
 
+    # ---- Gripper-state detector (grasp-recovery YOLO): live indicator + tuning-view surface -------- #
+    def gripper_detector(self):
+        """The live gripper-state detector (grasp_recovery._Detector) for the tuning page to run
+        analyze() on, or None if grasp recovery isn't loaded. Same instance the recovery uses, so a
+        confidence edit in the tuning tab changes the live recovery check too."""
+        rec = getattr(self, "recovery", None)
+        return getattr(rec, "det", None) if rec is not None else None
+
+    def gripper_detector_params(self):
+        """Current live gripper-detector tunable(s) to seed the tuning widgets, or None."""
+        det = self.gripper_detector()
+        return {"conf": det.conf} if det is not None else None
+
+    def set_gripper_param(self, name, value):
+        """Live-set one gripper-detector tunable (currently just 'conf'); effective on the next scan."""
+        det = self.gripper_detector()
+        if det is not None and hasattr(det, name):
+            cur = getattr(det, name)
+            setattr(det, name, type(cur)(value))     # keep the param's original type
+
+    def gripper_state_status(self):
+        """Live snapshot for the GUI gripper pill: classify the current right-wrist frame ("hand_right")
+        into the detector's gripper state (open / closed-gripped / closed-empty). None if no detector.
+        Detection is LOCAL and cheap, so this runs every ~250 ms without competing with the (remote)
+        policy — during auto the recovery still owns the real grasp check; this is a passive read-out."""
+        det = self.gripper_detector()
+        if det is None:
+            return None
+        from real_world.grasp_recovery import RECOVERY_STATE
+        classes = list(det.names.values())
+        env = self.humanoid_env
+        frame = None
+        if env is not None:
+            try:
+                frame = env.get_frame("hand_right")   # right wrist cam; also request()s it -> keeps ON
+            except Exception:
+                frame = None
+        if not (isinstance(frame, np.ndarray) and frame.size > 0):
+            return {"available": True, "frame_ok": False, "state": None, "conf": 0.0,
+                    "recover_on": RECOVERY_STATE, "classes": classes}
+        try:
+            state, conf = det.classify(frame)
+        except Exception as e:
+            log.debug("gripper-state idle scan skipped: %r", e)
+            return {"available": True, "frame_ok": False, "state": None, "conf": 0.0,
+                    "recover_on": RECOVERY_STATE, "classes": classes}
+        return {"available": True, "frame_ok": True, "state": state, "conf": float(conf),
+                "recover_on": RECOVERY_STATE, "classes": classes}
+
     # ---- Package-presence gate: pause + home when there's no package to work on ------------------- #
     @property
     def package_gate_enabled(self):

@@ -273,6 +273,46 @@ class InferenceMixin:
             return
         self.root.after(250, self._update_package_gate_indicator)
 
+    def _update_gripper_indicator(self):
+        """Repaint the gripper-state pill (~4 Hz) from the grasp-recovery YOLO's live view of the RIGHT
+        WRIST camera. Passive read-out (recovery arms itself, so there's no checkbox) of the current
+        gripper state:
+          * grey  — no gripper detector loaded
+          * amber — loaded but no wrist frame yet
+          * red (solid)   — 'closed-empty' (the state that triggers grasp recovery)
+          * green (solid)  — 'closed-gripped' (holding something)
+          * grey  — 'open' / nothing detected
+        Detection is local, so this stays live during auto too (the recovery still owns the real check).
+        """
+        ind = getattr(self, "_gripper_ind", None)
+        if ind is None:
+            return
+        th = self.theme
+        try:
+            st = self.inference.gripper_state_status()
+        except Exception:
+            st = None
+        if not st:
+            label, bg, fg = "○  gripper: n/a", th.APP_BG, th.DOT_OFF
+        elif not st.get("frame_ok"):
+            label, bg, fg = "◌  waiting for wrist cam…", th.WARN_SOFT, th.WARN_DARK
+        else:
+            state = st.get("state")
+            conf = st.get("conf") or 0.0
+            if state and state == st.get("recover_on"):     # closed-empty -> recovery trigger
+                label, bg, fg = f"●  {state}  {conf:.2f}", th.DANGER, "white"
+            elif state == "closed-gripped":
+                label, bg, fg = f"◉  gripped  {conf:.2f}", th.SUCCESS, "white"
+            elif state == "open":
+                label, bg, fg = f"○  open  {conf:.2f}", th.APP_BG, th.DOT_OFF
+            else:
+                label, bg, fg = "◌  gripper: —", th.APP_BG, th.DOT_OFF
+        try:
+            ind.config(text=label, bg=bg, fg=fg)
+        except tk.TclError:
+            return
+        self.root.after(250, self._update_gripper_indicator)
+
     # YOLO-detection tuning params: (attr, label, from, to, step, is_int, tooltip). Editable ANYTIME
     # (they change detection only, no motion), so they are NOT part of the idle-only tuning lock.
     _LABEL_PARAM_SPEC = (
@@ -693,6 +733,22 @@ class InferenceMixin:
                                           bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
         self._package_gate_ind.pack(side=tk.RIGHT)
         self._update_package_gate_indicator()     # paint once now + start the ~4 Hz refresh
+
+        # Gripper grasp-check indicator: a LIVE pill (repainted ~4 Hz by _update_gripper_indicator) of
+        # what the grasp-recovery YOLO sees on the RIGHT WRIST camera (open / closed-gripped /
+        # closed-empty). Passive read-out — recovery arms itself, so there is no checkbox here.
+        grip_row = ttk.Frame(sec_auto)
+        grip_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        grip_lbl = ttk.Label(grip_row, text="Gripper grasp check (right-wrist YOLO)")
+        grip_lbl.pack(side=tk.LEFT)
+        self.tip(grip_lbl,
+                 "Live read-out of the grasp-recovery detector on the right wrist camera. Red = "
+                 "'closed-empty' (a missed grasp — recovery opens + re-homes); green = holding an item; "
+                 "grey = open. Tune its confidence in the Detector-tuning tab (Right-wrist source).")
+        self._gripper_ind = tk.Label(grip_row, text="●  gripper", font=self.theme.ui(9, "bold"),
+                                     bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
+        self._gripper_ind.pack(side=tk.RIGHT)
+        self._update_gripper_indicator()          # paint once now + start the ~4 Hz refresh
 
         # (Emergency stop lives in the pinned bar at the top of this column — always reachable.)
 

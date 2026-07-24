@@ -85,6 +85,35 @@ class _Detector:
         i = int(confs.argmax())                    # highest-confidence detection is the gripper state
         return self.names.get(int(boxes.cls[i].item())), float(confs[i])
 
+    @property
+    def available(self):
+        """True when a YOLO model is loaded (detection can run). Mirrors YoloGate.available so the
+        detector-tuning view can treat the gripper and no-flip detectors uniformly."""
+        return self.model is not None
+
+    def analyze(self, frame, floor=0.05):
+        """Detector-tuning helper: run YOLO at a low confidence FLOOR and return every box as a dict
+        {x, y, w, h, reason, text} in the tuning view's schema — reason is None for boxes that clear the
+        live self.conf (drawn green) and a short string for below-threshold near-misses (drawn red), so
+        the same render path used for the no-flip YoloGate renders the gripper model too."""
+        if not isinstance(frame, Image.Image):
+            frame = Image.fromarray(np.asarray(frame)[..., :3].astype(np.uint8))
+        res = self.model.predict(frame.convert("RGB"), conf=float(floor), device=self.device,
+                                 verbose=False)[0]
+        out = []
+        boxes = res.boxes
+        if boxes is None or len(boxes) == 0:
+            return out
+        xyxy = boxes.xyxy.cpu().numpy()
+        cls = boxes.cls.cpu().numpy()
+        cf = boxes.conf.cpu().numpy()
+        for (x1, y1, x2, y2), c, p in zip(xyxy, cls, cf):
+            name = self.names.get(int(c), str(int(c)))
+            out.append({"x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1),
+                        "reason": None if p >= self.conf else f"conf {p:.2f}",
+                        "text": f"{name} {p:.2f}"})
+        return out
+
 
 class GraspRecoveryMonitor:
     def __init__(self, detector_path, *,
