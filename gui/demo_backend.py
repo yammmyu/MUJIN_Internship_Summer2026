@@ -367,6 +367,12 @@ class DemoInference(_Stub):
         return {"available": True, "frame_ok": True, "state": state, "conf": conf,
                 "recover_on": "closed-empty", "classes": ["open", "closed-gripped", "closed-empty"]}
 
+    def gripper_scan(self, *a, **k):
+        return None            # demo status is synthetic; nothing to scan
+
+    def scan_head_gates(self, *a, **k):
+        return None            # demo no-flip/package statuses are synthetic; nothing to scan
+
     def gripper_detector(self):
         return None            # demo has no real weights; the tuning view shows the synthetic frame
 

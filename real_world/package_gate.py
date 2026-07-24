@@ -66,11 +66,13 @@ class PackagePresenceGate:
         return bool(getattr(det, "available", False) and hasattr(det, "has_class")
                     and det.has_class(self.package_class))
 
-    def scan(self, env) -> bool:
+    def scan(self, env, seen=None) -> bool:
         """Run one package detection and update the debounced `present` belief. Returns `present`.
-        Does not move the robot, so it is safe to call outside the auto loop (e.g. a GUI indicator)."""
-        seen = bool(self.detector(env, None))
-        if seen:
+        Does not move the robot, so it is safe to call outside the auto loop (e.g. a GUI indicator).
+        `seen` lets a caller inject the detection result (from a shared head scan) so this doesn't run
+        its own predict; None -> detect here as usual."""
+        got = bool(self.detector(env, None)) if seen is None else bool(seen)
+        if got:
             self._present += 1
             self._absent = 0
             if not self.present and self._present >= self.present_to_resume:

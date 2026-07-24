@@ -565,33 +565,39 @@ class InferenceController:
             setattr(det, name, type(cur)(value))     # keep the param's original type
 
     def gripper_state_status(self):
-        """Live snapshot for the GUI gripper pill: classify the current right-wrist frame ("hand_right")
-        into the detector's gripper state (open / closed-gripped / closed-empty). None if no detector.
-        Detection is LOCAL and cheap, so this runs every ~250 ms without competing with the (remote)
-        policy — during auto the recovery still owns the real grasp check; this is a passive read-out."""
-        det = self.gripper_detector()
-        if det is None:
-            return None
-        from real_world.grasp_recovery import RECOVERY_STATE
-        classes = list(det.names.values())
+        """CHEAP snapshot for the GUI gripper pill — reads the recovery monitor's cached last read, NO
+        forward pass. During auto the loop's maybe_start keeps that cache fresh; while idle the GUI
+        calls gripper_scan() (below) to refresh it. None if no detector is loaded."""
+        rec = getattr(self, "recovery", None)
+        return rec.live_status() if rec is not None else None
+
+    def gripper_scan(self, imgsz=320):
+        """Run ONE right-wrist forward pass and cache it for the pill. Called by the GUI ONLY while auto
+        is OFF and the indicator is visible, so YOLO never runs on the UI thread during auto (where it
+        would double-infer and race the loop on the same model). No-op if recovery isn't loaded."""
+        rec = getattr(self, "recovery", None)
+        if rec is not None:
+            rec.scan_live(self.humanoid_env, imgsz=imgsz)
+
+    def scan_head_gates(self):
+        """Drive the barcode (no-flip) and package gates from ONE shared head-camera YOLO pass rather
+        than two. Both gates reuse the same model, so this halves the idle head-cam inference the GUI
+        pills would otherwise do (one predict feeds both latch/debounce updates). No-op if env or both
+        gates are missing; degrades to per-gate scans inside scan_gates_once if the model isn't shared."""
+        from real_world.no_flip_place import scan_gates_once
         env = self.humanoid_env
-        frame = None
-        if env is not None:
-            try:
-                frame = env.get_frame("hand_right")   # right wrist cam; also request()s it -> keeps ON
-            except Exception:
-                frame = None
-        if not (isinstance(frame, np.ndarray) and frame.size > 0):
-            return {"available": True, "frame_ok": False, "state": None, "conf": 0.0,
-                    "recover_on": RECOVERY_STATE, "classes": classes}
-        try:
-            state, conf = det.classify(frame)
-        except Exception as e:
-            log.debug("gripper-state idle scan skipped: %r", e)
-            return {"available": True, "frame_ok": False, "state": None, "conf": 0.0,
-                    "recover_on": RECOVERY_STATE, "classes": classes}
-        return {"available": True, "frame_ok": True, "state": state, "conf": float(conf),
-                "recover_on": RECOVERY_STATE, "classes": classes}
+        nfp = getattr(self, "no_flip_place", None)
+        pkg = getattr(self, "package_gate", None)
+        bg = getattr(nfp, "detector", None) if nfp is not None else None
+        pg = getattr(pkg, "detector", None) if pkg is not None else None
+        gates = [g for g in (bg, pg) if g is not None]
+        if env is None or not gates:
+            return
+        seen = scan_gates_once(env, gates)
+        if nfp is not None and bg is not None:
+            nfp.scan(env, seen=seen.get(bg, False))
+        if pkg is not None and pg is not None:
+            pkg.scan(env, seen=seen.get(pg, False))
 
     # ---- Package-presence gate: pause + home when there's no package to work on ------------------- #
     @property

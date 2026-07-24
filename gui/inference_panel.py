@@ -143,6 +143,19 @@ class InferenceMixin:
         self.status_text.set("■ Auto-run stopped (queue drains naturally; E-stop halts immediately)")
         self._refresh_tuning_state()         # idle again -> unlock tuning
 
+    def _ensure_head_scan(self, min_interval=0.30):
+        """Run ONE shared head-camera YOLO pass that drives BOTH the no-flip and package gates, at most
+        once per `min_interval`. The two head pills call this instead of each scanning the head model
+        themselves, so their independent refresh timers still cost only a single predict per interval."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_head_scan_t", 0.0) < min_interval:
+            return
+        self._last_head_scan_t = now
+        try:
+            self.inference.scan_head_gates()
+        except Exception:
+            pass
+
     def _update_no_flip_indicator(self):
         """Repaint the no-flip label pill from the macro's live status (~4 Hz), and push a one-time
         status-bar message on the two key edges (first detection, and the lock):
@@ -154,6 +167,13 @@ class InferenceMixin:
         ind = getattr(self, "_no_flip_ind", None)
         if ind is None:
             return
+        try:
+            visible = bool(ind.winfo_viewable())
+        except tk.TclError:
+            return
+        if not visible:                       # inference tab hidden -> skip the YOLO scan entirely
+            self.root.after(350, self._update_no_flip_indicator)
+            return
         th = self.theme
         # While auto-run is OFF, actively drive one scan tick so the indicator responds to a barcode
         # held under a camera even when idle. During auto the loop already scans, so skip (avoid double
@@ -161,7 +181,7 @@ class InferenceMixin:
         scan_err = None
         try:
             if not getattr(self.inference, "is_auto_inference", False):
-                self.inference.no_flip_place_scan()
+                self._ensure_head_scan()          # ONE head predict feeds both no-flip + package gates
         except Exception as e:
             scan_err = e
         try:
@@ -226,7 +246,7 @@ class InferenceMixin:
                 brief = {k: st.get(k) for k in keys} if st else None
                 print(f"[no-flip UI] refresh alive, auto={auto}, state={state!r}, status={brief}")
 
-        self.root.after(250, self._update_no_flip_indicator)
+        self.root.after(350, self._update_no_flip_indicator)
 
     def _update_package_gate_indicator(self):
         """Repaint the package-presence pill (~4 Hz) and drive one idle scan so it responds while auto
@@ -240,14 +260,19 @@ class InferenceMixin:
         ind = getattr(self, "_package_gate_ind", None)
         if ind is None:
             return
+        try:
+            visible = bool(ind.winfo_viewable())
+        except tk.TclError:
+            return
+        if not visible:                       # inference tab hidden -> skip the YOLO scan entirely
+            self.root.after(350, self._update_package_gate_indicator)
+            return
         th = self.theme
-        # Drive one scan while auto is OFF so the pill is live when idle; during auto the loop scans.
+        # Drive the shared head scan while auto is OFF so the pill is live when idle; during auto the
+        # loop scans. Throttled + shared with the no-flip pill -> one head predict per interval, not two.
         try:
             if not getattr(self.inference, "is_auto_inference", False):
-                pkg = getattr(self.inference, "package_gate", None)
-                env = getattr(self.inference, "humanoid_env", None)
-                if pkg is not None and pkg.enabled and pkg.capable and env is not None:
-                    pkg.scan(env)
+                self._ensure_head_scan()
         except Exception:
             pass
         try:
@@ -271,25 +296,41 @@ class InferenceMixin:
             ind.config(text=label, bg=bg, fg=fg)
         except tk.TclError:
             return
-        self.root.after(250, self._update_package_gate_indicator)
+        self.root.after(350, self._update_package_gate_indicator)
 
     def _update_gripper_indicator(self):
-        """Repaint the gripper-state pill (~4 Hz) from the grasp-recovery YOLO's live view of the RIGHT
-        WRIST camera. Passive read-out (recovery arms itself, so there's no checkbox) of the current
-        gripper state:
+        """Repaint the gripper-state pill (~3 Hz) from the grasp-recovery YOLO's read of the RIGHT WRIST
+        camera. Passive read-out (recovery arms itself, so there's no checkbox) of the current gripper
+        state:
           * grey  — no gripper detector loaded
           * amber — loaded but no wrist frame yet
           * red (solid)   — 'closed-empty' (the state that triggers grasp recovery)
           * green (solid)  — 'closed-gripped' (holding something)
           * grey  — 'open' / nothing detected
-        Detection is local, so this stays live during auto too (the recovery still owns the real check).
+        Cost control: skips entirely when the tab is hidden; while idle it drives ONE cheap (imgsz=320)
+        wrist forward pass; during auto it just reads the cache the recovery loop already refreshes, so
+        no YOLO runs on the Tk thread during auto (avoids double-inference + a race on one model).
         """
         ind = getattr(self, "_gripper_ind", None)
         if ind is None:
             return
-        th = self.theme
         try:
-            st = self.inference.gripper_state_status()
+            visible = bool(ind.winfo_viewable())
+        except tk.TclError:
+            return
+        if not visible:                       # inference tab hidden -> skip the YOLO scan entirely
+            self.root.after(350, self._update_gripper_indicator)
+            return
+        th = self.theme
+        # Refresh the cache with ONE cheap wrist forward pass only while idle; during auto the loop's
+        # maybe_start keeps it fresh, and running YOLO here too would race the loop on one model.
+        try:
+            if not getattr(self.inference, "is_auto_inference", False):
+                self.inference.gripper_scan()
+        except Exception:
+            pass
+        try:
+            st = self.inference.gripper_state_status()      # cheap: reads the cached last read
         except Exception:
             st = None
         if not st:
@@ -311,7 +352,7 @@ class InferenceMixin:
             ind.config(text=label, bg=bg, fg=fg)
         except tk.TclError:
             return
-        self.root.after(250, self._update_gripper_indicator)
+        self.root.after(350, self._update_gripper_indicator)
 
     # YOLO-detection tuning params: (attr, label, from, to, step, is_int, tooltip). Editable ANYTIME
     # (they change detection only, no motion), so they are NOT part of the idle-only tuning lock.

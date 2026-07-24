@@ -300,6 +300,62 @@ class YoloGate:
             return None
 
 
+def scan_gates_once(env, gates):
+    """Run ONE YOLO forward pass per camera on a SHARED model and report, per gate, whether that gate's
+    class was seen — so N YoloGates that share a model (the barcode + package gates) cost a single
+    predict instead of N. Each gate applies its own class filter + confidence, and its live bookkeeping
+    (last_seen/last_text/last_frame_cams) is updated so seen_within() still works. Returns {gate: seen}.
+    Falls back to each gate's own scan if the gates don't actually share one loaded model."""
+    gates = [g for g in gates if g is not None]
+    seen = {g: False for g in gates}
+    if not gates:
+        return seen
+    model = getattr(gates[0], "_model", None)
+    # Only dedupe when every gate shares this one loaded model; otherwise run them independently.
+    if model is None or any(getattr(g, "_model", None) is not model for g in gates):
+        for g in gates:
+            seen[g] = bool(g(env, None))
+        return seen
+    g0 = gates[0]
+    min_conf = min(float(g.conf) for g in gates)      # widest net; each gate re-thresholds at its own conf
+    got = []
+    for name in g0.cameras:
+        frame = env.get_frame(name)                   # also request()s the camera -> switches it ON
+        if frame is None:
+            continue
+        rgb = g0._as_uint8_rgb(frame)
+        if rgb is None:
+            continue
+        got.append(name)
+        try:
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            res = model.predict(bgr, conf=min_conf, iou=g0.iou, imgsz=g0.imgsz,
+                                device=g0.device, verbose=False)[0]
+        except Exception as e:
+            log.warning("[head-scan] shared YOLO predict failed: %s", e)
+            continue
+        names = getattr(res, "names", None) or getattr(model, "names", {}) or {}
+        boxes = getattr(res, "boxes", None)
+        dets = []
+        if boxes is not None and len(boxes):
+            for b in boxes:
+                cid, cf = int(b.cls[0]), float(b.conf[0])
+                dets.append((cid, cf, names.get(cid, str(cid)) if isinstance(names, dict) else str(cid)))
+        for g in gates:
+            if seen[g]:
+                continue
+            hits = [d for d in dets if d[1] >= float(g.conf) and g._class_ok(d[0], names)]
+            if hits:
+                cid, cf, cname = max(hits, key=lambda d: d[1])
+                g.last_text = f"{cname} {cf:.2f}"
+                g.last_camera = name
+                g.last_seen_monotonic = time.monotonic()
+                seen[g] = True
+    for g in gates:
+        g.last_frame_cams = tuple(got)                # diagnostics: which cams delivered a frame
+    return seen
+
+
 class BarcodeGate:
     """Detection port for the no-flip case: "does a camera see a barcode on the grasped object?".
 
@@ -471,15 +527,18 @@ class NoFlipPlaceMacro:
             return bool(self.detector(env, arm14))
         return False
 
-    def scan(self, env, arm14=None) -> bool:
+    def scan(self, env, arm14=None, seen=None) -> bool:
         """One detection tick: run the detector and update the commit latch. Does NOT fire / move the
         robot, so it is safe to call outside the auto loop — e.g. the GUI calls it while auto is OFF so
         the live indicator still responds to a label held under a camera. A label detected for
         commit_count consecutive scans LATCHES ``self.committed``; the latch is dropped again if the
-        label is then MISSED commit_count scans in a row. Returns committed. No-op while disabled."""
+        label is then MISSED commit_count scans in a row. Returns committed. No-op while disabled.
+        `seen` lets a caller inject the detection result (from a shared head scan) so this doesn't run
+        its own predict; None -> detect here as usual."""
         if not self.enabled:
             return self.committed
-        if self._should_place(env, arm14):           # PORT: a label is visible this scan
+        hit = self._should_place(env, arm14) if seen is None else bool(seen)
+        if hit:                                       # PORT: a label is visible this scan
             self._absent_count = 0                   # seen -> reset the unlock (miss) counter
             self._seen_count += 1
             if not self.committed and self._seen_count >= self.commit_count:

@@ -133,7 +133,7 @@ class DetectorTuningMixin:
                     self._tune_stats_var.set(f"error: {e}")
                 except tk.TclError:
                     return
-        self.root.after(100, self._detector_tuning_refresh)
+        self.root.after(160, self._detector_tuning_refresh)
 
     def _render_detector_tuning(self):
         # Source selector: "gripper" -> right-wrist camera + grasp-recovery YOLO; else head + no-flip.
