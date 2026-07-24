@@ -324,6 +324,35 @@ class DemoInference(_Stub):
         # indicator pill visibly blinks green in the demo.
         self.no_flip_place = object()
         self._no_flip_enabled = True
+        # Package-presence gate stand-in: non-None marker keeps the GUI checkbox enabled; the status
+        # below walks present -> paused -> present so the pill visibly cycles in the demo.
+        self.package_gate = object()
+        self._package_gate_enabled = True
+
+    @property
+    def package_gate_enabled(self):
+        return self._package_gate_enabled
+
+    @package_gate_enabled.setter
+    def package_gate_enabled(self, v):
+        self._package_gate_enabled = bool(v)
+
+    def package_gate_status(self):
+        # Synthetic 16 s cycle: package present for 10 s, then absent -> PAUSED for 6 s, then back.
+        t = _clock() % 16.0
+        present = (not self._package_gate_enabled) or t < 10.0
+        paused = self._package_gate_enabled and t >= 10.0
+        return {
+            "enabled": self._package_gate_enabled,
+            "capable": True,
+            "available": True,
+            "present": present,
+            "paused": paused,
+            "package_seen": present,
+            "last_text": "DEMO-PACKAGE 0.88" if present else None,
+            "absent": 0 if present else int(t - 10.0),
+            "present_count": int(min(t, 3.0)) if present else 0,
+        }
 
     @property
     def no_flip_place_enabled(self):

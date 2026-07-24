@@ -214,6 +214,18 @@ class InferenceController:
         except Exception as e:
             log.warning("no-flip-place disabled (failed to init): %r", e)
 
+        # Package-presence gate: pause auto inference + park at home when no package is present, resume
+        # when one appears (see real_world/package_gate.py). Reuses the barcode gate's already-loaded
+        # YOLO model. Fail-open: inert until a package-capable model is trained, so it is safe to ship
+        # alongside today's barcode-only model.
+        self.package_gate = None
+        try:
+            from real_world.package_gate import PackagePresenceGate
+            shared_model = barcode_gate.model if barcode_gate is not None else None
+            self.package_gate = PackagePresenceGate(model=shared_model)
+        except Exception as e:
+            log.warning("package-gate disabled (failed to init): %r", e)
+
     def _trace(self, name, obj):
         """Append one JSON line to the named trace file (no-op if that file's handle isn't open:
         buffer is always open; requests/chunks only under TRACE_JSONL)."""
@@ -532,6 +544,77 @@ class InferenceController:
             except Exception as e:
                 log.debug("no-flip-place idle scan skipped: %r", e)
 
+    # ---- Package-presence gate: pause + home when there's no package to work on ------------------- #
+    @property
+    def package_gate_enabled(self):
+        """Whether the package-presence gate is armed. When off (or fail-open, i.e. the model can't
+        detect a 'package' class) auto inference never pauses on package absence."""
+        pkg = getattr(self, "package_gate", None)
+        return pkg is not None and pkg.enabled
+
+    @package_gate_enabled.setter
+    def package_gate_enabled(self, v):
+        pkg = getattr(self, "package_gate", None)
+        if pkg is not None:
+            pkg.enabled = bool(v)
+            if not v:
+                pkg.reset()                            # disarming -> drop any active pause immediately
+        elif v:
+            log.warning("package-gate cannot be enabled: no gate loaded.")
+
+    def package_gate_status(self):
+        """Live snapshot for the GUI package indicator, or None if no gate is loaded."""
+        pkg = getattr(self, "package_gate", None)
+        return pkg.status() if pkg is not None else None
+
+    def _home_arm(self, env):
+        """Move the arm to the fixed auto start pose (absolute joints), clearing any queued/streamed
+        motion first so homing has sole control. No-op if disabled / unsupported / E-stopped. Shared by
+        the initial auto homing intent and the package-gate pause."""
+        if self.auto_start_pose is None or not hasattr(env, "move_to_joints") or env.estopped:
+            return
+        if getattr(env, "pipeline", None) is not None:
+            env.pipeline.clear_queue()
+        try:                                           # drop robot queue + staging so nothing snaps
+            with env._lock:
+                env._robot_q.clear()
+                env._staged_release.clear()
+                env._queued_through = -1
+        except AttributeError:
+            pass
+        env.move_to_joints(self.auto_start_pose)
+
+    def _maybe_pause_for_package(self, env) -> bool:
+        """Top-of-auto-loop step. Returns True if inference should be SKIPPED this cycle because there is
+        no package to work on (the arm is homed and paused until one reappears). Pauses ONLY when idle
+        (gripper empty); while holding an item it never pauses (the arm occludes the package). Fail-open:
+        never pauses unless the gate is enabled AND capable of detecting the package class."""
+        pkg = getattr(self, "package_gate", None)
+        if pkg is None or not pkg.enabled or not pkg.capable:
+            return False
+        from real_world.no_flip_place import R_GRIP_IDX
+        grip = getattr(env, "_last_grip_cmd", None)
+        holding = grip is not None and grip[R_GRIP_IDX] >= 1
+        if holding:                                    # busy -> treat as present, never pause mid-task
+            pkg.on_busy()
+            return False
+        pkg.scan(env)                                  # idle -> debounced presence belief
+        if pkg.present:
+            if pkg.paused:
+                log.warning("[package-gate] package detected -> resuming auto inference")
+            pkg.paused = False
+            return False
+        # No package (debounced) while idle -> park at home ONCE, then hold (skip inference) until it
+        # returns. Re-home only on the transition into pause so we don't fight the arm every tick.
+        if not pkg.paused:
+            log.warning("[package-gate] no package while idle -> homing + pausing auto inference")
+            self._home_arm(env)
+            nfp = getattr(self, "no_flip_place", None)
+            if nfp is not None:
+                nfp.reset()                            # drop any stale barcode commit latch
+            pkg.paused = True
+        return True
+
     def inference_once(self) -> bool:
         """Predict + publish only (no execution).
 
@@ -622,6 +705,9 @@ class InferenceController:
             nfp = getattr(self, "no_flip_place", None)
             if nfp is not None:
                 nfp.reset()
+            pkg = getattr(self, "package_gate", None)
+            if pkg is not None:
+                pkg.reset()
             # Stop feeding NEW chunks; let the release loop drain whatever is already queued. (Use
             # the env E-stop to halt immediately instead.)
             return
@@ -638,6 +724,9 @@ class InferenceController:
         nfp = getattr(self, "no_flip_place", None)
         if nfp is not None:
             nfp.reset()                                    # drop any idle pre-arm; decide live this run
+        pkg = getattr(self, "package_gate", None)
+        if pkg is not None:
+            pkg.reset()                                    # fresh run -> assume present, decide live
 
         def _run_auto_inference():
             # Home to a fixed START pose (absolute joints, slow) BEFORE any server call, so every run
@@ -674,8 +763,16 @@ class InferenceController:
                     nfp = getattr(self, "no_flip_place", None)
                     if nfp is not None:
                         nfp.reset()                        # ...and the no-flip macro
+                    pkg = getattr(self, "package_gate", None)
+                    if pkg is not None:
+                        pkg.reset()                        # ...and drop any package-gate pause
                     self.is_auto_inference = False
                     break
+                # Package-presence gate: while idle (empty gripper), if no package is in view the arm is
+                # homed and inference is PAUSED until one reappears — so the robot doesn't run on an empty
+                # workspace. Checked first; inert (never pauses) unless a package-capable model is loaded.
+                if self._maybe_pause_for_package(self.humanoid_env):
+                    continue
                 # No-flip-place: if a camera sees a barcode on the grasped package it is right-side-up
                 # and must NOT be flipped, so place it as-is. Checked BEFORE the flip macro so a barcode
                 # (seen right after the grasp) takes over before the wrist ever swings; on packages

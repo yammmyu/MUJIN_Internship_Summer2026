@@ -228,6 +228,51 @@ class InferenceMixin:
 
         self.root.after(250, self._update_no_flip_indicator)
 
+    def _update_package_gate_indicator(self):
+        """Repaint the package-presence pill (~4 Hz) and drive one idle scan so it responds while auto
+        is OFF. States:
+          * grey — not armed, or the model can't detect a 'package' class (fail-open: never pauses)
+          * amber — armed but no camera frame / backend unavailable
+          * red (solid) — PAUSED: no package, arm homed, waiting
+          * green — a package is currently present
+          * grey (watching) — armed & idle-scanning, package not seen yet
+        """
+        ind = getattr(self, "_package_gate_ind", None)
+        if ind is None:
+            return
+        th = self.theme
+        # Drive one scan while auto is OFF so the pill is live when idle; during auto the loop scans.
+        try:
+            if not getattr(self.inference, "is_auto_inference", False):
+                pkg = getattr(self.inference, "package_gate", None)
+                env = getattr(self.inference, "humanoid_env", None)
+                if pkg is not None and pkg.enabled and pkg.capable and env is not None:
+                    pkg.scan(env)
+        except Exception:
+            pass
+        try:
+            st = self.inference.package_gate_status()
+        except Exception:
+            st = None
+
+        if not st or not st.get("enabled"):
+            label, bg, fg = "○  package: off", th.APP_BG, th.DOT_OFF
+        elif not st.get("capable"):
+            label, bg, fg = "○  package: n/a", th.APP_BG, th.DOT_OFF
+        elif st.get("available") is False:
+            label, bg, fg = "▲  detector missing", th.WARN_SOFT, th.WARN_DARK
+        elif st.get("paused"):
+            label, bg, fg = "●  PAUSED — no package (homed)", th.WARN_SOFT, th.WARN_DARK
+        elif st.get("present"):
+            label, bg, fg = "◉  package present", th.SUCCESS, "white"
+        else:
+            label, bg, fg = "◌  watching for package", th.APP_BG, th.DOT_OFF
+        try:
+            ind.config(text=label, bg=bg, fg=fg)
+        except tk.TclError:
+            return
+        self.root.after(250, self._update_package_gate_indicator)
+
     # YOLO-detection tuning params: (attr, label, from, to, step, is_int, tooltip). Editable ANYTIME
     # (they change detection only, no motion), so they are NOT part of the idle-only tuning lock.
     _LABEL_PARAM_SPEC = (
@@ -626,6 +671,28 @@ class InferenceMixin:
         self._no_flip_ind.pack(side=tk.RIGHT)
         self._update_no_flip_indicator()          # paint once now + start the ~4 Hz refresh
         # (Tune the label detector — with a live boxed camera view — in the "Detector tuning" tab.)
+
+        # Package-presence gate: while idle (empty gripper), if the head camera sees NO package the arm
+        # parks at home and auto inference PAUSES until one reappears. Checkbox arms it; the pill is a
+        # LIVE indicator (repainted ~4 Hz by _update_package_gate_indicator).
+        pkg_row = ttk.Frame(sec_auto)
+        pkg_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._package_gate_var = tk.BooleanVar(value=bool(self.inference.package_gate_enabled))
+        self._package_gate_cb = ttk.Checkbutton(
+            pkg_row, text="Pause + home when no package is present",
+            variable=self._package_gate_var,
+            command=lambda: setattr(self.inference, "package_gate_enabled", self._package_gate_var.get()))
+        self._package_gate_cb.pack(side=tk.LEFT)
+        if getattr(self.inference, "package_gate", None) is None:
+            self._package_gate_cb.state(["disabled"])
+        self.tip(self._package_gate_cb,
+                 "While idle (nothing grasped), if no package is detected the arm homes and auto "
+                 "inference pauses; it resumes when a package appears. Never pauses mid-grasp. Inert "
+                 "unless the loaded model has a 'package' class. Safe to toggle mid-run.")
+        self._package_gate_ind = tk.Label(pkg_row, text="●  package", font=self.theme.ui(9, "bold"),
+                                          bg=self.theme.APP_BG, fg=self.theme.DOT_OFF, padx=8, pady=2)
+        self._package_gate_ind.pack(side=tk.RIGHT)
+        self._update_package_gate_indicator()     # paint once now + start the ~4 Hz refresh
 
         # (Emergency stop lives in the pinned bar at the top of this column — always reachable.)
 
