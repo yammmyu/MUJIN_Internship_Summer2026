@@ -8,7 +8,11 @@
       "Read(//home/chenyanyu/Documents/diffusion_policy/diffusion_policy/env_runner/**)",
       "Bash(/home/chenyanyu/Documents/Humanoid/humanoid/.venv/bin/python3 build_dataset.py --src recordings --out /tmp/test_fixed.zarr)",
       "Read(//home/chenyanyu/Downloads/pusht/**)",
-      "Bash(python3 -m py_compile robot_control_gui.py)"
+      "Bash(python3 -m py_compile robot_control_gui.py)",
+      "Bash(git remote *)",
+      "Bash(git branch *)",
+      "Bash(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }
