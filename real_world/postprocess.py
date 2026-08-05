@@ -6,10 +6,14 @@ order, so the whole path reads top to bottom:
 
   1. GRIPPER BINARIZE        raw [0,~85] grip -> {0,1} per arm (col 9 left / col 19 right)
   2. TEMPORAL-ENSEMBLE MERGE cross-chunk recency-weighted mean + along-id Gaussian, master-id aligned
-  (later stages absorb: 3. dual-arm IK, 4. sim validation, 5. master-id tag + seam ramp + subdivide
-   + queue splice — see the plan; each is moved here behavior-preserving.)
+  3. DUAL-ARM IK             per-row workspace gate (H4) + orientation smoothing (H3) + dual-arm IK,
+                             warm-started row-to-row -> absolute [left7, right7] joint configs
+  4. SIM VALIDATION          substep the configs through the preview sim (self-collision + joint readback)
+  5. QUEUE SPLICE            master-id tag each substep (stage 4's sim already velocity-bounded them
+                             to <= MAX_JOINT_STEP), add a velocity-paced seam ramp/bridge, then splice
+                             onto the robot queue the env's release loop drains one substep/tick
 
-A PostProcessor is the single owner of the merge buffer (and, in later stages, the robot queue); the
+A PostProcessor is the single owner of the merge buffer and the robot queue; the
 env owns the hardware, the sim, and the release-loop CONSUMER, and constructs one PostProcessor. The
 inference controller hands each server chunk to PostProcessor.merge and (when streaming) the result
 is spliced onto the robot queue.

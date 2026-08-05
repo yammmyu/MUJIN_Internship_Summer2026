@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(../.venv/bin/python3 build_dataset.py --src recordings --out /tmp/test.zarr)",
+      "Bash(.venv/bin/python3 -c ' *)",
+      "Bash(/home/chenyanyu/Documents/Humanoid/humanoid/.venv/bin/python3 -c ' *)",
+      "Bash(ls /home/chenyanyu/Documents/diffusion_policy/diffusion_policy/env_runner/noop_image_runner.py 2>/dev/null && echo \"exists\")",
+      "Read(//home/chenyanyu/Documents/diffusion_policy/diffusion_policy/env_runner/**)",
+      "Bash(/home/chenyanyu/Documents/Humanoid/humanoid/.venv/bin/python3 build_dataset.py --src recordings --out /tmp/test_fixed.zarr)",
+      "Read(//home/chenyanyu/Downloads/pusht/**)",
+      "Bash(python3 -m py_compile robot_control_gui.py)"
+    ]
+  }
+}
