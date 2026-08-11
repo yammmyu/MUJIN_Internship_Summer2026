@@ -1,34 +1,54 @@
-# Humanoid
+# Humanoid — Dual-Arm Diffusion Policy for Parcel Handling
 
+Teleoperation, data-collection, and policy-deployment stack for the **AgiBot / 智元 Genie G1**
+dual-arm humanoid, built on the vendored **a2d_sdk** robot SDK.
 
-this project utilized the diffusion policy framework by rea-standford lab.
+The robot picks a parcel off a table with two arms, lifts it, decides whether the shipping
+label is visible, flips the parcel ~180° if it is not, and places it label-up for downstream
+barcode scanning. The manipulation policy is a **diffusion policy** (Chi et al., Stanford
+REALab), image-conditioned and trained by imitation from VR teleoperation demonstrations.
 
+One codebase covers the full imitation-learning loop:
 
-Teleoperation, data-collection, and policy-deployment stack for the AgiBot / 智元
-**A2D** dual-arm humanoid, built on the vendored **a2d_sdk** robot SDK.
-
-One codebase covers the full loop of imitation-learning robotics:
-
-- **Teleoperate** the robot from a Pico VR headset and **record** demonstrations.
+- **Teleoperate** from a Pico VR headset and **record** demonstrations.
 - **Build datasets** from those recordings into replay-buffer `.zarr` for policy training.
-- **Deploy** a trained dual-arm policy: stream camera + proprioception observations to a
-  policy server, turn the returned action chunks into safe, smooth arm motion, and complete
-  the task with scripted place macros and YOLO perception gates.
+- **Deploy** the trained policy: stream observations to a policy server, turn the returned
+  action chunks into safe, smooth arm motion, and finish the task with scripted place macros.
 - **Evaluate** on the robot or offline in a PyBullet sim, with a live success-rate dashboard.
 
-Everything is driven from one Tkinter control console
-([robot_control_gui.py](robot_control_gui.py)), which also runs **hardware-free** for demos,
-screenshots, and UI work.
+Everything runs from one Tkinter console ([robot_control_gui.py](robot_control_gui.py)), which
+also runs **hardware-free** (`--demo`) for demos, screenshots, and UI work.
+
+> **📖 This README is the map, not the manual.** For the full rationale, debugging history,
+> and tuning reference, read
+> [KNOWHOW_Humanoid_Diffusion_Policy.md](documenation/Documentation_English/KNOWHOW_Humanoid_Diffusion_Policy.md)
+> (中文: [KNOWHOW_..._CN.md](documenation/Documentation_中文/KNOWHOW_Humanoid_Diffusion_Policy_CN.md)).
+> A PoC report and slide deck sit alongside them.
+
+---
+
+## What was used
+
+| | Choice | Why / note |
+|---|---|---|
+| Robot | AgiBot / 智元 Genie **G1** dual-arm humanoid | SDK is `a2d_sdk`, URDF is `A2D.urdf` — name the robot and SDK separately, this has confused people |
+| Policy | Diffusion policy — image-conditioned, dual-arm, **EE-space** | runs as a separate HTTP service (`POST /predict`); never drives the robot directly |
+| Cameras | head + 2 wrist | own ResNet encoder each: head = coarse positioning, wrists = alignment + gripper |
+| Kinematics | **Pinocchio + in-repo URDF**, replacing the SDK's black-box IK | same solver runs in sim and on the robot — the basis of every safety check |
+| Sim | **PyBullet** (in-process) | chosen over Isaac Lab for simplicity + runs on a GPU-less laptop |
+| Teleop | Pico VR headset over ZeroMQ | |
+| Vision | **YOLO** (local, ultralytics) | gates placing / recovery / start-stop; picked after barcode, ArUco, and text-block detectors proved unstable |
+| Timing | `RECORD_HZ` = 10 Hz, `CONTROL_HZ` = 120 Hz | policy row cadence vs. substep streaming rate |
 
 ---
 
 ## How deployment works
 
-The policy never talks to the robot directly. Observations flow out, action chunks flow
-back, and the stack turns each chunk into velocity-bounded, temporally-consistent motion:
+The policy never talks to the robot directly. Observations flow out, action chunks flow back,
+and the stack turns each chunk into velocity-bounded, temporally-consistent motion:
 
 ```
-  ┌─────────────── HumanoidEnv (owns SDK + two threads) ───────────────┐
+  ┌─────────────── HumanoidEnv (owns SDK + threads) ───────────────────┐
   │                                                                    │
   │  collect thread ─▶ cameras + dual-arm EE pose + grippers (10 Hz)   │
   │        │                                                           │
@@ -44,50 +64,122 @@ back, and the stack turns each chunk into velocity-bounded, temporally-consisten
   │        ▼                                                           │
   │  exec thread ─▶ drain queue, stream substeps to arms (120 Hz)      │
   └────────────────────────────────────────────────────────────────────┘
-        ▲ inference loop (caller-owned):  obs → server → submit, repeat
+        ▲ inference loop:  obs → server → submit, repeat
 ```
-
-the gripper was none binarized as the input to provie the model more information on the state of the gripper, while binarization in the data postprocessing, eliminates alot of fluctuations in the output command.
-
 
 - **Observation** ([build_data.py](real_world/build_data.py)) — head + two wrist cameras
   (cropped/resized to 16:9, base64 JPEG) plus per-arm EE pose `[pos(3) + rot6d(6)]` and both
-  gripper states, in the exact layout the policy was trained on.
-- **Action post-processing** ([postprocess.py](real_world/postprocess.py)) — the output-side
-  mirror of `build_data`: gripper binarize → cross-chunk temporal-ensemble merge (master-row-id
-  aligned) → dual-arm IK → sim validation → splice onto the robot queue.
-- **Inverse kinematics** ([ik.py](real_world/ik.py)) — a transparent URDF + Pinocchio solver
-  that replaces the SDK's firmware IK blackbox; the same solver runs in the PyBullet check and
-  on the robot. Calibrated by [config/fk_calibration*.json](real_world/config/).
-- **Timing** ([timing.py](real_world/timing.py)) — single source of truth. `RECORD_HZ` (10 Hz)
-  is the policy's action-row cadence; `CONTROL_HZ` (120 Hz) is the substep streaming rate. Every
-  substep is bounded by `MAX_JOINT_VEL` / `MAX_JOINT_STEP`, with a `WATCHDOG_MAX_JOINT_JUMP`
-  E-stop on any oversized single command.
+  gripper states, in the **exact layout the policy trained on**.
+- **Post-processing** ([postprocess.py](real_world/postprocess.py)) — the output-side mirror of
+  `build_data`: gripper binarize → cross-chunk temporal-ensemble merge → dual-arm IK → sim
+  validation → splice onto the robot queue. Training imports the *same* build functions, so
+  train/deploy parity holds by construction — most model-quality regressions traced back to a
+  divergence between these two sides.
+- **Inverse kinematics** ([ik.py](real_world/ik.py)) — a transparent URDF + Pinocchio
+  damped-least-squares solver replacing the SDK's firmware IK black-box. Calibrated per arm
+  ([config/fk_calibration*.json](real_world/config/)) to sub-millimetre FK agreement.
+- **Timing** ([timing.py](real_world/timing.py)) — **single source of truth** for every rate
+  and limit constant. Each policy row expands to a fixed number of substeps *uniform in time*,
+  so wall-clock per row is independent of how far the joints move.
 
-## Manipulation pipeline
+**Alignment keys on absolute master row IDs**, not a clock: every action row carries an ID from
+the robot's own execution clock, so new inferences merge correctly against what is already
+queued, surviving variable inference latency (the failure mode of the earlier clock-based sync).
 
-The policy only **grabs, lifts, and (sometimes) flips**. These modules run **inline in the
-auto-inference loop** to finish the task — placing, releasing, recovering, and gating — each
-self-contained with only small call-ins from the inference controller:
+### Safety is layered and independent of the policy
+
+Invariants **C1–C7 / H1–H4**, pinned by `tests/test_safety_invariants.py` and run as a launch
+pre-flight. The load-bearing ones: no sim running → nothing reaches the robot (C1); every
+released trajectory was stepped and self-collision-checked in sim (C2); a latched E-stop (C3);
+a per-command displacement watchdog that latches E-stop on any oversized jump (C6); and an
+EE-outside-safe-box guard (C7). See §3 of the knowhow for the full table.
+
+### Gripper: three mechanisms, easily confused
+
+- **Obs side** — the model receives the **non-binarised commanded** value, so it sees true
+  continuous state (firmware read-back lags by *seconds*, which made the policy re-issue grasps
+  it had already completed).
+- **Action side** — **binarised** in post-processing → clean open/close decision out, which
+  eliminated a large amount of command fluctuation.
+- **Dispatch side** — an anti-chatter **change latch** locks a gripper state for 20 row IDs so
+  an oscillating policy cannot re-grab.
+
+---
+
+## Manipulation pipeline — hybrid policy + scripted macros
+
+The policy only **grabs, lifts, and (sometimes) flips**. Everything geometrically constrained
+and repeatable is a scripted macro running **inline in the auto-inference loop**. This reserves
+the policy's capacity for the contact-rich part of the task and is far cheaper than the
+demonstrations needed to learn placement — at the stated cost that new placement locations
+require additional scripting.
 
 | Module | Role |
 |--------|------|
-| [flip_place.py](real_world/flip_place.py) | Scripted release **after** the policy's ~180° flip: warp a recorded path onto the live pose, move out, open, reverse back. |
-| [no_flip_place.py](real_world/no_flip_place.py) | Same, for the **no-flip** case; the "place now" cue is a YOLO detection with a commit latch. |
-| [grasp_recovery.py](real_world/grasp_recovery.py) | Wrist-camera YOLO (open / closed-gripped / **closed-empty**). On a failed grasp: clear queue, open, home both arms, let the policy re-plan. |
-| [package_gate.py](real_world/package_gate.py) | Same model's `package` class — pause inference + park at home when there's nothing to work on. **Fail-open**: never pauses if it can't detect. |
-| [retreat.py](real_world/retreat.py) | Torch-free, velocity-bounded "retreat to home" primitive shared by recovery and the unreachable-target handler. |
+| [package_gate.py](real_world/package_gate.py) | Pause inference + park at home when there's no parcel. **Fail-open**: never pauses if it can't detect. |
+| [no_flip_place.py](real_world/no_flip_place.py) | Place as-is: warp a recorded joint path onto the live pose, move out, open, reverse back. Cue = YOLO `barcode` with a commit latch. |
+| [flip_place.py](real_world/flip_place.py) | Same, **after** the policy's ~180° flip. Cue = right wrist-roll ≥ 2.5 rad since the grab. |
+| [grasp_recovery.py](real_world/grasp_recovery.py) | Wrist YOLO (`open`/`closed-gripped`/`closed-empty`). On a failed grasp: clear queue, open, retreat, let the policy re-plan. |
+| [retreat.py](real_world/retreat.py) | Torch-free, velocity-bounded retreat primitive shared by recovery and the unreachable-target handler. |
 
-Detection runs **locally** on the client (ultralytics + `.pt` weights under
-[real_world/assets/](real_world/assets/) and [data/](data/)), not on the policy server. The
-**Detector tuning** GUI tab shows a live boxed head-cam view for tuning these gates.
+The place macros work **in joint space throughout** (a fixed end joint config guarantees the
+release point via FK with no IK, avoiding redundancy branch-flips); the **start adapts, the end
+is fixed** via a decaying-offset warp; and **everything is cleared before and after** so nothing
+snaps when auto resumes.
+
+Detection runs **locally on the client**, not on the policy server. The **Detector tuning** GUI
+tab shows a live boxed head-cam view, backed by the same `YoloGate` the robot uses, so a
+confidence change applies to the running robot immediately.
+
+---
+
+## Key design decisions & considerations
+
+- **Hybrid policy + scripted macros** — learn the hard part, script the repeatable part.
+- **Transparent IK over the SDK black-box** — a black box permits no pre-execution trajectory
+  validation, which makes every safety guarantee hollow. The same Pinocchio solver runs in the
+  PyBullet check and on the robot.
+- **EE-space, not joint-space** — on the diffusion-policy authors' recommendation; joint output
+  was trained and tested and performed worse.
+- **6D rotation output, quaternion input** — 6D rotation is continuous (quaternions
+  double-cover and are discontinuous), which matters enormously for regression/training
+  stability; quaternions are compact and fine as an *input*.
+- **Absolute master-ID alignment + buffered Gaussian smoothing** — replaced explicit
+  time/nearest-state trajectory merging, the consistent source of motion oscillation.
+- **On-demand camera hub** — depth-camera bandwidth (~600 MB/s) saturated DDS and froze other
+  streams; cameras now subscribe only while a consumer needs them.
+- **Known limitation** — the diffusion policy currently requires a **fixed head-camera
+  position**, as in the original fixed-platform paper.
+
+---
+
+## Data & training — the lessons that matter most
+
+Model quality is dominated by **operator consistency during teleoperation**, none of which is
+captured in the code:
+
+- **Exaggerate movements.** Subtle motions do not survive training; moves that feel too large
+  during teleop reproduce correctly on the robot.
+- **Be explicit about intent.** An end-to-end vision model infers no implicit intent — it learns
+  only patterns it sees repeated.
+- **Keep approach margins consistent.** If the head cam sees the parcel spanning x1–x2, always
+  approach at x1−n / x2+n for a fixed n (~5 cm). Inconsistency here was the **single largest
+  source of grasp failures**, especially for parcels low and close to the table.
+
+Practicalities: recordings at 30 Hz are built into a **10 Hz** dataset (every 3rd frame), which
+fixed the robot stalling between inference updates. ~50 demos at 50–100 epochs already replicate
+relative motion; ~100–200 demos capture fine idiosyncrasies; **diminishing returns set in above
+~100 epochs** (a 200-epoch run showed no visible gain). The current dataset is 200 episodes.
+
+---
 
 ## SDK-free split
 
-The SDK (`a2d_sdk`) and ROS live **only on the robot machine**. The kinematics, sim, camera hub,
+The SDK (`a2d_sdk`) and ROS live **only on the robot machine**. Kinematics, sim, camera hub,
 recorded-obs playback, and timing are written to import without them — via lazy package imports
-and dependency injection — so the whole sim/eval/CI path (and `--demo` mode) runs on any laptop.
-[requirements_sim.txt](requirements_sim.txt) is the SDK-free dependency set.
+and dependency injection — so the whole sim/eval/CI path (and `--demo` mode) runs on any laptop,
+roughly halving iteration time. [requirements_sim.txt](requirements_sim.txt) is that SDK-free
+dependency set. **Preserve this separation.**
 
 ---
 
@@ -95,19 +187,20 @@ and dependency injection — so the whole sim/eval/CI path (and `--demo` mode) r
 
 | Path | What it is |
 |------|------------|
-| [robot_control_gui.py](robot_control_gui.py) | Main entry point — the Tkinter control console; assembles the GUI mixins and wires up robot / camera / env / inference. |
-| [real_world/](real_world/) | Core library — the env, IK, inference controller, post-processing, sim backend, timing, data building, and the manipulation-pipeline modules above. |
-| [gui/](gui/) | GUI feature mixins, one per domain, combined by multiple inheritance in `RobotControlGUI` (`Style`, `Camera`, `Inference`, `DetectorTuning`, `VR`, `DataCollection`, `Eval`) + the hardware-free [demo_backend.py](gui/demo_backend.py). |
+| [robot_control_gui.py](robot_control_gui.py) | Main entry point — the Tkinter console; wires up robot / camera / env / inference. |
+| [real_world/](real_world/) | Core library — env, IK, inference controller, post-processing, sim backend, timing, data building, and the manipulation-pipeline modules. |
+| [gui/](gui/) | GUI feature mixins (Camera, Inference, DetectorTuning, VR, DataCollection, Eval) + the hardware-free [demo_backend.py](gui/demo_backend.py). |
 | [pico_vr/](pico_vr/) | Pico VR teleop client/server and shared wire protocol. |
 | [servers/](servers/) | Networking glue: robot-info HTTP server, inference-server ping, recording upload. |
-| [MDM_data_collection/](MDM_data_collection/) | Data-collection GUI + dataset builder: recorded episodes → replay-buffer `.zarr` (recordings/buffers not versioned). |
-| [scripts/](scripts/) | Eval, diagnostics, and path/waypoint builders (sim inference eval, FK-consistency check, retreat-waypoint estimation, …). |
+| [MDM_data_collection/](MDM_data_collection/) | Data-collection GUI + dataset builder: recorded episodes → replay-buffer `.zarr`. |
+| [scripts/](scripts/) | Eval, diagnostics, and path/waypoint builders (sim inference eval, FK-consistency check, …). |
 | [tests/](tests/) | Pytest suite — safety invariants, append/splice, retreat waypoints, tagging. |
 | [planning/](planning/) | Reachability, detection, and planning server subsystem. |
 | [examples/](examples/) | Standalone reference scripts (e.g. wheel/base control). |
-| [data/](data/), [real_world/assets/](real_world/assets/) | Local model weights (YOLO `.pt`) and recorded release paths / URDF assets. |
+| [data/](data/), [real_world/assets/](real_world/assets/) | Local YOLO `.pt` weights, recorded release paths, vendored URDF. |
 | [a2d_sdk/](a2d_sdk/) | Vendored A2D robot SDK (runtime dependency, imported as `a2d_sdk.robot`). |
 | [docs/](docs/) | Vendor manuals and product references. |
+| [documenation/](documenation/) | **Knowhow, PoC report, and slide deck** (EN + 中文). Start here for depth. |
 
 > `G1_SDK_ENV/` is a legacy SDK snapshot kept on disk but excluded from version control.
 
@@ -120,12 +213,10 @@ Run everything from the repository root so the top-level packages (`real_world`,
 
 ```bash
 # On the robot machine — full stack (needs a2d_sdk + ROS + the robot):
-pip install -r requirements_gui.txt          # numpy, opencv, ruckig, zxing-cpp, pyzmq, matplotlib, …
-# ultralytics + the .pt weights are additionally needed for grasp recovery / package gating.
+pip install -r requirements_gui.txt      # + `pip install ultralytics` for the YOLO gates
 python robot_control_gui.py
 
-# On any laptop — hardware-free DEMO mode (synthetic robot, live camera feeds,
-# a filling evaluation dashboard; no SDK/ROS/robot):
+# On any laptop — hardware-free DEMO mode (synthetic robot, live camera, no SDK/ROS/robot):
 python robot_control_gui.py --demo
 
 # SDK-free sim / IK tools (Pinocchio + PyBullet):
@@ -133,64 +224,27 @@ python -m venv .venv && .venv/bin/pip install -r requirements_sim.txt
 .venv/bin/python scripts/sim_infer_eval.py    # run the policy against a recording in sim
 ```
 
-The console has four tabs:
+The console has four tabs — **Console** (camera views + inference: sim preview → auto-run;
+auto-run refuses to start without the sim preview, for safety), **Detector tuning** (live boxed
+head-cam for tuning the YOLO gates), **VR teleop** (Pico teleop + recording), and **Evaluation**
+(live success-rate dashboard fed by `infer_logs/eval/*.jsonl`).
 
-- **Console** — camera views + policy inference (sim preview, validate, release, substep monitor).
-- **Detector tuning** — live boxed head-cam view for tuning the YOLO place/package gates.
-- **VR teleop** — Pico teleoperation + demonstration recording.
-- **Evaluation** — live success-rate KPI dashboard fed by `infer_logs/eval/*.jsonl` (the logs
-  [scripts/eval_trials.py](scripts/eval_trials.py) writes).
-
-The UI theme and all ttk styles live in [gui/styles.py](gui/styles.py).
-
-## Testing
+### Testing
 
 ```bash
-pytest tests/          # safety invariants, append/splice, retreat waypoints, tagging
+pytest tests/    # safety invariants, append/splice continuity, retreat waypoints, tagging
 ```
 
-## Notes on runtime state
+The test suite also runs automatically as a **launch pre-flight**; a safety-invariant regression
+blocks the GUI from starting (`HUMANOID_SKIP_SAFETY_PREFLIGHT=1` bypasses it, for exceptional
+cases only).
 
-- [tuning_config.json](tuning_config.json) holds live tuning overrides (temporal-ensemble params,
-  `speed_scale`, `append_ahead_rows`), loaded **once** at GUI startup; code constants are the
-  defaults when a key is absent. Delete it to reset.
-- Calibration lives in [real_world/config/](real_world/config/): `fk_calibration*.json` (the
-  IK base offset, per arm), `nominal_arm_config.json`, `retreat_waypoints.json`. Both arms'
-  calibrations must match the deployment torso pose.
+### Runtime state
+
+- [tuning_config.json](tuning_config.json) holds live operator tuning (temporal-ensemble params,
+  `speed_scale`, `append_ahead_rows`), loaded once at GUI startup; code constants are the
+  defaults. Delete it to reset.
+- Calibration lives in [real_world/config/](real_world/config/) — `fk_calibration*.json`,
+  `nominal_arm_config.json`, `retreat_waypoints.json`; must match the deployment torso pose.
 - `live_joints.jsonl`, `released_substeps.jsonl`, recordings, `.zarr` buffers, and
   `infer_logs/eval/` are runtime scratch/data and are git-ignored.
-
-
-
-Data training
-
-you have to exagerate alot of actions for it to learn
-
-for end to end model like this you have to be very explicit about what actions it should take
-
-for example for grabbing packages, because packages are so low and close to the table. 
-
-the head camera sees the package taks up x1 to x2 and y1 to y2 position of its camera, than you need to make sure your gripper always approaches x1 - n amount and x2 + n amount where this n can for example be 5cms. Once you are consistent on this, it will remeber to do so. This is the nature of a Motion diffusion model that learns from vision
-
-Another important 
-
-
-A drawback of diffusion policy model is that it at the current moment it requires a fixed head position.
-
-In the original paper the implementation is all done at a fixed platform with a fixed camera on top
-
-
-
-Ro alternative the author cheng-chi developed a hand held data collection tool that only uses the camera on the hand to complete tasks.
-
-this frame is very efficient in training
-
-the robot is able to relatively replicate the motion at 50 sets of data at around 50 to 100 epoches.
-
-the largest model I have used was 200 and I was already expereiencing dimenishing returns above 100.
-
-with around 100 to 200 set of data it is already capable to replicating small movements in my training data such as the tendency to release than use the lower half of the gripper to move the package into a straight position before pulling out the gripper fully.
-
-to be explicit the trianed data we used are ened effector position and 6D orientation. the first because it is generally easier for the model to learn and 6D orientation because it has the adventage of being coutinuous compared to quatarian representation.
-
-
